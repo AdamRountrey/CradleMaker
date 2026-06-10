@@ -1,0 +1,7 @@
+*
+!/.gitignore
+!/cradlemaker-web/
+!/cradlemaker-web/**
+!/.github/
+!/.github/workflows/
+!/.github/workflows/cradlemaker-pages.yml
