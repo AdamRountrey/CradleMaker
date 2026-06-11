@@ -243,6 +243,37 @@
         </div>
 
         <div class="control-block">
+          <h2>Split for printing</h2>
+          <div class="compact-grid">
+            <label>
+              Plate width
+              <input id="split-build-width" type="number" min="25" max="1200" step="1" value="220" />
+            </label>
+            <label>
+              Plate depth
+              <input id="split-build-depth" type="number" min="25" max="1200" step="1" value="220" />
+            </label>
+            <label>
+              Max height
+              <input id="split-build-height" type="number" min="25" max="1200" step="1" value="250" />
+            </label>
+            <label>
+              Plate margin <output id="split-build-margin-value">5 mm</output>
+              <input id="split-build-margin" type="range" min="0" max="30" step="0.5" value="5" />
+            </label>
+          </div>
+          <div class="button-grid">
+            <button id="preview-split" type="button">Preview split</button>
+            <button id="clear-split" type="button">Clear split</button>
+          </div>
+          <div class="export-grid">
+            <button id="export-split-stls" type="button">Export chunk STLs</button>
+            <button id="export-split-manifest" type="button">Export manifest</button>
+          </div>
+          <div id="split-status" class="job-status" role="status">Generate a cradle to check build-plate fit.</div>
+        </div>
+
+        <div class="control-block">
           <div class="export-grid">
             <button id="export-stl" class="primary-action" type="button">Export cradle STL</button>
             <button id="export-ply" type="button">Export cradle PLY</button>
@@ -254,6 +285,6 @@
       </aside>
     </main>
 
-    <script type="module" src="./src/main.js?v=orca-wasm-32"></script>
+    <script type="module" src="./src/main.js?v=orca-wasm-41"></script>
   </body>
 </html>
