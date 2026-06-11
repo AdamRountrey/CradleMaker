@@ -2,8 +2,8 @@ import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { STLLoader } from "three/addons/loaders/STLLoader.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
-import { getSupportOptionSchema, prepareSupportJob } from "./wasmCore.js?v=orca-wasm-41";
-import { defaultOrcaSupportConfig } from "./orcaSupportOptions.js?v=orca-wasm-41";
+import { getSupportOptionSchema, prepareSupportJob } from "./wasmCore.js?v=orca-wasm-42";
+import { defaultOrcaSupportConfig } from "./orcaSupportOptions.js?v=orca-wasm-42";
 
 const SAMPLE_MODEL = "TruckAntennaMount1.stl";
 const SAMPLE_MODEL_URLS = [
@@ -78,6 +78,9 @@ const controlsEl = {
   splitBuildDepth: document.querySelector("#split-build-depth"),
   splitBuildHeight: document.querySelector("#split-build-height"),
   splitBuildMargin: document.querySelector("#split-build-margin"),
+  splitConnectorsEnabled: document.querySelector("#split-connectors-enabled"),
+  splitConnectorClearance: document.querySelector("#split-connector-clearance"),
+  splitConnectorSize: document.querySelector("#split-connector-size"),
   previewSplit: document.querySelector("#preview-split"),
   clearSplit: document.querySelector("#clear-split"),
   exportSplitStls: document.querySelector("#export-split-stls"),
@@ -97,6 +100,8 @@ const outputs = {
   baseMargin: document.querySelector("#base-margin-value"),
   baseThickness: document.querySelector("#base-thickness-value"),
   splitBuildMargin: document.querySelector("#split-build-margin-value"),
+  splitConnectorClearance: document.querySelector("#split-connector-clearance-value"),
+  splitConnectorSize: document.querySelector("#split-connector-size-value"),
 };
 
 const state = {
@@ -332,9 +337,20 @@ function bindControls() {
     controlsEl.splitBuildDepth,
     controlsEl.splitBuildHeight,
     controlsEl.splitBuildMargin,
+    controlsEl.splitConnectorsEnabled,
+    controlsEl.splitConnectorClearance,
+    controlsEl.splitConnectorSize,
   ]) {
     input.addEventListener("input", () => {
-      if (input === controlsEl.splitBuildWidth || input === controlsEl.splitBuildDepth || input === controlsEl.splitBuildHeight || input === controlsEl.splitBuildMargin) {
+      if (
+        input === controlsEl.splitBuildWidth ||
+        input === controlsEl.splitBuildDepth ||
+        input === controlsEl.splitBuildHeight ||
+        input === controlsEl.splitBuildMargin ||
+        input === controlsEl.splitConnectorsEnabled ||
+        input === controlsEl.splitConnectorClearance ||
+        input === controlsEl.splitConnectorSize
+      ) {
         clearSplitPreview();
       } else {
         clearGeneratedSupport();
@@ -686,12 +702,13 @@ function previewSplitPlan() {
 
   const oversizedCount = plan.chunks.filter((chunk) => !chunk.fits).length;
   const chunkText = `${plan.chunks.length.toLocaleString()} chunk${plan.chunks.length === 1 ? "" : "s"}`;
+  const connectorText = `${plan.connectors.length.toLocaleString()} Z-slide dovetail connector${plan.connectors.length === 1 ? "" : "s"}`;
   if (plan.chunks.length === 1 && oversizedCount === 0 && !plan.wasOversized) {
     setSplitStatus(`Cradle fits the selected build volume as one piece (${formatDimensions(plan.sourceBounds.size)}).`, "idle");
   } else if (oversizedCount > 0) {
-    setSplitStatus(`Draft split made ${chunkText}, but ${oversizedCount.toLocaleString()} still exceed the usable build volume. Smaller margins or manual seam/capping support will be needed.`, "error");
+    setSplitStatus(`Draft split made ${chunkText} with ${connectorText}, but ${oversizedCount.toLocaleString()} still exceed the usable build volume. Smaller margins or manual seam/capping support will be needed.`, "error");
   } else {
-    setSplitStatus(`Draft split made ${chunkText}. This preview partitions existing triangles; watertight seam caps and connectors are the next implementation step.`, "pending");
+    setSplitStatus(`Draft split made ${chunkText} with ${connectorText}. Seam caps and hidden boolean-cut sockets are still future work.`, "pending");
   }
 
   updateButtons();
@@ -712,6 +729,8 @@ function splitSettings() {
   const depth = positiveNumber(controlsEl.splitBuildDepth?.value, 220);
   const height = positiveNumber(controlsEl.splitBuildHeight?.value, 250);
   const margin = Math.max(0, Number(controlsEl.splitBuildMargin?.value) || 0);
+  const connectorClearance = Math.max(0.05, Number(controlsEl.splitConnectorClearance?.value) || 0.3);
+  const connectorSize = Math.max(2, Number(controlsEl.splitConnectorSize?.value) || 8);
   return {
     width,
     depth,
@@ -720,6 +739,9 @@ function splitSettings() {
     usableWidth: Math.max(1, width - margin * 2),
     usableDepth: Math.max(1, depth - margin * 2),
     usableHeight: Math.max(1, height - margin * 2),
+    connectorsEnabled: controlsEl.splitConnectorsEnabled?.checked ?? true,
+    connectorClearance,
+    connectorSize,
   };
 }
 
@@ -769,6 +791,7 @@ function buildDraftSplitPlan(mesh, settings) {
   const chunks = [...builders.values()]
     .map((builder, index) => finalizeChunk(builder, index, settings))
     .sort((a, b) => a.id.localeCompare(b.id));
+  const connectors = settings.connectorsEnabled ? addZSlideDovetails(chunks, sourceBounds, settings) : [];
 
   return {
     createdAt: new Date().toISOString(),
@@ -777,8 +800,9 @@ function buildDraftSplitPlan(mesh, settings) {
     grid: { x: countX, y: countY, z: countZ },
     wasOversized: sourceBounds.size.x > settings.usableWidth || sourceBounds.size.y > settings.usableDepth || sourceBounds.size.z > settings.usableHeight,
     chunks,
+    connectors,
     method: "draft-centroid-partition",
-    warning: "Draft split partitions existing mesh triangles. Seam caps, boolean-cut watertightness, labels, and connectors are not implemented yet.",
+    warning: "Draft split partitions existing mesh triangles. Seam caps and boolean-cut watertightness are not implemented yet. Z-slide dovetails are additive external connector hardware.",
   };
 }
 
@@ -848,6 +872,158 @@ function supportMeshBounds(mesh) {
     max,
     size: { x: max.x - min.x, y: max.y - min.y, z: max.z - min.z },
   };
+}
+
+function addZSlideDovetails(chunks, sourceBounds, settings) {
+  const byGrid = new Map(chunks.map((chunk) => [`${chunk.grid.x}:${chunk.grid.y}:${chunk.grid.z}`, chunk]));
+  const connectors = [];
+  const zRange = connectorZRange(sourceBounds, settings);
+  if (!zRange) return connectors;
+
+  for (const chunk of chunks) {
+    const right = byGrid.get(`${chunk.grid.x + 1}:${chunk.grid.y}:${chunk.grid.z}`);
+    if (right) {
+      connectors.push(addZSlideDovetailPair(chunk, right, "x", sourceBounds, settings, zRange, connectors.length + 1));
+    }
+    const back = byGrid.get(`${chunk.grid.x}:${chunk.grid.y + 1}:${chunk.grid.z}`);
+    if (back) {
+      connectors.push(addZSlideDovetailPair(chunk, back, "y", sourceBounds, settings, zRange, connectors.length + 1));
+    }
+  }
+
+  for (const chunk of chunks) {
+    chunk.mesh.triangle_count = Math.floor(chunk.mesh.triangles.length / 3);
+    chunk.bounds = supportMeshBounds(chunk.mesh);
+    chunk.fits = chunk.bounds.size.x <= settings.usableWidth + 0.001 && chunk.bounds.size.y <= settings.usableDepth + 0.001 && chunk.bounds.size.z <= settings.usableHeight + 0.001;
+  }
+
+  return connectors;
+}
+
+function connectorZRange(sourceBounds, settings) {
+  const minHeight = Math.max(6, settings.connectorSize * 1.35);
+  const bottom = sourceBounds.min.z + 1;
+  const maxTop = sourceBounds.max.z - 2;
+  const preferredHeight = Math.max(minHeight, Math.min(55, sourceBounds.size.z * 0.62));
+  const top = Math.min(maxTop, bottom + preferredHeight);
+  if (top - bottom < minHeight) return null;
+  return { min: bottom, max: top };
+}
+
+function addZSlideDovetailPair(maleChunk, femaleChunk, axis, sourceBounds, settings, zRange, index) {
+  const size = settings.connectorSize;
+  const clearance = settings.connectorClearance;
+  const wall = Math.max(1.2, size * 0.24);
+  const head = size;
+  const neck = size * 0.58;
+  const projection = size * 1.35;
+  const anchor = size * 0.8;
+  const label = `D${String(index).padStart(2, "0")}`;
+
+  if (axis === "x") {
+    const seam = (maleChunk.bounds.max.x + femaleChunk.bounds.min.x) / 2;
+    const pairMaxY = Math.max(maleChunk.bounds.max.y, femaleChunk.bounds.max.y);
+    const pairDepth = Math.max(maleChunk.bounds.size.y, femaleChunk.bounds.size.y);
+    const yBase = pairMaxY - Math.min(anchor * 0.65, Math.max(0, pairDepth * 0.08));
+    const yTip = pairMaxY + projection;
+    const yBack = yTip + clearance + wall;
+    appendBoxToMesh(maleChunk.mesh, { x: seam - anchor, y: yBase - anchor, z: zRange.min }, { x: seam, y: yTip, z: zRange.max });
+    appendVerticalPrismToMesh(maleChunk.mesh, [
+      { x: seam - neck / 2, y: yBase },
+      { x: seam + neck / 2, y: yBase },
+      { x: seam + head / 2, y: yTip },
+      { x: seam - head / 2, y: yTip },
+    ], zRange.min, zRange.max);
+    appendBoxToMesh(femaleChunk.mesh, { x: seam, y: yBase - anchor, z: zRange.min }, { x: seam + anchor, y: yBack, z: zRange.max });
+    appendBoxToMesh(femaleChunk.mesh, { x: seam - head / 2 - clearance - wall, y: yBase - clearance, z: zRange.min }, { x: seam - head / 2 - clearance, y: yBack, z: zRange.max });
+    appendBoxToMesh(femaleChunk.mesh, { x: seam + head / 2 + clearance, y: yBase - clearance, z: zRange.min }, { x: seam + head / 2 + clearance + wall, y: yBack, z: zRange.max });
+    appendBoxToMesh(femaleChunk.mesh, { x: seam - head / 2 - clearance - wall, y: yTip + clearance, z: zRange.min }, { x: seam + head / 2 + clearance + wall, y: yBack, z: zRange.max });
+  } else {
+    const seam = (maleChunk.bounds.max.y + femaleChunk.bounds.min.y) / 2;
+    const pairMaxX = Math.max(maleChunk.bounds.max.x, femaleChunk.bounds.max.x);
+    const pairWidth = Math.max(maleChunk.bounds.size.x, femaleChunk.bounds.size.x);
+    const xBase = pairMaxX - Math.min(anchor * 0.65, Math.max(0, pairWidth * 0.08));
+    const xTip = pairMaxX + projection;
+    const xBack = xTip + clearance + wall;
+    appendBoxToMesh(maleChunk.mesh, { x: xBase - anchor, y: seam - anchor, z: zRange.min }, { x: xTip, y: seam, z: zRange.max });
+    appendVerticalPrismToMesh(maleChunk.mesh, [
+      { x: xBase, y: seam - neck / 2 },
+      { x: xBase, y: seam + neck / 2 },
+      { x: xTip, y: seam + head / 2 },
+      { x: xTip, y: seam - head / 2 },
+    ], zRange.min, zRange.max);
+    appendBoxToMesh(femaleChunk.mesh, { x: xBase - anchor, y: seam, z: zRange.min }, { x: xBack, y: seam + anchor, z: zRange.max });
+    appendBoxToMesh(femaleChunk.mesh, { x: xBase - clearance, y: seam - head / 2 - clearance - wall, z: zRange.min }, { x: xBack, y: seam - head / 2 - clearance, z: zRange.max });
+    appendBoxToMesh(femaleChunk.mesh, { x: xBase - clearance, y: seam + head / 2 + clearance, z: zRange.min }, { x: xBack, y: seam + head / 2 + clearance + wall, z: zRange.max });
+    appendBoxToMesh(femaleChunk.mesh, { x: xTip + clearance, y: seam - head / 2 - clearance - wall, z: zRange.min }, { x: xBack, y: seam + head / 2 + clearance + wall, z: zRange.max });
+  }
+
+  return {
+    id: label,
+    type: "external-z-slide-dovetail",
+    axis,
+    slide_axis: "z",
+    male_chunk: maleChunk.id,
+    female_chunk: femaleChunk.id,
+    clearance_mm: clearance,
+    nominal_size_mm: size,
+    z_range_mm: { min: roundedCoordinate(zRange.min), max: roundedCoordinate(zRange.max) },
+  };
+}
+
+function appendBoxToMesh(mesh, min, max) {
+  const lo = {
+    x: Math.min(min.x, max.x),
+    y: Math.min(min.y, max.y),
+    z: Math.min(min.z, max.z),
+  };
+  const hi = {
+    x: Math.max(min.x, max.x),
+    y: Math.max(min.y, max.y),
+    z: Math.max(min.z, max.z),
+  };
+  if (hi.x - lo.x <= 0.001 || hi.y - lo.y <= 0.001 || hi.z - lo.z <= 0.001) return;
+  const start = mesh.vertices.length / 3;
+  mesh.vertices.push(
+    lo.x, lo.y, lo.z,
+    hi.x, lo.y, lo.z,
+    hi.x, hi.y, lo.z,
+    lo.x, hi.y, lo.z,
+    lo.x, lo.y, hi.z,
+    hi.x, lo.y, hi.z,
+    hi.x, hi.y, hi.z,
+    lo.x, hi.y, hi.z
+  );
+  mesh.triangles.push(
+    start, start + 2, start + 1,
+    start, start + 3, start + 2,
+    start + 4, start + 5, start + 6,
+    start + 4, start + 6, start + 7,
+    start, start + 1, start + 5,
+    start, start + 5, start + 4,
+    start + 1, start + 2, start + 6,
+    start + 1, start + 6, start + 5,
+    start + 2, start + 3, start + 7,
+    start + 2, start + 7, start + 6,
+    start + 3, start, start + 4,
+    start + 3, start + 4, start + 7
+  );
+}
+
+function appendVerticalPrismToMesh(mesh, points, zMin, zMax) {
+  if (points.length < 3 || zMax - zMin <= 0.001) return;
+  const start = mesh.vertices.length / 3;
+  for (const point of points) mesh.vertices.push(point.x, point.y, zMin);
+  for (const point of points) mesh.vertices.push(point.x, point.y, zMax);
+  for (let index = 0; index < points.length; index += 1) {
+    const next = (index + 1) % points.length;
+    mesh.triangles.push(start + index, start + next, start + points.length + next);
+    mesh.triangles.push(start + index, start + points.length + next, start + points.length + index);
+  }
+  for (let index = 1; index + 1 < points.length; index += 1) {
+    mesh.triangles.push(start, start + index + 1, start + index);
+    mesh.triangles.push(start + points.length, start + points.length + index, start + points.length + index + 1);
+  }
 }
 
 function renderSplitChunks(plan) {
@@ -1058,6 +1234,8 @@ function updateOutputs() {
   outputs.baseMargin.textContent = `${controlsEl.baseMargin.value} mm`;
   outputs.baseThickness.textContent = `${controlsEl.baseThickness.value} mm`;
   outputs.splitBuildMargin.textContent = `${controlsEl.splitBuildMargin.value} mm`;
+  outputs.splitConnectorClearance.textContent = `${controlsEl.splitConnectorClearance.value} mm`;
+  outputs.splitConnectorSize.textContent = `${controlsEl.splitConnectorSize.value} mm`;
 }
 
 function updateButtons() {
@@ -1223,8 +1401,16 @@ function splitManifest() {
       usable_depth: plan.settings.usableDepth,
       usable_height: plan.settings.usableHeight,
     },
+    connector_settings: {
+      enabled: plan.settings.connectorsEnabled,
+      type: "external-z-slide-dovetail",
+      clearance_mm: plan.settings.connectorClearance,
+      nominal_size_mm: plan.settings.connectorSize,
+      count: plan.connectors.length,
+    },
     source_bounds_mm: manifestBounds(plan.sourceBounds),
     grid: plan.grid,
+    connectors: plan.connectors,
     chunks: plan.chunks.map((chunk) => ({
       id: chunk.id,
       filename: supportExportName(`cradle-${chunk.id.toLowerCase()}`, "stl"),
