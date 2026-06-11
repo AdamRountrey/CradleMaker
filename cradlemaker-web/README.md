@@ -2,6 +2,8 @@
 
 Cradlemaker is a standalone Three.js app for building independently printable support cradles for physical objects. It can import an STL, orient/elevate the object, create automatic or manual cradle supports, preview the result, and export the generated support mesh.
 
+The split-for-printing controls can preview a draft chunk layout against a selected build volume and export per-chunk STL files plus a JSON manifest. This first pass is for sizing, review, and workflow testing; watertight seam caps and keyed dovetail/puzzle connectors are still upcoming work.
+
 ## Run
 
 Serve the repository root and open `cradlemaker-web/`.
@@ -47,6 +49,7 @@ The bundled sample model lives in `cradlemaker-web/samples/` so the sample loade
 ## Current Limits
 
 - Normal cradle generation uses the current Cradlemaker WASM solid cradle engine.
+- Split-for-printing exports are draft triangle partitions. They are not yet watertight boolean cuts and do not yet include assembly connectors.
 - Real Orca organic tree support source now compiles as a WASM probe, but it is not wired to runtime generation yet.
 - Tree/organic support requests intentionally fall back to the stable solid cradle until the headless Orca `PrintObject` adapter is complete.
 - Manual support clicks are point marks; painted enforcer/blocker regions are still future work.

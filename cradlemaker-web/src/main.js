@@ -2,8 +2,8 @@ import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { STLLoader } from "three/addons/loaders/STLLoader.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
-import { getSupportOptionSchema, prepareSupportJob } from "./wasmCore.js?v=orca-wasm-40";
-import { defaultOrcaSupportConfig } from "./orcaSupportOptions.js?v=orca-wasm-40";
+import { getSupportOptionSchema, prepareSupportJob } from "./wasmCore.js?v=orca-wasm-41";
+import { defaultOrcaSupportConfig } from "./orcaSupportOptions.js?v=orca-wasm-41";
 
 const SAMPLE_MODEL = "TruckAntennaMount1.stl";
 const SAMPLE_MODEL_URLS = [
@@ -74,6 +74,15 @@ const controlsEl = {
   exportPly: document.querySelector("#export-ply"),
   exportInterfaceStl: document.querySelector("#export-interface-stl"),
   exportInterfacePly: document.querySelector("#export-interface-ply"),
+  splitBuildWidth: document.querySelector("#split-build-width"),
+  splitBuildDepth: document.querySelector("#split-build-depth"),
+  splitBuildHeight: document.querySelector("#split-build-height"),
+  splitBuildMargin: document.querySelector("#split-build-margin"),
+  previewSplit: document.querySelector("#preview-split"),
+  clearSplit: document.querySelector("#clear-split"),
+  exportSplitStls: document.querySelector("#export-split-stls"),
+  exportSplitManifest: document.querySelector("#export-split-manifest"),
+  splitStatus: document.querySelector("#split-status"),
 };
 
 const outputs = {
@@ -87,6 +96,7 @@ const outputs = {
   treeSupportBranchAngle: document.querySelector("#tree-support-branch-angle-value"),
   baseMargin: document.querySelector("#base-margin-value"),
   baseThickness: document.querySelector("#base-thickness-value"),
+  splitBuildMargin: document.querySelector("#split-build-margin-value"),
 };
 
 const state = {
@@ -97,6 +107,9 @@ const state = {
   interfaceMesh: null,
   coverage: null,
   coverageVisible: false,
+  splitChunks: [],
+  splitPreviewVisible: false,
+  splitPlan: null,
   manualSupports: [],
   supportMarkerObjects: new Map(),
   nextManualId: 1,
@@ -146,9 +159,10 @@ transformControls.addEventListener("objectChange", () => {
 
 const modelGroup = new THREE.Group();
 const supportGroup = new THREE.Group();
+const splitGroup = new THREE.Group();
 const coverageGroup = new THREE.Group();
 const markerGroup = new THREE.Group();
-scene.add(modelGroup, supportGroup, coverageGroup, markerGroup);
+scene.add(modelGroup, supportGroup, splitGroup, coverageGroup, markerGroup);
 
 const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
@@ -196,6 +210,16 @@ const materialCoverageUnsupported = new THREE.MeshBasicMaterial({
   side: THREE.DoubleSide,
   depthWrite: false,
 });
+const splitPalette = [
+  0x4fb286,
+  0xd38b39,
+  0x6f91a2,
+  0xd6c35a,
+  0xb86f91,
+  0x8fb85b,
+  0x7d74c7,
+  0xc76f55,
+];
 
 scene.add(new THREE.HemisphereLight(0xf8f2e7, 0x28302d, 1.8));
 const keyLight = new THREE.DirectionalLight(0xffffff, 1.6);
@@ -264,6 +288,10 @@ function bindControls() {
   controlsEl.exportInterfacePly?.addEventListener("click", () => {
     exportInterfacePly();
   });
+  controlsEl.previewSplit?.addEventListener("click", () => previewSplitPlan());
+  controlsEl.clearSplit?.addEventListener("click", () => clearSplitPreview());
+  controlsEl.exportSplitStls?.addEventListener("click", () => exportSplitStls());
+  controlsEl.exportSplitManifest?.addEventListener("click", () => exportSplitManifest());
   controlsEl.interfaceEnabled?.addEventListener("change", () => {
     if (controlsEl.interfaceEnabled.checked && Number(controlsEl.supportInterfaceTopLayers.value) <= 0) {
       controlsEl.supportInterfaceTopLayers.value = "2";
@@ -300,9 +328,17 @@ function bindControls() {
     controlsEl.treeSupportWallCount,
     controlsEl.baseMargin,
     controlsEl.baseThickness,
+    controlsEl.splitBuildWidth,
+    controlsEl.splitBuildDepth,
+    controlsEl.splitBuildHeight,
+    controlsEl.splitBuildMargin,
   ]) {
     input.addEventListener("input", () => {
-      clearGeneratedSupport();
+      if (input === controlsEl.splitBuildWidth || input === controlsEl.splitBuildDepth || input === controlsEl.splitBuildHeight || input === controlsEl.splitBuildMargin) {
+        clearSplitPreview();
+      } else {
+        clearGeneratedSupport();
+      }
       updateOutputs();
       applyModelTransform();
       updateManualMarkers();
@@ -564,6 +600,7 @@ async function showWasmPending() {
 
 function renderGeneratedMeshes(supportMesh, interfaceMesh) {
   supportGroup.clear();
+  clearSplitPreview();
   state.supportMesh = null;
   state.interfaceMesh = null;
 
@@ -634,6 +671,210 @@ function renderCoverageOverlay(coverage) {
 
   coverageGroup.visible = state.coverageVisible;
   updateButtons();
+}
+
+function previewSplitPlan() {
+  if (!state.supportMesh) return;
+
+  const settings = splitSettings();
+  const plan = buildDraftSplitPlan(state.supportMesh, settings);
+  renderSplitChunks(plan);
+  state.splitPlan = plan;
+  state.splitChunks = plan.chunks;
+  state.splitPreviewVisible = true;
+  supportGroup.visible = false;
+
+  const oversizedCount = plan.chunks.filter((chunk) => !chunk.fits).length;
+  const chunkText = `${plan.chunks.length.toLocaleString()} chunk${plan.chunks.length === 1 ? "" : "s"}`;
+  if (plan.chunks.length === 1 && oversizedCount === 0 && !plan.wasOversized) {
+    setSplitStatus(`Cradle fits the selected build volume as one piece (${formatDimensions(plan.sourceBounds.size)}).`, "idle");
+  } else if (oversizedCount > 0) {
+    setSplitStatus(`Draft split made ${chunkText}, but ${oversizedCount.toLocaleString()} still exceed the usable build volume. Smaller margins or manual seam/capping support will be needed.`, "error");
+  } else {
+    setSplitStatus(`Draft split made ${chunkText}. This preview partitions existing triangles; watertight seam caps and connectors are the next implementation step.`, "pending");
+  }
+
+  updateButtons();
+}
+
+function clearSplitPreview() {
+  splitGroup.clear();
+  state.splitChunks = [];
+  state.splitPlan = null;
+  state.splitPreviewVisible = false;
+  supportGroup.visible = true;
+  setSplitStatus(state.supportMesh ? "Generate a split preview to check build-plate fit." : "Generate a cradle to check build-plate fit.", "idle");
+  updateButtons();
+}
+
+function splitSettings() {
+  const width = positiveNumber(controlsEl.splitBuildWidth?.value, 220);
+  const depth = positiveNumber(controlsEl.splitBuildDepth?.value, 220);
+  const height = positiveNumber(controlsEl.splitBuildHeight?.value, 250);
+  const margin = Math.max(0, Number(controlsEl.splitBuildMargin?.value) || 0);
+  return {
+    width,
+    depth,
+    height,
+    margin,
+    usableWidth: Math.max(1, width - margin * 2),
+    usableDepth: Math.max(1, depth - margin * 2),
+    usableHeight: Math.max(1, height - margin * 2),
+  };
+}
+
+function positiveNumber(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : fallback;
+}
+
+function buildDraftSplitPlan(mesh, settings) {
+  const sourceBounds = supportMeshBounds(mesh);
+  const countX = Math.max(1, Math.ceil(sourceBounds.size.x / settings.usableWidth));
+  const countY = Math.max(1, Math.ceil(sourceBounds.size.y / settings.usableDepth));
+  const countZ = Math.max(1, Math.ceil(sourceBounds.size.z / settings.usableHeight));
+  const chunkSize = {
+    x: sourceBounds.size.x / countX,
+    y: sourceBounds.size.y / countY,
+    z: sourceBounds.size.z / countZ,
+  };
+  const builders = new Map();
+  const vertices = mesh.vertices ?? [];
+  const triangles = mesh.triangles ?? [];
+
+  for (let index = 0; index + 2 < triangles.length; index += 3) {
+    const ia = triangles[index];
+    const ib = triangles[index + 1];
+    const ic = triangles[index + 2];
+    const a = readSupportVertex(vertices, ia);
+    const b = readSupportVertex(vertices, ib);
+    const c = readSupportVertex(vertices, ic);
+    const centroid = {
+      x: (a.x + b.x + c.x) / 3,
+      y: (a.y + b.y + c.y) / 3,
+      z: (a.z + b.z + c.z) / 3,
+    };
+    const ix = clampIndex(Math.floor((centroid.x - sourceBounds.min.x) / Math.max(chunkSize.x, 0.0001)), countX);
+    const iy = clampIndex(Math.floor((centroid.y - sourceBounds.min.y) / Math.max(chunkSize.y, 0.0001)), countY);
+    const iz = clampIndex(Math.floor((centroid.z - sourceBounds.min.z) / Math.max(chunkSize.z, 0.0001)), countZ);
+    const key = `${ix}:${iy}:${iz}`;
+    let builder = builders.get(key);
+    if (!builder) {
+      builder = { ix, iy, iz, vertices: [], triangles: [], vertexMap: new Map() };
+      builders.set(key, builder);
+    }
+    appendTriangleToChunk(builder, vertices, ia, ib, ic);
+  }
+
+  const chunks = [...builders.values()]
+    .map((builder, index) => finalizeChunk(builder, index, settings))
+    .sort((a, b) => a.id.localeCompare(b.id));
+
+  return {
+    createdAt: new Date().toISOString(),
+    settings,
+    sourceBounds,
+    grid: { x: countX, y: countY, z: countZ },
+    wasOversized: sourceBounds.size.x > settings.usableWidth || sourceBounds.size.y > settings.usableDepth || sourceBounds.size.z > settings.usableHeight,
+    chunks,
+    method: "draft-centroid-partition",
+    warning: "Draft split partitions existing mesh triangles. Seam caps, boolean-cut watertightness, labels, and connectors are not implemented yet.",
+  };
+}
+
+function clampIndex(index, count) {
+  return Math.max(0, Math.min(count - 1, index));
+}
+
+function appendTriangleToChunk(builder, sourceVertices, ia, ib, ic) {
+  const a = appendVertexToChunk(builder, sourceVertices, ia);
+  const b = appendVertexToChunk(builder, sourceVertices, ib);
+  const c = appendVertexToChunk(builder, sourceVertices, ic);
+  builder.triangles.push(a, b, c);
+}
+
+function appendVertexToChunk(builder, sourceVertices, sourceIndex) {
+  const cached = builder.vertexMap.get(sourceIndex);
+  if (cached !== undefined) return cached;
+  const offset = sourceIndex * 3;
+  const targetIndex = builder.vertices.length / 3;
+  builder.vertices.push(sourceVertices[offset] ?? 0, sourceVertices[offset + 1] ?? 0, sourceVertices[offset + 2] ?? 0);
+  builder.vertexMap.set(sourceIndex, targetIndex);
+  return targetIndex;
+}
+
+function finalizeChunk(builder, index, settings) {
+  const mesh = {
+    vertices: builder.vertices,
+    triangles: builder.triangles,
+    triangle_count: Math.floor(builder.triangles.length / 3),
+  };
+  const bounds = supportMeshBounds(mesh);
+  const fits = bounds.size.x <= settings.usableWidth + 0.001 && bounds.size.y <= settings.usableDepth + 0.001 && bounds.size.z <= settings.usableHeight + 0.001;
+  return {
+    id: `P${String(index + 1).padStart(2, "0")}`,
+    grid: { x: builder.ix, y: builder.iy, z: builder.iz },
+    mesh,
+    bounds,
+    fits,
+  };
+}
+
+function supportMeshBounds(mesh) {
+  const vertices = mesh?.vertices ?? [];
+  const min = { x: Infinity, y: Infinity, z: Infinity };
+  const max = { x: -Infinity, y: -Infinity, z: -Infinity };
+  for (let index = 0; index + 2 < vertices.length; index += 3) {
+    const x = vertices[index];
+    const y = vertices[index + 1];
+    const z = vertices[index + 2];
+    min.x = Math.min(min.x, x);
+    min.y = Math.min(min.y, y);
+    min.z = Math.min(min.z, z);
+    max.x = Math.max(max.x, x);
+    max.y = Math.max(max.y, y);
+    max.z = Math.max(max.z, z);
+  }
+  if (!Number.isFinite(min.x)) {
+    min.x = 0;
+    min.y = 0;
+    min.z = 0;
+    max.x = 0;
+    max.y = 0;
+    max.z = 0;
+  }
+  return {
+    min,
+    max,
+    size: { x: max.x - min.x, y: max.y - min.y, z: max.z - min.z },
+  };
+}
+
+function renderSplitChunks(plan) {
+  splitGroup.clear();
+  for (const [index, chunk] of plan.chunks.entries()) {
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(chunk.mesh.vertices), 3));
+    geometry.setIndex(new THREE.BufferAttribute(new Uint32Array(chunk.mesh.triangles), 1));
+    geometry.computeVertexNormals();
+    geometry.computeBoundingBox();
+    geometry.computeBoundingSphere();
+    const material = new THREE.MeshStandardMaterial({
+      color: splitPalette[index % splitPalette.length],
+      roughness: 0.76,
+      metalness: 0.02,
+      transparent: true,
+      opacity: chunk.fits ? 0.9 : 0.62,
+      side: THREE.DoubleSide,
+    });
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.name = `${chunk.id} draft split chunk`;
+    splitGroup.add(mesh);
+  }
+}
+
+function formatDimensions(size) {
+  return `${formatStatusNumber(size.x)} x ${formatStatusNumber(size.y)} x ${formatStatusNumber(size.z)} mm`;
 }
 
 function buildSupportJobPayload() {
@@ -781,13 +1022,19 @@ function updateManualMarkers() {
 }
 
 function clearGeneratedSupport() {
-  if (!state.supportMesh && !state.interfaceMesh && !state.coverage && supportGroup.children.length === 0 && coverageGroup.children.length === 0) return;
+  if (!state.supportMesh && !state.interfaceMesh && !state.coverage && supportGroup.children.length === 0 && splitGroup.children.length === 0 && coverageGroup.children.length === 0) return;
   supportGroup.clear();
+  splitGroup.clear();
   coverageGroup.clear();
   state.supportMesh = null;
   state.interfaceMesh = null;
   state.coverage = null;
   state.coverageVisible = false;
+  state.splitChunks = [];
+  state.splitPlan = null;
+  state.splitPreviewVisible = false;
+  supportGroup.visible = true;
+  setSplitStatus("Generate a cradle to check build-plate fit.", "idle");
 }
 
 function realizedManualSupports() {
@@ -810,6 +1057,7 @@ function updateOutputs() {
   outputs.treeSupportBranchAngle.textContent = `${controlsEl.treeSupportBranchAngle.value} deg`;
   outputs.baseMargin.textContent = `${controlsEl.baseMargin.value} mm`;
   outputs.baseThickness.textContent = `${controlsEl.baseThickness.value} mm`;
+  outputs.splitBuildMargin.textContent = `${controlsEl.splitBuildMargin.value} mm`;
 }
 
 function updateButtons() {
@@ -833,6 +1081,10 @@ function updateButtons() {
   if (controlsEl.exportPly) controlsEl.exportPly.disabled = generatedSupportTriangles === 0;
   if (controlsEl.exportInterfaceStl) controlsEl.exportInterfaceStl.disabled = generatedInterfaceTriangles === 0;
   if (controlsEl.exportInterfacePly) controlsEl.exportInterfacePly.disabled = generatedInterfaceTriangles === 0;
+  if (controlsEl.previewSplit) controlsEl.previewSplit.disabled = generatedSupportTriangles === 0;
+  if (controlsEl.clearSplit) controlsEl.clearSplit.disabled = !state.splitPreviewVisible;
+  if (controlsEl.exportSplitStls) controlsEl.exportSplitStls.disabled = !state.splitChunks.length;
+  if (controlsEl.exportSplitManifest) controlsEl.exportSplitManifest.disabled = !state.splitChunks.length;
   const totalGeneratedTriangles = generatedSupportTriangles + generatedInterfaceTriangles;
   supportStatus.textContent = totalGeneratedTriangles
     ? `${generatedSupportTriangles.toLocaleString()} cradle + ${generatedInterfaceTriangles.toLocaleString()} interface triangles`
@@ -842,6 +1094,12 @@ function updateButtons() {
 function setJobStatus(message, stateName = "idle") {
   jobStatus.textContent = message;
   jobStatus.dataset.state = stateName;
+}
+
+function setSplitStatus(message, stateName = "idle") {
+  if (!controlsEl.splitStatus) return;
+  controlsEl.splitStatus.textContent = message;
+  controlsEl.splitStatus.dataset.state = stateName;
 }
 
 function toggleModelVisibility() {
@@ -922,6 +1180,74 @@ function exportInterfacePly() {
 
   const ply = supportMeshToAsciiPly(state.interfaceMesh);
   downloadTextFile(ply, supportExportName("interface", "ply"), "model/ply");
+}
+
+function exportSplitStls() {
+  if (!state.splitChunks.length) return;
+
+  const chunks = [...state.splitChunks];
+  setSplitStatus(`Preparing ${chunks.length.toLocaleString()} chunk STL download${chunks.length === 1 ? "" : "s"}...`, "working");
+  for (const [index, chunk] of chunks.entries()) {
+    window.setTimeout(() => {
+      const stl = supportMeshToAsciiStl(chunk.mesh, `cradlemaker_${chunk.id.toLowerCase()}`);
+      downloadTextFile(stl, supportExportName(`cradle-${chunk.id.toLowerCase()}`, "stl"), "model/stl");
+      if (index === chunks.length - 1) {
+        setSplitStatus(`Exported ${chunks.length.toLocaleString()} draft chunk STL${chunks.length === 1 ? "" : "s"}.`, "pending");
+      }
+    }, index * 180);
+  }
+}
+
+function exportSplitManifest() {
+  if (!state.splitPlan) return;
+
+  const manifest = splitManifest();
+  downloadTextFile(JSON.stringify(manifest, null, 2), supportExportName("split-manifest", "json"), "application/json");
+}
+
+function splitManifest() {
+  const plan = state.splitPlan;
+  const modelName = state.modelMesh?.name || "model";
+  return {
+    version: 1,
+    created_at: new Date().toISOString(),
+    model: modelName,
+    method: plan.method,
+    warning: plan.warning,
+    build_volume_mm: {
+      width: plan.settings.width,
+      depth: plan.settings.depth,
+      height: plan.settings.height,
+      margin: plan.settings.margin,
+      usable_width: plan.settings.usableWidth,
+      usable_depth: plan.settings.usableDepth,
+      usable_height: plan.settings.usableHeight,
+    },
+    source_bounds_mm: manifestBounds(plan.sourceBounds),
+    grid: plan.grid,
+    chunks: plan.chunks.map((chunk) => ({
+      id: chunk.id,
+      filename: supportExportName(`cradle-${chunk.id.toLowerCase()}`, "stl"),
+      grid: chunk.grid,
+      fits_build_volume: chunk.fits,
+      bounds_mm: manifestBounds(chunk.bounds),
+      triangle_count: chunk.mesh.triangle_count,
+      vertex_count: Math.floor(chunk.mesh.vertices.length / 3),
+    })),
+    next_steps: [
+      "Replace draft centroid partition with watertight boolean cuts.",
+      "Add keyed dovetail or puzzle connectors outside protected model-contact surfaces.",
+      "Add engraved/raised chunk labels and assembly direction marks.",
+    ],
+  };
+}
+
+function manifestBounds(bounds) {
+  return {
+    min: { x: roundedCoordinate(bounds.min.x), y: roundedCoordinate(bounds.min.y), z: roundedCoordinate(bounds.min.z) },
+    max: { x: roundedCoordinate(bounds.max.x), y: roundedCoordinate(bounds.max.y), z: roundedCoordinate(bounds.max.z) },
+    size: { x: roundedCoordinate(bounds.size.x), y: roundedCoordinate(bounds.size.y), z: roundedCoordinate(bounds.size.z) },
+  };
 }
 
 function supportExportName(partName, extension) {
