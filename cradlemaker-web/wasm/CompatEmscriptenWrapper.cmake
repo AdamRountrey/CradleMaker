@@ -10,8 +10,33 @@ string(REPLACE
     contents "${contents}"
 )
 string(REPLACE
+    "globalThis.process?.versions?.node && globalThis.process?.type != 'renderer'"
+    "(globalThis.process&&globalThis.process.versions&&globalThis.process.versions.node&&globalThis.process.type!='renderer')"
+    contents "${contents}"
+)
+string(REPLACE
+    "typeof process !== 'undefined' && process.versions?.node"
+    "typeof process !== 'undefined' && process.versions && process.versions.node"
+    contents "${contents}"
+)
+string(REPLACE
+    "process.versions?.node"
+    "(process.versions&&process.versions.node)"
+    contents "${contents}"
+)
+string(REPLACE
+    "globalThis.process?.type"
+    "(globalThis.process&&globalThis.process.type)"
+    contents "${contents}"
+)
+string(REPLACE
     "Module[\"onAbort\"]?.(what);"
     "if(Module[\"onAbort\"]){Module[\"onAbort\"](what)}"
+    contents "${contents}"
+)
+string(REPLACE
+    "Module['onAbort']?.(what);"
+    "if(Module['onAbort']){Module['onAbort'](what)}"
     contents "${contents}"
 )
 string(REPLACE
@@ -21,6 +46,11 @@ string(REPLACE
 )
 string(REPLACE
     "wasmBinaryFile??=findWasmBinary();"
+    "if(wasmBinaryFile==null){wasmBinaryFile=findWasmBinary()}"
+    contents "${contents}"
+)
+string(REPLACE
+    "wasmBinaryFile ??= findWasmBinary();"
     "if(wasmBinaryFile==null){wasmBinaryFile=findWasmBinary()}"
     contents "${contents}"
 )
@@ -40,8 +70,38 @@ string(REPLACE
     contents "${contents}"
 )
 string(REPLACE
+    "maxBytesToWrite ??= 2147483647;"
+    "if(maxBytesToWrite==null){maxBytesToWrite=2147483647}"
+    contents "${contents}"
+)
+string(REPLACE
+    "maxBytesToWrite??=0x7FFFFFFF;"
+    "if(maxBytesToWrite==null){maxBytesToWrite=0x7FFFFFFF}"
+    contents "${contents}"
+)
+string(REPLACE
+    "maxBytesToWrite ??= 0x7FFFFFFF;"
+    "if(maxBytesToWrite==null){maxBytesToWrite=0x7FFFFFFF}"
+    contents "${contents}"
+)
+string(REPLACE
+    "warnOnce.shown||={};"
+    "if(!warnOnce.shown){warnOnce.shown={}}"
+    contents "${contents}"
+)
+string(REPLACE
+    "warnOnce.shown ||= {};"
+    "if(!warnOnce.shown){warnOnce.shown={}}"
+    contents "${contents}"
+)
+string(REPLACE
     "globalThis.navigator?.language??\"C\""
     "(globalThis.navigator&&globalThis.navigator.language||\"C\")"
+    contents "${contents}"
+)
+string(REPLACE
+    "globalThis.navigator?.language ?? 'C'"
+    "(globalThis.navigator&&globalThis.navigator.language||'C')"
     contents "${contents}"
 )
 string(REPLACE
@@ -52,6 +112,11 @@ string(REPLACE
 string(REPLACE
     "Module[\"onRuntimeInitialized\"]?.();"
     "if(Module[\"onRuntimeInitialized\"]){Module[\"onRuntimeInitialized\"]()}"
+    contents "${contents}"
+)
+string(REPLACE
+    "Module['onRuntimeInitialized']?.();"
+    "if(Module['onRuntimeInitialized']){Module['onRuntimeInitialized']()}"
     contents "${contents}"
 )
 

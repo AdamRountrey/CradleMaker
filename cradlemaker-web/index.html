@@ -46,75 +46,73 @@
           <p>Import an object, place supports, export the cradle.</p>
         </header>
 
-        <div class="control-block">
+        <details class="control-block" open>
+          <summary>Model</summary>
           <label class="file-button">
             Import STL
             <input id="model-file" type="file" accept=".stl,model/stl" />
           </label>
+          <label>
+            Sample
+            <select id="sample-model"></select>
+          </label>
           <button id="load-sample" type="button">Load sample</button>
-        </div>
+        </details>
 
-        <div class="control-block">
-          <h2>Object</h2>
+        <details class="control-block">
+          <summary>Object</summary>
           <div class="button-grid">
             <button id="toggle-model-visibility" type="button">Hide model</button>
+            <button id="toggle-grid-visibility" type="button">Hide grid</button>
             <button id="orient-model" type="button">Rotate helper</button>
             <button id="reset-orientation" type="button">Reset rotation</button>
           </div>
           <label>
+            Display
+            <select id="model-display-mode">
+              <option value="solid" selected>Solid inspection</option>
+              <option value="ghost">Ghosted context</option>
+              <option value="hidden">Hidden cradle view</option>
+            </select>
+          </label>
+          <label>
+            Rotation preset
+            <select id="rotation-preset">
+              <option value="0,0,0" selected>0 / 0 / 0</option>
+              <option value="90,0,0">X 90</option>
+              <option value="0,90,0">Y 90</option>
+              <option value="0,0,90">Z 90</option>
+              <option value="45,0,0">X 45</option>
+              <option value="0,45,0">Y 45</option>
+              <option value="0,0,45">Z 45</option>
+              <option value="30,15,0">X 30 / Y 15</option>
+              <option value="0,30,15">Y 30 / Z 15</option>
+            </select>
+          </label>
+          <button id="apply-rotation-preset" type="button">Apply rotation</button>
+          <label>
             Elevation <output id="elevation-value">18 mm</output>
             <input id="elevation" type="range" min="0" max="120" step="1" value="18" />
           </label>
-        </div>
+        </details>
 
-        <div class="control-block">
-          <h2>Supports</h2>
-          <label class="inline-toggle">
-            <input id="enable-support" type="checkbox" checked />
-            Enable support
-          </label>
+        <details class="control-block" open>
+          <summary>Supports</summary>
           <label>
             Type
             <select id="support-type">
               <option value="normal(auto)" selected>Normal auto</option>
-              <option value="tree(auto)">Tree auto</option>
-              <option value="hybrid(auto)">Hybrid auto</option>
             </select>
           </label>
           <label>
             Style
             <select id="support-style">
               <option value="default" selected>Default (Grid/Organic)</option>
-              <option value="grid">Grid</option>
-              <option value="snug">Snug</option>
-              <option value="organic">Organic</option>
-              <option value="tree_slim">Tree Slim</option>
-              <option value="tree_strong">Tree Strong</option>
-              <option value="tree_hybrid">Tree Hybrid</option>
-            </select>
-          </label>
-          <label>
-            Base pattern
-            <select id="support-base-pattern">
-              <option value="default" selected>Default</option>
-              <option value="rectilinear">Rectilinear</option>
-              <option value="rectilinear-grid">Rectilinear grid</option>
-              <option value="honeycomb">Honeycomb</option>
-              <option value="lightning">Lightning</option>
-              <option value="hollow">Hollow</option>
             </select>
           </label>
           <label>
             Threshold angle <output id="support-threshold-angle-value">40 deg</output>
             <input id="support-threshold-angle" type="range" min="0" max="89" step="1" value="40" />
-          </label>
-          <label>
-            Threshold overlap
-            <input id="support-threshold-overlap" type="text" value="50%" />
-          </label>
-          <label class="inline-toggle">
-            <input id="support-on-build-plate-only" type="checkbox" />
-            On build plate only
           </label>
           <label class="inline-toggle">
             <input id="support-critical-regions-only" type="checkbox" />
@@ -127,10 +125,6 @@
           <label>
             Top Z distance <output id="support-top-z-distance-value">0.2 mm</output>
             <input id="support-top-z-distance" type="range" min="0" max="2" step="0.05" value="0.2" />
-          </label>
-          <label>
-            Bottom Z distance <output id="support-bottom-z-distance-value">0.2 mm</output>
-            <input id="support-bottom-z-distance" type="range" min="0" max="2" step="0.05" value="0.2" />
           </label>
           <label>
             Object XY distance <output id="support-object-xy-distance-value">0.35 mm</output>
@@ -152,32 +146,15 @@
               <input id="interface-enabled" type="checkbox" />
               Print soft interface
             </label>
+            <p class="control-note">Requires dual extruders or a tool changer for a separate soft material.</p>
             <div id="interface-options" class="option-panel" hidden>
-              <label>
-                Interface pattern
-                <select id="support-interface-pattern">
-                  <option value="auto" selected>Default</option>
-                  <option value="rectilinear">Rectilinear</option>
-                  <option value="concentric">Concentric</option>
-                  <option value="rectilinear_interlaced">Rectilinear Interlaced</option>
-                  <option value="grid">Grid</option>
-                </select>
-              </label>
               <label>
                 Top interface layers
                 <input id="support-interface-top-layers" type="number" min="0" max="10" step="1" value="2" />
               </label>
               <label>
-                Bottom interface layers
-                <input id="support-interface-bottom-layers" type="number" min="-1" max="10" step="1" value="0" />
-              </label>
-              <label>
                 Top interface spacing
                 <input id="support-interface-spacing" type="number" min="0" max="10" step="0.05" value="0.5" />
-              </label>
-              <label>
-                Bottom interface spacing
-                <input id="support-bottom-interface-spacing" type="number" min="0" max="10" step="0.05" value="0.5" />
               </label>
             </div>
             <label class="inline-toggle option-toggle">
@@ -195,12 +172,13 @@
               </label>
             </div>
           </details>
-          <h2>Tree Supports</h2>
+          <details class="advanced-options" hidden>
+            <summary>Tree supports</summary>
             <label>
-            Branch distance <output id="tree-support-branch-distance-value">10 mm</output>
-            <input id="tree-support-branch-distance" type="range" min="1" max="20" step="0.5" value="10" />
-          </label>
-          <div class="compact-grid">
+              Branch distance <output id="tree-support-branch-distance-value">10 mm</output>
+              <input id="tree-support-branch-distance" type="range" min="1" max="20" step="0.5" value="10" />
+            </label>
+            <div class="compact-grid">
             <label>
               Tip diameter
                 <input id="tree-support-tip-diameter" type="number" min="0.1" max="10" step="0.1" value="2" />
@@ -209,28 +187,37 @@
               Branch diameter
                 <input id="tree-support-branch-diameter" type="number" min="0.1" max="20" step="0.1" value="6" />
             </label>
+            </div>
             <label>
-              Wall count
-              <input id="tree-support-wall-count" type="number" min="0" max="5" step="1" value="1" />
+              Branch angle <output id="tree-support-branch-angle-value">45 deg</output>
+              <input id="tree-support-branch-angle" type="range" min="5" max="85" step="1" value="45" />
             </label>
-          </div>
-          <label>
-            Branch angle <output id="tree-support-branch-angle-value">45 deg</output>
-            <input id="tree-support-branch-angle" type="range" min="5" max="85" step="1" value="45" />
-          </label>
+          </details>
           <div class="button-grid">
             <button id="generate-supports" type="button">Generate supports</button>
+            <button id="toggle-manual-support" type="button" aria-pressed="false">Manual marks off</button>
             <button id="toggle-coverage" type="button">Show coverage</button>
             <button id="clear-manual" type="button">Clear manual</button>
           </div>
-          <div id="job-status" class="job-status" role="status">Support core ready check has not run.</div>
-        </div>
+          <div id="qa-dashboard" class="qa-dashboard" aria-label="Cradle QA dashboard"></div>
+          <details class="status-details">
+            <summary>Details</summary>
+            <div id="job-status" class="job-status" role="status">Support core ready check has not run.</div>
+          </details>
+          <div id="job-progress-shell" class="progress-shell" hidden>
+            <progress id="job-progress" max="100" value="0" aria-label="Generate supports progress"></progress>
+          </div>
+        </details>
 
-        <div class="control-block">
-          <h2>Cradle</h2>
+        <details class="control-block">
+          <summary>Cradle</summary>
           <label class="inline-toggle">
             <input id="base-enabled" type="checkbox" checked />
             Add base plate
+          </label>
+          <label class="inline-toggle">
+            <input id="base-join-uprights" type="checkbox" checked />
+            Join uprights at bottom
           </label>
           <label>
             Base margin <output id="base-margin-value">8 mm</output>
@@ -240,10 +227,18 @@
             Base thickness <output id="base-thickness-value">3 mm</output>
             <input id="base-thickness" type="range" min="0.5" max="20" step="0.5" value="3" />
           </label>
-        </div>
+        </details>
 
-        <div class="control-block">
-          <h2>Split for printing</h2>
+        <details class="control-block">
+          <summary>Split for printing</summary>
+          <label>
+            Plate preset
+            <select id="split-plate-preset">
+              <option value="220,220,250" selected>220 x 220</option>
+              <option value="120,120,250">120 x 120</option>
+              <option value="60,60,250">60 x 60 test</option>
+            </select>
+          </label>
           <div class="compact-grid">
             <label>
               Plate width
@@ -260,10 +255,6 @@
             <label>
               Plate margin <output id="split-build-margin-value">5 mm</output>
               <input id="split-build-margin" type="range" min="0" max="30" step="0.5" value="5" />
-            </label>
-            <label>
-              Z-slide dovetails
-              <input id="split-connectors-enabled" type="checkbox" checked />
             </label>
             <label>
               Connector clearance <output id="split-connector-clearance-value">0.3 mm</output>
@@ -283,20 +274,24 @@
             <button id="export-split-manifest" type="button">Export manifest</button>
           </div>
           <div id="split-status" class="job-status" role="status">Generate a cradle to check build-plate fit.</div>
-        </div>
+          <div id="split-progress-shell" class="progress-shell" hidden>
+            <progress id="split-progress" max="100" value="0" aria-label="Preview split progress"></progress>
+          </div>
+        </details>
 
-        <div class="control-block">
+        <details class="control-block">
+          <summary>Export</summary>
           <div class="export-grid">
             <button id="export-stl" class="primary-action" type="button">Export cradle STL</button>
             <button id="export-ply" type="button">Export cradle PLY</button>
             <button id="export-interface-stl" type="button">Export interface STL</button>
             <button id="export-interface-ply" type="button">Export interface PLY</button>
           </div>
-          <p class="hint">Click the model to mark manual support intent. Support generation will be enabled by the ported libslic3r WASM core.</p>
-        </div>
+          <p class="hint">Use Manual marks in Supports when you need to place manual support intent.</p>
+        </details>
       </aside>
     </main>
 
-    <script type="module" src="./src/main.js?v=orca-wasm-42"></script>
+    <script type="module" src="./src/main.js?v=orca-wasm-131"></script>
   </body>
 </html>

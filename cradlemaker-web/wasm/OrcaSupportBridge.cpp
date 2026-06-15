@@ -32,10 +32,19 @@ std::string real_orca_support_plan_json()
 "src/libslic3r/Support/SupportMaterial.cpp",
 "src/libslic3r/Support/TreeModelVolumes.cpp",
 "src/libslic3r/Support/TreeSupport.cpp",
-"src/libslic3r/Support/TreeSupport3D.cpp",
-"src/libslic3r/Cradle/CradleSupport.cpp"
+"src/libslic3r/Support/TreeSupport3D.cpp"
 ],
-"solidification":"Slic3r::Cradle::build_support_solid",
+"organic_tree_stages":[
+"detect overhang polygons from sliced object layers",
+"precalculate collision, avoidance, wall restriction, bed, and placeable areas",
+"create initial support influence areas",
+"propagate influence areas downward layer by layer",
+"place support nodes inside valid areas",
+"smooth branches while avoiding model collisions",
+"extrude branch meshes and slice them back into support polygons",
+"emit support, contact, and interface layers"
+],
+"solidification":"Cradlemaker-owned watertight cradle solidification from Orca support polygons",
 "next_build_step":"construct a headless Print/PrintObject from uploaded mesh, run Orca organic tree support generation, then solidify returned SupportLayer polygons",
 "known_port_boundary":[
 "Print/PrintObject construction from browser mesh",

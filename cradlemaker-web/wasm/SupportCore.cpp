@@ -53,6 +53,7 @@ struct SupportSettings {
     bool base_enabled = false;
     bool interface_enabled = false;
     bool foam_gap_enabled = false;
+    bool join_uprights_bottom_enabled = true;
     bool remove_small_overhangs = true;
     bool tree_mode = false;
     bool requested_orca_tree_mode = false;
@@ -125,11 +126,40 @@ struct SupportGenerationStats {
     std::size_t closed_gap_cells = 0;
     std::size_t contact_cells = 0;
     std::size_t base_cells = 0;
+    std::size_t bottom_join_cells = 0;
     std::size_t interface_cells = 0;
     std::size_t edge_clearance_removed_cells = 0;
     std::size_t foam_gap_removed_cells = 0;
     std::size_t manual_points = 0;
     std::size_t tree_branches = 0;
+    std::size_t tree_tip_contacts = 0;
+    std::size_t tree_local_uprights = 0;
+    std::size_t tree_waypoint_branches = 0;
+    std::size_t tree_slope_reroutes = 0;
+    std::size_t tree_model_reroutes = 0;
+};
+
+struct TreeLayerDisk {
+    double x = 0.0;
+    double y = 0.0;
+    double z = 0.0;
+    double radius = 0.0;
+};
+
+struct OrganicTreeLayerData {
+    double bottom_z = 0.0;
+    double top_z = 0.0;
+    double layer_height = 0.2;
+    int circle_segments = 18;
+    std::vector<std::vector<TreeLayerDisk>> layers;
+
+    std::size_t disk_count() const
+    {
+        std::size_t total = 0;
+        for (const auto& layer : layers)
+            total += layer.size();
+        return total;
+    }
 };
 
 struct CoverageSamples {
@@ -405,6 +435,7 @@ SupportSettings read_support_settings(const std::string& json)
     SupportSettings settings;
     settings.enable_support = read_bool_field(json, "enable_support", settings.enable_support);
     settings.base_enabled = read_bool_field(json, "base_enabled", settings.base_enabled);
+    settings.join_uprights_bottom_enabled = read_bool_field(json, "join_uprights_bottom_enabled", settings.join_uprights_bottom_enabled);
     settings.interface_enabled = read_bool_field(json, "support_interface_enabled", settings.interface_enabled);
     settings.foam_gap_enabled = read_bool_field(json, "foam_gap_enabled", settings.foam_gap_enabled);
     settings.remove_small_overhangs = read_bool_field(json, "support_remove_small_overhang", settings.remove_small_overhangs);
@@ -414,7 +445,7 @@ SupportSettings read_support_settings(const std::string& json)
         support_type.find("hybrid") != std::string::npos ||
         support_style.find("tree") != std::string::npos ||
         support_style.find("organic") != std::string::npos;
-    settings.tree_mode = false;
+    settings.tree_mode = settings.requested_orca_tree_mode;
     settings.threshold_angle_deg = read_number_field(json, "support_threshold_angle", settings.threshold_angle_deg);
     settings.top_z_distance_mm = read_number_field(json, "support_top_z_distance", settings.top_z_distance_mm);
     settings.xy_distance_mm = read_number_field(json, "support_object_xy_distance", settings.xy_distance_mm);
@@ -457,6 +488,16 @@ Vec3 subtract(const Vec3& lhs, const Vec3& rhs)
     return { lhs.x - rhs.x, lhs.y - rhs.y, lhs.z - rhs.z };
 }
 
+Vec3 add(const Vec3& lhs, const Vec3& rhs)
+{
+    return { lhs.x + rhs.x, lhs.y + rhs.y, lhs.z + rhs.z };
+}
+
+Vec3 multiply(const Vec3& value, const double scale)
+{
+    return { value.x * scale, value.y * scale, value.z * scale };
+}
+
 Vec3 cross(const Vec3& lhs, const Vec3& rhs)
 {
     return {
@@ -471,6 +512,14 @@ double length(const Vec3& value)
     return std::sqrt(value.x * value.x + value.y * value.y + value.z * value.z);
 }
 
+Vec3 normalize(const Vec3& value)
+{
+    const double value_length = length(value);
+    if (value_length <= 1e-12)
+        return { 0.0, 0.0, 1.0 };
+    return { value.x / value_length, value.y / value_length, value.z / value_length };
+}
+
 int add_vertex(SupportMesh& mesh, const Vec3& vertex)
 {
     mesh.vertices.push_back(vertex);
@@ -479,9 +528,24 @@ int add_vertex(SupportMesh& mesh, const Vec3& vertex)
 
 void add_triangle(SupportMesh& mesh, const Vec3& a, const Vec3& b, const Vec3& c)
 {
+    if (length(cross(subtract(b, a), subtract(c, a))) <= 1e-8)
+        return;
+
     const int ia = add_vertex(mesh, a);
     const int ib = add_vertex(mesh, b);
     const int ic = add_vertex(mesh, c);
+    mesh.triangles.push_back({ ia, ib, ic });
+}
+
+void add_indexed_triangle(SupportMesh& mesh, const int ia, const int ib, const int ic)
+{
+    if (ia == ib || ib == ic || ic == ia)
+        return;
+    const Vec3& a = mesh.vertices[std::size_t(ia)];
+    const Vec3& b = mesh.vertices[std::size_t(ib)];
+    const Vec3& c = mesh.vertices[std::size_t(ic)];
+    if (length(cross(subtract(b, a), subtract(c, a))) <= 1e-8)
+        return;
     mesh.triangles.push_back({ ia, ib, ic });
 }
 
@@ -489,6 +553,402 @@ void add_quad(SupportMesh& mesh, const Vec3& a, const Vec3& b, const Vec3& c, co
 {
     add_triangle(mesh, a, b, c);
     add_triangle(mesh, a, c, d);
+}
+
+void add_tapered_tube(
+    SupportMesh& mesh,
+    const Vec3& start,
+    const Vec3& end,
+    const double start_radius,
+    const double end_radius,
+    const int segments = 14,
+    const bool cap_ends = true)
+{
+    const Vec3 axis = subtract(end, start);
+    const double tube_length = length(axis);
+    if (tube_length <= 0.05)
+        return;
+
+    const Vec3 w = normalize(axis);
+    const Vec3 reference = std::abs(w.z) < 0.92 ? Vec3 { 0.0, 0.0, 1.0 } : Vec3 { 1.0, 0.0, 0.0 };
+    const Vec3 u = normalize(cross(w, reference));
+    const Vec3 v = normalize(cross(w, u));
+    const double r0 = std::max(0.05, start_radius);
+    const double r1 = std::max(0.05, end_radius);
+
+    std::vector<Vec3> start_ring;
+    std::vector<Vec3> end_ring;
+    start_ring.reserve(std::size_t(segments));
+    end_ring.reserve(std::size_t(segments));
+    for (int index = 0; index < segments; ++index) {
+        const double angle = 2.0 * kPi * double(index) / double(segments);
+        const Vec3 direction = add(multiply(u, std::cos(angle)), multiply(v, std::sin(angle)));
+        start_ring.push_back(add(start, multiply(direction, r0)));
+        end_ring.push_back(add(end, multiply(direction, r1)));
+    }
+
+    for (int index = 0; index < segments; ++index) {
+        const int next = (index + 1) % segments;
+        add_quad(mesh, start_ring[index], start_ring[next], end_ring[next], end_ring[index]);
+    }
+
+    if (cap_ends) {
+        for (int index = 0; index < segments; ++index) {
+            const int next = (index + 1) % segments;
+            add_triangle(mesh, start, start_ring[index], start_ring[next]);
+            add_triangle(mesh, end, end_ring[next], end_ring[index]);
+        }
+    }
+}
+
+Vec3 quadratic_bezier(const Vec3& a, const Vec3& b, const Vec3& c, const double t)
+{
+    const double u = 1.0 - t;
+    return add(add(multiply(a, u * u), multiply(b, 2.0 * u * t)), multiply(c, t * t));
+}
+
+double organic_bend_sign(const Vec3& start, const Vec3& end)
+{
+    const double value = std::sin(start.x * 0.173 + start.y * 0.117 + end.x * 0.071 - end.y * 0.191);
+    return value < 0.0 ? -1.0 : 1.0;
+}
+
+void add_curved_tube(
+    SupportMesh& mesh,
+    const Vec3& start,
+    const Vec3& end,
+    const double start_radius,
+    const double end_radius,
+    const int curve_segments = 5,
+    const int ring_segments = 14)
+{
+    const Vec3 delta = subtract(end, start);
+    const double horizontal = std::hypot(delta.x, delta.y);
+    if (length(delta) <= 0.05)
+        return;
+
+    const int safe_curve_segments = std::max(2, curve_segments);
+    const int safe_ring_segments = std::max(8, ring_segments);
+    Vec3 control {
+        (start.x + end.x) * 0.5,
+        (start.y + end.y) * 0.5,
+        (start.z + end.z) * 0.5
+    };
+    if (horizontal > 0.1) {
+        const double bend = std::min(std::max(horizontal * 0.18, std::max(start_radius, end_radius) * 0.35), std::max(1.0, horizontal * 0.35));
+        const double sign = organic_bend_sign(start, end);
+        control.x += (-delta.y / horizontal) * bend * sign;
+        control.y += (delta.x / horizontal) * bend * sign;
+    }
+    control.z = std::min(start.z, end.z) + std::abs(delta.z) * 0.58;
+
+    std::vector<Vec3> points;
+    std::vector<double> radii;
+    points.reserve(std::size_t(safe_curve_segments + 1));
+    radii.reserve(std::size_t(safe_curve_segments + 1));
+    for (int segment = 0; segment <= safe_curve_segments; ++segment) {
+        const double t = double(segment) / double(safe_curve_segments);
+        points.push_back(quadratic_bezier(start, control, end, t));
+        radii.push_back(std::max(0.05, start_radius + (end_radius - start_radius) * t));
+    }
+
+    std::vector<std::vector<Vec3>> rings;
+    rings.reserve(points.size());
+    for (int segment = 0; segment <= safe_curve_segments; ++segment) {
+        Vec3 tangent;
+        if (segment == 0)
+            tangent = subtract(points[1], points[0]);
+        else if (segment == safe_curve_segments)
+            tangent = subtract(points[std::size_t(segment)], points[std::size_t(segment - 1)]);
+        else
+            tangent = subtract(points[std::size_t(segment + 1)], points[std::size_t(segment - 1)]);
+
+        const Vec3 w = normalize(tangent);
+        const Vec3 reference = std::abs(w.z) < 0.92 ? Vec3 { 0.0, 0.0, 1.0 } : Vec3 { 1.0, 0.0, 0.0 };
+        const Vec3 u = normalize(cross(w, reference));
+        const Vec3 v = normalize(cross(w, u));
+        std::vector<Vec3> ring;
+        ring.reserve(std::size_t(safe_ring_segments));
+        for (int index = 0; index < safe_ring_segments; ++index) {
+            const double angle = 2.0 * kPi * double(index) / double(safe_ring_segments);
+            const Vec3 direction = add(multiply(u, std::cos(angle)), multiply(v, std::sin(angle)));
+            ring.push_back(add(points[std::size_t(segment)], multiply(direction, radii[std::size_t(segment)])));
+        }
+        rings.push_back(std::move(ring));
+    }
+
+    for (int segment = 0; segment < safe_curve_segments; ++segment) {
+        for (int index = 0; index < safe_ring_segments; ++index) {
+            const int next = (index + 1) % safe_ring_segments;
+            add_quad(
+                mesh,
+                rings[std::size_t(segment)][std::size_t(index)],
+                rings[std::size_t(segment)][std::size_t(next)],
+                rings[std::size_t(segment + 1)][std::size_t(next)],
+                rings[std::size_t(segment + 1)][std::size_t(index)]);
+        }
+    }
+
+    for (int index = 0; index < safe_ring_segments; ++index) {
+        const int next = (index + 1) % safe_ring_segments;
+        add_triangle(mesh, points.front(), rings.front()[std::size_t(index)], rings.front()[std::size_t(next)]);
+        add_triangle(mesh, points.back(), rings.back()[std::size_t(next)], rings.back()[std::size_t(index)]);
+    }
+}
+
+void add_layer_area_branch(
+    SupportMesh& mesh,
+    const Vec3& start,
+    const Vec3& end,
+    const double start_radius,
+    const double end_radius,
+    const int curve_segments = 5,
+    const int ring_segments = 14)
+{
+    const Vec3 delta = subtract(end, start);
+    const double horizontal = std::hypot(delta.x, delta.y);
+    if (length(delta) <= 0.05 || end.z <= start.z + 0.05)
+        return;
+
+    const int safe_curve_segments = std::max(2, curve_segments);
+    const int safe_ring_segments = std::max(8, ring_segments);
+    Vec3 control {
+        (start.x + end.x) * 0.5,
+        (start.y + end.y) * 0.5,
+        (start.z + end.z) * 0.5
+    };
+    if (horizontal > 0.1) {
+        const double bend = std::min(std::max(horizontal * 0.16, std::max(start_radius, end_radius) * 0.35), std::max(0.7, horizontal * 0.28));
+        const double sign = organic_bend_sign(start, end);
+        control.x += (-delta.y / horizontal) * bend * sign;
+        control.y += (delta.x / horizontal) * bend * sign;
+    }
+    control.z = start.z + (end.z - start.z) * 0.56;
+
+    const Vec3 axis_xy = horizontal > 0.1 ? Vec3 { delta.x / horizontal, delta.y / horizontal, 0.0 } : Vec3 { 1.0, 0.0, 0.0 };
+    const Vec3 normal_xy { -axis_xy.y, axis_xy.x, 0.0 };
+    const double branch_slope = horizontal / std::max(0.1, end.z - start.z);
+    const double oval_stretch = std::clamp(branch_slope * 0.32, 0.0, 0.55);
+
+    std::vector<Vec3> centers;
+    std::vector<double> radii;
+    centers.reserve(std::size_t(safe_curve_segments + 1));
+    radii.reserve(std::size_t(safe_curve_segments + 1));
+    for (int segment = 0; segment <= safe_curve_segments; ++segment) {
+        const double t = double(segment) / double(safe_curve_segments);
+        Vec3 center = quadratic_bezier(start, control, end, t);
+        center.z = start.z + (end.z - start.z) * t;
+        centers.push_back(center);
+        radii.push_back(std::max(0.05, start_radius + (end_radius - start_radius) * t));
+    }
+
+    std::vector<std::vector<Vec3>> rings;
+    rings.reserve(centers.size());
+    for (int segment = 0; segment <= safe_curve_segments; ++segment) {
+        const double radius = radii[std::size_t(segment)];
+        const double major = radius * (1.0 + oval_stretch);
+        const double minor = std::max(radius * 0.72, radius * (1.0 - oval_stretch * 0.35));
+        std::vector<Vec3> ring;
+        ring.reserve(std::size_t(safe_ring_segments));
+        for (int index = 0; index < safe_ring_segments; ++index) {
+            const double angle = 2.0 * kPi * double(index) / double(safe_ring_segments);
+            const Vec3 offset = add(
+                multiply(axis_xy, std::cos(angle) * major),
+                multiply(normal_xy, std::sin(angle) * minor));
+            ring.push_back({ centers[std::size_t(segment)].x + offset.x, centers[std::size_t(segment)].y + offset.y, centers[std::size_t(segment)].z });
+        }
+        rings.push_back(std::move(ring));
+    }
+
+    for (int segment = 0; segment < safe_curve_segments; ++segment) {
+        for (int index = 0; index < safe_ring_segments; ++index) {
+            const int next = (index + 1) % safe_ring_segments;
+            add_quad(
+                mesh,
+                rings[std::size_t(segment)][std::size_t(index)],
+                rings[std::size_t(segment)][std::size_t(next)],
+                rings[std::size_t(segment + 1)][std::size_t(next)],
+                rings[std::size_t(segment + 1)][std::size_t(index)]);
+        }
+    }
+
+    for (int index = 0; index < safe_ring_segments; ++index) {
+        const int next = (index + 1) % safe_ring_segments;
+        add_triangle(mesh, centers.front(), rings.front()[std::size_t(next)], rings.front()[std::size_t(index)]);
+        add_triangle(mesh, centers.back(), rings.back()[std::size_t(index)], rings.back()[std::size_t(next)]);
+    }
+}
+
+void add_layer_area_polybranch(
+    SupportMesh& mesh,
+    const std::vector<Vec3>& source_centers,
+    const std::vector<double>& source_radii,
+    const int ring_segments = 18)
+{
+    if (source_centers.size() < 2 || source_centers.size() != source_radii.size())
+        return;
+
+    std::vector<Vec3> centers;
+    std::vector<double> radii;
+    centers.reserve(source_centers.size());
+    radii.reserve(source_radii.size());
+    centers.push_back(source_centers.front());
+    radii.push_back(source_radii.front());
+
+    for (std::size_t index = 1; index + 1 < source_centers.size(); ++index) {
+        const Vec3& previous = centers.back();
+        const Vec3& current = source_centers[index];
+        const Vec3& next = source_centers[index + 1];
+        const double keep_distance = std::hypot(previous.x - current.x, previous.y - current.y) + std::abs(current.z - previous.z);
+        const Vec3 in = normalize(subtract(current, previous));
+        const Vec3 out = normalize(subtract(next, current));
+        const double bend = length(cross(in, out));
+        if (keep_distance < 1.2 && bend < 0.075)
+            continue;
+        centers.push_back(current);
+        radii.push_back(source_radii[index]);
+    }
+
+    centers.push_back(source_centers.back());
+    radii.push_back(source_radii.back());
+    if (centers.size() < 2)
+        return;
+
+    for (int pass = 0; pass < 3 && centers.size() > 3; ++pass) {
+        std::vector<Vec3> smoothed_centers = centers;
+        std::vector<double> smoothed_radii = radii;
+        for (std::size_t index = 1; index + 1 < centers.size(); ++index) {
+            smoothed_centers[index] = {
+                centers[index - 1].x * 0.22 + centers[index].x * 0.56 + centers[index + 1].x * 0.22,
+                centers[index - 1].y * 0.22 + centers[index].y * 0.56 + centers[index + 1].y * 0.22,
+                centers[index - 1].z * 0.16 + centers[index].z * 0.68 + centers[index + 1].z * 0.16,
+            };
+            smoothed_radii[index] = radii[index - 1] * 0.24 + radii[index] * 0.52 + radii[index + 1] * 0.24;
+        }
+        centers = std::move(smoothed_centers);
+        radii = std::move(smoothed_radii);
+    }
+
+    const int safe_ring_segments = std::max(12, ring_segments);
+    std::vector<std::vector<int>> rings;
+    rings.reserve(centers.size());
+
+    for (std::size_t segment = 0; segment < centers.size(); ++segment) {
+        Vec3 tangent;
+        if (segment == 0)
+            tangent = subtract(centers[1], centers[0]);
+        else if (segment + 1 == centers.size())
+            tangent = subtract(centers[segment], centers[segment - 1]);
+        else
+            tangent = subtract(centers[segment + 1], centers[segment - 1]);
+
+        const double horizontal = std::hypot(tangent.x, tangent.y);
+        const Vec3 axis_xy = horizontal > 0.1 ? Vec3 { tangent.x / horizontal, tangent.y / horizontal, 0.0 } : Vec3 { 1.0, 0.0, 0.0 };
+        const Vec3 normal_xy { -axis_xy.y, axis_xy.x, 0.0 };
+        const double slope = horizontal / std::max(0.1, std::abs(tangent.z));
+        const double oval_stretch = std::clamp(slope * 0.22, 0.0, 0.38);
+        const double radius = std::max(0.05, radii[segment]);
+        const double major = radius * (1.0 + oval_stretch);
+        const double minor = std::max(radius * 0.82, radius * (1.0 - oval_stretch * 0.25));
+
+        std::vector<int> ring;
+        ring.reserve(std::size_t(safe_ring_segments));
+        for (int index = 0; index < safe_ring_segments; ++index) {
+            const double angle = 2.0 * kPi * double(index) / double(safe_ring_segments);
+            const Vec3 offset = add(
+                multiply(axis_xy, std::cos(angle) * major),
+                multiply(normal_xy, std::sin(angle) * minor));
+            ring.push_back(add_vertex(mesh, { centers[segment].x + offset.x, centers[segment].y + offset.y, centers[segment].z }));
+        }
+        rings.push_back(std::move(ring));
+    }
+
+    for (std::size_t segment = 0; segment + 1 < rings.size(); ++segment) {
+        for (int index = 0; index < safe_ring_segments; ++index) {
+            const int next = (index + 1) % safe_ring_segments;
+            const int a = rings[segment][std::size_t(index)];
+            const int b = rings[segment][std::size_t(next)];
+            const int c = rings[segment + 1][std::size_t(next)];
+            const int d = rings[segment + 1][std::size_t(index)];
+            add_indexed_triangle(mesh, a, b, c);
+            add_indexed_triangle(mesh, a, c, d);
+        }
+    }
+
+    const int bottom_center = add_vertex(mesh, centers.front());
+    const int top_center = add_vertex(mesh, centers.back());
+    for (int index = 0; index < safe_ring_segments; ++index) {
+        const int next = (index + 1) % safe_ring_segments;
+        add_indexed_triangle(mesh, bottom_center, rings.front()[std::size_t(next)], rings.front()[std::size_t(index)]);
+        add_indexed_triangle(mesh, top_center, rings.back()[std::size_t(index)], rings.back()[std::size_t(next)]);
+    }
+}
+
+struct OrganicNode {
+    Vec3 point;
+    double load = 1.0;
+    double distance_to_top = 0.0;
+    double radius = 0.5;
+    int source_count = 1;
+};
+
+struct OrganicSkeletonEdge {
+    int parent_id = 0;
+    int child_id = 0;
+    int level = 0;
+};
+
+void collect_organic_layer_disks(
+    OrganicTreeLayerData* layer_data,
+    const std::vector<OrganicNode>& nodes,
+    const std::vector<OrganicSkeletonEdge>& edges,
+    const ContactGrid& grid,
+    const double root_z,
+    const double top_z,
+    const double layer_height)
+{
+    if (!layer_data || nodes.empty() || edges.empty())
+        return;
+
+    double max_radius = 0.0;
+    for (const OrganicNode& node : nodes) {
+        max_radius = std::max(max_radius, node.radius);
+    }
+
+    const double union_cell = std::clamp(std::min(grid.cell_size * 0.42, max_radius * 0.18), 0.18, 0.42);
+    const double safe_layer_height = std::max(0.05, layer_height);
+    const int layer_count = std::max(1, int(std::ceil((top_z - root_z) / safe_layer_height)) + 2);
+    layer_data->bottom_z = root_z;
+    layer_data->top_z = top_z;
+    layer_data->layer_height = safe_layer_height;
+    layer_data->circle_segments = std::max(14, std::min(28, int(std::ceil(max_radius * 5.0))));
+    layer_data->layers.clear();
+    layer_data->layers.resize(std::size_t(layer_count));
+
+    for (const OrganicSkeletonEdge& edge : edges) {
+        if (edge.parent_id < 0 || edge.child_id < 0 ||
+            edge.parent_id >= int(nodes.size()) || edge.child_id >= int(nodes.size()))
+            continue;
+        const OrganicNode& parent = nodes[std::size_t(edge.parent_id)];
+        const OrganicNode& child = nodes[std::size_t(edge.child_id)];
+        const double z0 = std::min(parent.point.z, child.point.z);
+        const double z1 = std::max(parent.point.z, child.point.z);
+        if (z1 <= z0 + 1e-6)
+            continue;
+        const int first_layer = std::max(0, int(std::floor((z0 - root_z) / safe_layer_height)));
+        const int last_layer = std::min(layer_count - 1, int(std::ceil((z1 - root_z) / safe_layer_height)));
+        for (int layer = first_layer; layer <= last_layer; ++layer) {
+            const double z = root_z + double(layer) * safe_layer_height;
+            const double t = std::clamp((z - parent.point.z) / (child.point.z - parent.point.z), 0.0, 1.0);
+            const Vec3 center {
+                parent.point.x + (child.point.x - parent.point.x) * t,
+                parent.point.y + (child.point.y - parent.point.y) * t,
+                z
+            };
+            const double radius = std::max(union_cell * 0.85, parent.radius + (child.radius - parent.radius) * t);
+            layer_data->layers[std::size_t(layer)].push_back({ center.x, center.y, z, radius });
+        }
+    }
 }
 
 double triangle_area_2d(const Vec3& a, const Vec3& b, const Vec3& c)
@@ -625,14 +1085,62 @@ void mark_model_ceiling_cell(ContactGrid& grid, const int ix, const int iy, cons
     cell_ceiling = std::min(cell_ceiling, ceiling_z);
 }
 
+void mark_model_side_wall_clearance(ContactGrid& grid, const SupportSettings& settings, const Vec3& a, const Vec3& b, const Vec3& c)
+{
+    const std::array<Vec3, 3> points { a, b, c };
+    int first = 0;
+    int second = 1;
+    double max_distance = -1.0;
+
+    for (int left = 0; left < 3; ++left) {
+        for (int right = left + 1; right < 3; ++right) {
+            const double distance = std::hypot(points[left].x - points[right].x, points[left].y - points[right].y);
+            if (distance > max_distance) {
+                max_distance = distance;
+                first = left;
+                second = right;
+            }
+        }
+    }
+
+    const Vec3 p0 = points[first];
+    const Vec3 p1 = points[second];
+    const double side_floor_z = std::min({ a.z, b.z, c.z }) - settings.effective_top_z_distance_mm();
+    const double expand = settings.xy_distance_mm + grid.cell_size * 0.8;
+    const int min_ix = int(std::floor((std::min(p0.x, p1.x) - expand - grid.origin_x) / grid.cell_size));
+    const int max_ix = int(std::floor((std::max(p0.x, p1.x) + expand - grid.origin_x) / grid.cell_size));
+    const int min_iy = int(std::floor((std::min(p0.y, p1.y) - expand - grid.origin_y) / grid.cell_size));
+    const int max_iy = int(std::floor((std::max(p0.y, p1.y) + expand - grid.origin_y) / grid.cell_size));
+
+    for (int iy = min_iy; iy <= max_iy; ++iy) {
+        for (int ix = min_ix; ix <= max_ix; ++ix) {
+            if (!grid.inside(ix, iy))
+                continue;
+
+            const Vec3 cell_center {
+                grid.origin_x + (double(ix) + 0.5) * grid.cell_size,
+                grid.origin_y + (double(iy) + 0.5) * grid.cell_size,
+                0.0
+            };
+            const double distance = max_distance > 1e-9
+                ? point_segment_distance_xy(cell_center, p0, p1)
+                : std::hypot(cell_center.x - p0.x, cell_center.y - p0.y);
+            if (distance <= expand)
+                mark_model_ceiling_cell(grid, ix, iy, side_floor_z);
+        }
+    }
+}
+
 void populate_model_collision_ceiling(ContactGrid& grid, const MeshStats& mesh_stats, const SupportSettings& settings)
 {
     for (std::size_t vertex_index = 0; vertex_index + 2 < mesh_stats.vertices.size(); vertex_index += 3) {
         const Vec3 a = mesh_stats.vertices[vertex_index];
         const Vec3 b = mesh_stats.vertices[vertex_index + 1];
         const Vec3 c = mesh_stats.vertices[vertex_index + 2];
-        if (triangle_area_2d(a, b, c) <= 1e-8)
+        if (triangle_area_2d(a, b, c) <= 1e-8) {
+            mark_model_side_wall_clearance(grid, settings, a, b, c);
             continue;
+        }
 
         const double expand = grid.cell_size * 0.75;
         const int min_ix = int(std::floor((std::min({ a.x, b.x, c.x }) - expand - grid.origin_x) / grid.cell_size));
@@ -1104,6 +1612,71 @@ std::size_t grow_base_footprint(ContactGrid& grid, const double margin_mm, const
     return base_cells;
 }
 
+std::size_t join_bottom_uprights(ContactGrid& grid, const double base_thickness_mm)
+{
+    if (base_thickness_mm <= grid.bottom_z + 0.05)
+        return 0;
+
+    const std::vector<double> source = grid.top_z;
+    auto source_occupied = [&](const int ix, const int iy) {
+        return grid.inside(ix, iy) && source[grid.index(ix, iy)] > grid.bottom_z + 0.05;
+    };
+
+    std::vector<unsigned char> join_mask(grid.top_z.size(), 0);
+
+    for (int iy = 0; iy < grid.rows; ++iy) {
+        int min_ix = grid.cols;
+        int max_ix = -1;
+        for (int ix = 0; ix < grid.cols; ++ix) {
+            if (!source_occupied(ix, iy))
+                continue;
+            min_ix = std::min(min_ix, ix);
+            max_ix = std::max(max_ix, ix);
+        }
+        if (max_ix < min_ix)
+            continue;
+        for (int ix = min_ix; ix <= max_ix; ++ix)
+            join_mask[grid.index(ix, iy)] = 1;
+    }
+
+    for (int ix = 0; ix < grid.cols; ++ix) {
+        int min_iy = grid.rows;
+        int max_iy = -1;
+        for (int iy = 0; iy < grid.rows; ++iy) {
+            if (!source_occupied(ix, iy))
+                continue;
+            min_iy = std::min(min_iy, iy);
+            max_iy = std::max(max_iy, iy);
+        }
+        if (max_iy < min_iy)
+            continue;
+        for (int iy = min_iy; iy <= max_iy; ++iy)
+            join_mask[grid.index(ix, iy)] = 1;
+    }
+
+    std::size_t joined_cells = 0;
+    for (int iy = 0; iy < grid.rows; ++iy) {
+        for (int ix = 0; ix < grid.cols; ++ix) {
+            const int cell_index = grid.index(ix, iy);
+            if (!join_mask[cell_index])
+                continue;
+
+            const double clamped_base_top = clamp_to_model_ceiling(grid, ix, iy, base_thickness_mm);
+            if (clamped_base_top <= grid.bottom_z + 0.05)
+                continue;
+
+            double& cell_top = grid.top_z[cell_index];
+            if (cell_top < clamped_base_top - 0.05) {
+                if (cell_top <= grid.bottom_z + 0.05)
+                    ++joined_cells;
+                cell_top = clamped_base_top;
+            }
+        }
+    }
+
+    return joined_cells;
+}
+
 void smooth_contact_heights(ContactGrid& grid, const double base_thickness_mm)
 {
     std::vector<double> smoothed = grid.top_z;
@@ -1309,7 +1882,103 @@ void add_cell_side_quad(SupportMesh& out, const int dx, const int dy, const doub
         add_quad(out, { x1, y1, z0 }, { x0, y1, z0 }, { x0, y1, z1 }, { x1, y1, z1 });
 }
 
-void mesh_height_field(const ContactGrid& grid, const std::vector<double>& bottom_z, const std::vector<double>& top_z, SupportMesh& out)
+double layer_corner_value(
+    const ContactGrid& grid,
+    const std::vector<double>& bottom_z,
+    const std::vector<double>& top_z,
+    const std::vector<double>& value_z,
+    const int corner_ix,
+    const int corner_iy,
+    const double shoulder_z,
+    const bool prefer_high,
+    const double fallback)
+{
+    double value = prefer_high ? std::numeric_limits<double>::lowest() : std::numeric_limits<double>::max();
+    bool found = false;
+    const bool ignore_shoulder_neighbors = shoulder_z > grid.bottom_z + 0.05 && fallback > shoulder_z + grid.cell_size * 0.5;
+
+    for (int dy = -1; dy <= 0; ++dy) {
+        for (int dx = -1; dx <= 0; ++dx) {
+            const int ix = corner_ix + dx;
+            const int iy = corner_iy + dy;
+            if (!layer_cell_occupied(grid, bottom_z, top_z, ix, iy))
+                continue;
+
+            const double candidate = value_z[grid.index(ix, iy)];
+            if (ignore_shoulder_neighbors && candidate <= shoulder_z + 0.05)
+                continue;
+
+            value = prefer_high ? std::max(value, candidate) : std::min(value, candidate);
+            found = true;
+        }
+    }
+
+    return found ? value : fallback;
+}
+
+void add_cell_top_terrain(
+    SupportMesh& out,
+    const double x0,
+    const double x1,
+    const double y0,
+    const double y1,
+    const double center_z,
+    const double z00,
+    const double z10,
+    const double z11,
+    const double z01)
+{
+    (void)center_z;
+    add_quad(out, { x0, y0, z00 }, { x1, y0, z10 }, { x1, y1, z11 }, { x0, y1, z01 });
+}
+
+void add_cell_bottom_terrain(
+    SupportMesh& out,
+    const double x0,
+    const double x1,
+    const double y0,
+    const double y1,
+    const double z00,
+    const double z10,
+    const double z11,
+    const double z01)
+{
+    const Vec3 p00 { x0, y0, z00 };
+    const Vec3 p10 { x1, y0, z10 };
+    const Vec3 p11 { x1, y1, z11 };
+    const Vec3 p01 { x0, y1, z01 };
+
+    add_quad(out, p01, p11, p10, p00);
+}
+
+void add_cell_boundary_side_terrain(
+    SupportMesh& out,
+    const int dx,
+    const int dy,
+    const double x0,
+    const double x1,
+    const double y0,
+    const double y1,
+    const double b00,
+    const double b10,
+    const double b11,
+    const double b01,
+    const double t00,
+    const double t10,
+    const double t11,
+    const double t01)
+{
+    if (dx < 0)
+        add_quad(out, { x0, y1, b01 }, { x0, y0, b00 }, { x0, y0, t00 }, { x0, y1, t01 });
+    else if (dx > 0)
+        add_quad(out, { x1, y0, b10 }, { x1, y1, b11 }, { x1, y1, t11 }, { x1, y0, t10 });
+    else if (dy < 0)
+        add_quad(out, { x0, y0, b00 }, { x1, y0, b10 }, { x1, y0, t10 }, { x0, y0, t00 });
+    else
+        add_quad(out, { x1, y1, b11 }, { x0, y1, b01 }, { x0, y1, t01 }, { x1, y1, t11 });
+}
+
+void mesh_height_field(const ContactGrid& grid, const std::vector<double>& bottom_z, const std::vector<double>& top_z, const double shoulder_z, SupportMesh& out)
 {
     for (int iy = 0; iy < grid.rows; ++iy) {
         for (int ix = 0; ix < grid.cols; ++ix) {
@@ -1323,8 +1992,17 @@ void mesh_height_field(const ContactGrid& grid, const std::vector<double>& botto
             const double z0 = bottom_z[grid.index(ix, iy)];
             const double z1 = top_z[grid.index(ix, iy)];
 
-            add_quad(out, { x0, y0, z1 }, { x1, y0, z1 }, { x1, y1, z1 }, { x0, y1, z1 });
-            add_quad(out, { x0, y1, z0 }, { x1, y1, z0 }, { x1, y0, z0 }, { x0, y0, z0 });
+            const double top00 = layer_corner_value(grid, bottom_z, top_z, top_z, ix, iy, shoulder_z, true, z1);
+            const double top10 = layer_corner_value(grid, bottom_z, top_z, top_z, ix + 1, iy, shoulder_z, true, z1);
+            const double top11 = layer_corner_value(grid, bottom_z, top_z, top_z, ix + 1, iy + 1, shoulder_z, true, z1);
+            const double top01 = layer_corner_value(grid, bottom_z, top_z, top_z, ix, iy + 1, shoulder_z, true, z1);
+            const double bottom00 = layer_corner_value(grid, bottom_z, top_z, bottom_z, ix, iy, 0.0, false, z0);
+            const double bottom10 = layer_corner_value(grid, bottom_z, top_z, bottom_z, ix + 1, iy, 0.0, false, z0);
+            const double bottom11 = layer_corner_value(grid, bottom_z, top_z, bottom_z, ix + 1, iy + 1, 0.0, false, z0);
+            const double bottom01 = layer_corner_value(grid, bottom_z, top_z, bottom_z, ix, iy + 1, 0.0, false, z0);
+
+            add_cell_top_terrain(out, x0, x1, y0, y1, z1, top00, top10, top11, top01);
+            add_cell_bottom_terrain(out, x0, x1, y0, y1, bottom00, bottom10, bottom11, bottom01);
 
             const std::array<std::array<int, 2>, 4> neighbors { {
                 { -1, 0 },
@@ -1337,14 +2015,23 @@ void mesh_height_field(const ContactGrid& grid, const std::vector<double>& botto
                 const int nx = ix + neighbor[0];
                 const int ny = iy + neighbor[1];
                 if (!layer_cell_occupied(grid, bottom_z, top_z, nx, ny)) {
-                    add_cell_side_quad(out, neighbor[0], neighbor[1], x0, x1, y0, y1, z0, z1);
-                    continue;
+                    add_cell_boundary_side_terrain(
+                        out,
+                        neighbor[0],
+                        neighbor[1],
+                        x0,
+                        x1,
+                        y0,
+                        y1,
+                        bottom00,
+                        bottom10,
+                        bottom11,
+                        bottom01,
+                        top00,
+                        top10,
+                        top11,
+                        top01);
                 }
-
-                const double neighbor_bottom = layer_cell_bottom(grid, bottom_z, top_z, nx, ny);
-                const double neighbor_top = layer_cell_top(grid, bottom_z, top_z, nx, ny);
-                add_cell_side_quad(out, neighbor[0], neighbor[1], x0, x1, y0, y1, z0, std::min(z1, neighbor_bottom));
-                add_cell_side_quad(out, neighbor[0], neighbor[1], x0, x1, y0, y1, std::max(z0, neighbor_top), z1);
             }
         }
     }
@@ -1372,12 +2059,783 @@ std::size_t count_masked_cells(const std::vector<unsigned char>& mask)
     return count;
 }
 
+struct TreeTip {
+    int ix = 0;
+    int iy = 0;
+    Vec3 point;
+};
+
+struct TreeCluster {
+    std::vector<int> tips;
+    Vec3 center;
+};
+
+struct TreeRouteResult {
+    bool emitted = false;
+    bool used_local_upright = false;
+    bool used_waypoint = false;
+    bool slope_reroute = false;
+    bool model_reroute = false;
+};
+
+struct TreeMeshResult {
+    std::size_t branches = 0;
+    std::size_t tip_contacts = 0;
+    std::size_t local_uprights = 0;
+    std::size_t waypoint_branches = 0;
+    std::size_t slope_reroutes = 0;
+    std::size_t model_reroutes = 0;
+};
+
+double distance_xy(const Vec3& lhs, const Vec3& rhs)
+{
+    return std::hypot(lhs.x - rhs.x, lhs.y - rhs.y);
+}
+
+std::vector<TreeTip> collect_tree_tips(
+    const ContactGrid& grid,
+    const std::vector<double>& support_top,
+    const std::vector<unsigned char>& contact_mask,
+    const double root_z,
+    const double sample_spacing)
+{
+    std::vector<TreeTip> tips;
+    const int stride = std::max(1, int(std::ceil(sample_spacing / std::max(grid.cell_size, 0.05))));
+    for (int block_y = 0; block_y < grid.rows; block_y += stride) {
+        for (int block_x = 0; block_x < grid.cols; block_x += stride) {
+            int best_ix = -1;
+            int best_iy = -1;
+            double best_z = root_z;
+            for (int iy = block_y; iy < std::min(grid.rows, block_y + stride); ++iy) {
+                for (int ix = block_x; ix < std::min(grid.cols, block_x + stride); ++ix) {
+                    const int cell_index = grid.index(ix, iy);
+                    if (cell_index >= int(contact_mask.size()) || !contact_mask[std::size_t(cell_index)])
+                        continue;
+                    const double z = support_top[std::size_t(cell_index)];
+                    if (z <= root_z + 0.25)
+                        continue;
+                    if (best_ix < 0 || z > best_z) {
+                        best_ix = ix;
+                        best_iy = iy;
+                        best_z = z;
+                    }
+                }
+            }
+            if (best_ix >= 0) {
+                tips.push_back({
+                    best_ix,
+                    best_iy,
+                    {
+                        grid.origin_x + (double(best_ix) + 0.5) * grid.cell_size,
+                        grid.origin_y + (double(best_iy) + 0.5) * grid.cell_size,
+                        best_z
+                    }
+                });
+            }
+        }
+    }
+    return tips;
+}
+
+std::vector<TreeCluster> cluster_tree_tips(const std::vector<TreeTip>& tips, const double cluster_radius)
+{
+    std::vector<TreeCluster> clusters;
+    for (int tip_index = 0; tip_index < int(tips.size()); ++tip_index) {
+        int best_index = -1;
+        double best_distance = cluster_radius;
+        for (int cluster_index = 0; cluster_index < int(clusters.size()); ++cluster_index) {
+            const double distance = distance_xy(tips[std::size_t(tip_index)].point, clusters[std::size_t(cluster_index)].center);
+            if (distance < best_distance) {
+                best_distance = distance;
+                best_index = cluster_index;
+            }
+        }
+
+        if (best_index < 0) {
+            clusters.push_back({ { tip_index }, tips[std::size_t(tip_index)].point });
+            continue;
+        }
+
+        TreeCluster& cluster = clusters[std::size_t(best_index)];
+        cluster.tips.push_back(tip_index);
+        Vec3 sum { 0.0, 0.0, 0.0 };
+        for (const int member : cluster.tips)
+            sum = add(sum, tips[std::size_t(member)].point);
+        cluster.center = multiply(sum, 1.0 / double(cluster.tips.size()));
+    }
+    return clusters;
+}
+
+std::vector<OrganicNode> cluster_nodes(const std::vector<OrganicNode>& nodes, const double cluster_radius)
+{
+    std::vector<OrganicNode> clusters;
+    for (const OrganicNode& node : nodes) {
+        int best_index = -1;
+        double best_distance = cluster_radius;
+        for (int cluster_index = 0; cluster_index < int(clusters.size()); ++cluster_index) {
+            const double distance = distance_xy(node.point, clusters[std::size_t(cluster_index)].point);
+            if (distance < best_distance) {
+                best_distance = distance;
+                best_index = cluster_index;
+            }
+        }
+
+        if (best_index < 0) {
+        clusters.push_back(node);
+            continue;
+        }
+
+        OrganicNode& cluster = clusters[std::size_t(best_index)];
+        const double combined_load = cluster.load + node.load;
+        cluster.point = {
+            (cluster.point.x * cluster.load + node.point.x * node.load) / combined_load,
+            (cluster.point.y * cluster.load + node.point.y * node.load) / combined_load,
+            std::min(cluster.point.z, node.point.z),
+        };
+        cluster.load = combined_load;
+        cluster.distance_to_top = std::max(cluster.distance_to_top, node.distance_to_top);
+        cluster.radius = std::max(cluster.radius, node.radius);
+        cluster.source_count += node.source_count;
+    }
+    return clusters;
+}
+
+Vec3 branch_node_for_cluster(const TreeCluster& cluster, const std::vector<TreeTip>& tips, const SupportSettings& settings, const double root_z)
+{
+    double min_top_z = std::numeric_limits<double>::max();
+    double max_distance = 0.0;
+    for (const int tip_index : cluster.tips) {
+        const Vec3& point = tips[std::size_t(tip_index)].point;
+        min_top_z = std::min(min_top_z, point.z);
+        max_distance = std::max(max_distance, distance_xy(point, cluster.center));
+    }
+
+    const double branch_angle = settings.tree_branch_angle_deg * kPi / 180.0;
+    const double required_drop = max_distance / std::max(std::tan(branch_angle), 0.05);
+    const double branch_drop = std::max(settings.tree_tip_diameter_mm * 1.5, required_drop + settings.tree_tip_diameter_mm);
+    const double node_z = std::max(root_z + settings.tree_branch_diameter_mm * 0.75, min_top_z - branch_drop);
+    return { cluster.center.x, cluster.center.y, std::min(node_z, min_top_z - 0.2) };
+}
+
+double organic_radius_for_load(const SupportSettings& settings, const double load, const double vertical_drop)
+{
+    const double tip_radius = std::max(0.2, settings.tree_tip_diameter_mm * 0.5);
+    const double branch_radius = std::max(tip_radius, settings.tree_branch_diameter_mm * 0.5);
+    const double load_radius = tip_radius + std::sqrt(std::max(1.0, load)) * settings.contact_cell_size_mm * 0.18;
+    const double taper_radius = tip_radius + std::max(0.0, vertical_drop) * std::tan(7.0 * kPi / 180.0);
+    return std::min(branch_radius * 1.8, std::max({ tip_radius, load_radius, std::min(branch_radius, taper_radius) }));
+}
+
+double organic_radius_for_distance(const SupportSettings& settings, const double distance_to_top, const double load)
+{
+    const double tip_radius = std::max(0.2, settings.tree_tip_diameter_mm * 0.5);
+    const double branch_radius = std::max(tip_radius, settings.tree_branch_diameter_mm * 0.5);
+    const double diameter_angle = 7.0 * kPi / 180.0;
+    const double distance_radius = tip_radius * 0.62 + std::max(0.0, distance_to_top) * std::tan(diameter_angle);
+    const double load_radius = tip_radius * 0.62 + std::sqrt(std::max(1.0, load)) * settings.contact_cell_size_mm * 0.11;
+    return std::clamp(std::max(distance_radius, load_radius), tip_radius * 0.38, branch_radius * 1.55);
+}
+
+double legal_parent_z(const Vec3& child, const Vec3& parent_xy, const SupportSettings& settings, const double root_z, const double min_drop)
+{
+    const double angle = std::clamp(settings.tree_branch_angle_deg, 15.0, 80.0) * kPi / 180.0;
+    const double horizontal = distance_xy(child, parent_xy);
+    const double required_drop = horizontal / std::max(std::tan(angle), 0.1);
+    return std::max(root_z, child.z - std::max(min_drop, required_drop + settings.interface_layer_height_mm));
+}
+
+Vec3 weighted_center(const std::vector<OrganicNode>& nodes)
+{
+    Vec3 sum { 0.0, 0.0, 0.0 };
+    double load = 0.0;
+    for (const OrganicNode& node : nodes) {
+        sum = add(sum, multiply(node.point, node.load));
+        load += node.load;
+    }
+    if (load <= 0.0)
+        return {};
+    return multiply(sum, 1.0 / load);
+}
+
+double deterministic_unit_noise(const int a, const int b, const int salt)
+{
+    const double value = std::sin(double(a) * 12.9898 + double(b) * 78.233 + double(salt) * 37.719) * 43758.5453123;
+    return (value - std::floor(value)) * 2.0 - 1.0;
+}
+
+void add_branch_pad(SupportMesh& mesh, const Vec3& center, const double radius, const double thickness, const int segments = 18)
+{
+    const double r = std::max(0.15, radius);
+    const double z0 = center.z;
+    const double z1 = center.z + std::max(0.05, thickness);
+    std::vector<Vec3> bottom;
+    std::vector<Vec3> top;
+    bottom.reserve(std::size_t(segments));
+    top.reserve(std::size_t(segments));
+    for (int index = 0; index < segments; ++index) {
+        const double angle = 2.0 * kPi * double(index) / double(segments);
+        const double x = center.x + std::cos(angle) * r;
+        const double y = center.y + std::sin(angle) * r;
+        bottom.push_back({ x, y, z0 });
+        top.push_back({ x, y, z1 });
+    }
+
+    const Vec3 bottom_center { center.x, center.y, z0 };
+    const Vec3 top_center { center.x, center.y, z1 };
+    for (int index = 0; index < segments; ++index) {
+        const int next = (index + 1) % segments;
+        add_quad(mesh, bottom[std::size_t(index)], bottom[std::size_t(next)], top[std::size_t(next)], top[std::size_t(index)]);
+        add_triangle(mesh, bottom_center, bottom[std::size_t(next)], bottom[std::size_t(index)]);
+        add_triangle(mesh, top_center, top[std::size_t(index)], top[std::size_t(next)]);
+    }
+}
+
+int grid_ix_for_x(const ContactGrid& grid, const double x)
+{
+    return int(std::floor((x - grid.origin_x) / grid.cell_size));
+}
+
+int grid_iy_for_y(const ContactGrid& grid, const double y)
+{
+    return int(std::floor((y - grid.origin_y) / grid.cell_size));
+}
+
+double model_limited_radius(const ContactGrid& grid, const Vec3& point, const double requested_radius)
+{
+    const int ix = grid_ix_for_x(grid, point.x);
+    const int iy = grid_iy_for_y(grid, point.y);
+    if (!grid.inside(ix, iy) || !grid.has_model_ceiling(ix, iy))
+        return requested_radius;
+
+    const double ceiling_limited_radius = grid.model_ceiling(ix, iy) - point.z - 0.08;
+    if (ceiling_limited_radius <= 0.05)
+        return std::min(requested_radius, 0.05);
+
+    return std::min(requested_radius, ceiling_limited_radius);
+}
+
+bool branch_point_clear_of_model(const ContactGrid& grid, const Vec3& point, const double radius)
+{
+    const int ix = grid_ix_for_x(grid, point.x);
+    const int iy = grid_iy_for_y(grid, point.y);
+    if (!grid.inside(ix, iy) || !grid.has_model_ceiling(ix, iy))
+        return true;
+
+    return point.z + radius <= grid.model_ceiling(ix, iy) - 0.04;
+}
+
+bool branch_segment_clear_of_model(
+    const ContactGrid& grid,
+    const Vec3& start,
+    const Vec3& end,
+    const double start_radius,
+    const double end_radius)
+{
+    const double segment_length = length(subtract(end, start));
+    const int samples = std::max(8, int(std::ceil(segment_length / std::max(grid.cell_size * 0.65, 0.25))));
+    for (int index = 0; index <= samples; ++index) {
+        const double t = double(index) / double(samples);
+        const Vec3 point {
+            start.x + (end.x - start.x) * t,
+            start.y + (end.y - start.y) * t,
+            start.z + (end.z - start.z) * t,
+        };
+        const double radius = start_radius + (end_radius - start_radius) * t;
+        if (!branch_point_clear_of_model(grid, point, radius))
+            return false;
+    }
+    return true;
+}
+
+bool branch_segment_clear_of_model(const ContactGrid& grid, const Vec3& start, const Vec3& end, const double radius)
+{
+    return branch_segment_clear_of_model(grid, start, end, radius, radius);
+}
+
+bool branch_segment_printable(const Vec3& start, const Vec3& end, const SupportSettings& settings)
+{
+    const double dz = end.z - start.z;
+    if (dz <= 0.08)
+        return distance_xy(start, end) <= 0.15;
+
+    const double angle = std::clamp(settings.tree_branch_angle_deg, 15.0, 70.0) * kPi / 180.0;
+    return distance_xy(start, end) <= dz * std::tan(angle) + 0.05;
+}
+
+Vec3 local_root_for_child(const Vec3& child, const double root_z)
+{
+    return { child.x, child.y, root_z };
+}
+
+bool choose_avoidance_waypoint(
+    const ContactGrid& grid,
+    const SupportSettings& settings,
+    const Vec3& start,
+    const Vec3& end,
+    const double radius,
+    Vec3& waypoint)
+{
+    const Vec3 delta = subtract(end, start);
+    const double horizontal = std::hypot(delta.x, delta.y);
+    if (horizontal <= 0.1)
+        return false;
+
+    const Vec3 normal { -delta.y / horizontal, delta.x / horizontal, 0.0 };
+    const Vec3 midpoint {
+        (start.x + end.x) * 0.5,
+        (start.y + end.y) * 0.5,
+        (start.z + end.z) * 0.5,
+    };
+    const double base_offset = std::max(settings.xy_distance_mm + radius + grid.cell_size, grid.cell_size * 2.0);
+    for (int step = 1; step <= 8; ++step) {
+        for (const double side : { -1.0, 1.0 }) {
+            Vec3 candidate {
+                midpoint.x + normal.x * base_offset * double(step) * side,
+                midpoint.y + normal.y * base_offset * double(step) * side,
+                midpoint.z,
+            };
+            if (!branch_point_clear_of_model(grid, candidate, radius))
+                continue;
+            if (!branch_segment_printable(start, candidate, settings) || !branch_segment_printable(candidate, end, settings))
+                continue;
+            if (!branch_segment_clear_of_model(grid, start, candidate, radius) || !branch_segment_clear_of_model(grid, candidate, end, radius))
+                continue;
+            waypoint = candidate;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+TreeRouteResult add_printable_organic_branch(
+    SupportMesh& mesh,
+    const ContactGrid& grid,
+    const SupportSettings& settings,
+    Vec3 start,
+    const Vec3& end,
+    const double start_radius,
+    const double end_radius,
+    const double root_z,
+    const int curve_segments,
+    const int ring_segments)
+{
+    TreeRouteResult result;
+    const double radius = std::max(start_radius, end_radius);
+    double effective_start_radius = start_radius;
+    double effective_end_radius = end_radius;
+    if (!branch_segment_printable(start, end, settings)) {
+        result.slope_reroute = true;
+        result.used_local_upright = true;
+        start = local_root_for_child(end, root_z);
+        effective_start_radius = std::min(start_radius, std::max(end_radius * 1.12, settings.tree_tip_diameter_mm * 0.42));
+        effective_end_radius = std::min(end_radius, effective_start_radius * 1.05);
+        add_branch_pad(mesh, start, std::max(effective_start_radius * 1.05, settings.tree_tip_diameter_mm * 0.5), std::max(0.2, settings.interface_layer_height_mm * 1.5), 14);
+    }
+
+    if (branch_segment_clear_of_model(grid, start, end, effective_start_radius, effective_end_radius)) {
+        add_layer_area_branch(mesh, start, end, effective_start_radius, effective_end_radius, curve_segments, ring_segments);
+        result.emitted = true;
+        return result;
+    }
+
+    Vec3 waypoint;
+    if (choose_avoidance_waypoint(grid, settings, start, end, radius, waypoint)) {
+        const double mid_radius = (start_radius + end_radius) * 0.5;
+        add_layer_area_branch(mesh, start, waypoint, start_radius, mid_radius, std::max(2, curve_segments / 2), ring_segments);
+        add_layer_area_branch(mesh, waypoint, end, mid_radius, end_radius, std::max(2, curve_segments / 2), ring_segments);
+        result.emitted = true;
+        result.used_waypoint = true;
+        result.model_reroute = true;
+        return result;
+    }
+
+    result.model_reroute = true;
+    result.used_local_upright = true;
+    start = local_root_for_child(end, root_z);
+    effective_start_radius = std::min(start_radius, std::max(end_radius * 1.12, settings.tree_tip_diameter_mm * 0.42));
+    effective_end_radius = std::min(end_radius, effective_start_radius * 1.05);
+    add_branch_pad(mesh, start, std::max(effective_start_radius * 1.05, settings.tree_tip_diameter_mm * 0.5), std::max(0.2, settings.interface_layer_height_mm * 1.5), 14);
+    if (branch_segment_clear_of_model(grid, start, end, effective_start_radius, effective_end_radius)) {
+        add_layer_area_branch(mesh, start, end, effective_start_radius, effective_end_radius, curve_segments, ring_segments);
+        result.emitted = true;
+    }
+    return result;
+}
+
+void record_tree_route(TreeMeshResult& result, const TreeRouteResult& route)
+{
+    if (route.emitted)
+        ++result.branches;
+    if (route.used_local_upright)
+        ++result.local_uprights;
+    if (route.used_waypoint)
+        ++result.waypoint_branches;
+    if (route.slope_reroute)
+        ++result.slope_reroutes;
+    if (route.model_reroute)
+        ++result.model_reroutes;
+}
+
+TreeMeshResult mesh_organic_tree_grid(
+    const ContactGrid& grid,
+    const SupportSettings& settings,
+    const std::vector<unsigned char>& contact_mask,
+    const std::vector<double>& support_top,
+    const std::vector<double>& interface_bottom,
+    const std::vector<double>& interface_top,
+    SupportMesh& support_out,
+    SupportMesh& interface_out,
+    CoverageSamples* tree_coverage,
+    OrganicTreeLayerData* tree_layer_data)
+{
+    TreeMeshResult result;
+    const double root_z = settings.base_enabled ? std::max(grid.bottom_z, settings.base_thickness_mm) : grid.bottom_z;
+
+    const double tip_radius = std::max(0.2, settings.tree_tip_diameter_mm * 0.5);
+    const double branch_radius = std::max(tip_radius, settings.tree_branch_diameter_mm * 0.5);
+    const double branch_distance = std::max(settings.contact_cell_size_mm * 2.0, settings.tree_branch_distance_mm);
+    const double sample_spacing = std::max(settings.contact_cell_size_mm * 1.6, std::min(branch_distance * 0.36, settings.contact_cell_size_mm * 3.4));
+    const std::vector<TreeTip> tips = collect_tree_tips(grid, support_top, contact_mask, root_z, sample_spacing);
+    if (tips.empty())
+        return result;
+    if (tree_coverage) {
+        tree_coverage->cells.clear();
+        tree_coverage->supported_cells = 0;
+        tree_coverage->unsupported_cells = 0;
+    }
+
+    auto nearest_node_index = [](const Vec3& point, const std::vector<OrganicNode>& nodes) {
+        int nearest = 0;
+        double nearest_distance = std::numeric_limits<double>::max();
+        for (int index = 0; index < int(nodes.size()); ++index) {
+            const double distance = distance_xy(point, nodes[std::size_t(index)].point);
+            if (distance < nearest_distance) {
+                nearest_distance = distance;
+                nearest = index;
+            }
+        }
+        return nearest;
+    };
+
+    auto node_radius = [&](const OrganicNode& node) {
+        const double raw_radius = organic_radius_for_distance(settings, node.distance_to_top, node.load);
+        return std::max(tip_radius * 0.35, model_limited_radius(grid, node.point, raw_radius));
+    };
+
+    std::vector<OrganicNode> skeleton_nodes;
+    std::vector<OrganicSkeletonEdge> skeleton_edges;
+    skeleton_nodes.reserve(tips.size() * 2);
+    skeleton_edges.reserve(tips.size() * 3);
+
+    auto append_skeleton_node = [&](const OrganicNode& node) {
+        skeleton_nodes.push_back(node);
+        return int(skeleton_nodes.size()) - 1;
+    };
+
+    auto record_branch = [&](const int parent_id, const int child_id, const int level) {
+        if (parent_id == child_id)
+            return;
+        skeleton_edges.push_back({ parent_id, child_id, level });
+    };
+
+    auto emit_branch = [&](const OrganicNode& parent, const OrganicNode& child, const int level) {
+        Vec3 branch_start = parent.point;
+        const double child_dx = child.point.x - parent.point.x;
+        const double child_dy = child.point.y - parent.point.y;
+        const double child_distance_xy = std::hypot(child_dx, child_dy);
+        if (child_distance_xy > 1e-6) {
+            const double emergence = std::min({ parent.radius * 0.22, grid.cell_size * 0.32, child_distance_xy * 0.38 });
+            branch_start.x += child_dx / child_distance_xy * emergence;
+            branch_start.y += child_dy / child_distance_xy * emergence;
+        }
+        branch_start.z += std::min(0.16, std::max(0.0, child.point.z - parent.point.z) * 0.08);
+        const double vertical_drop = std::max(0.0, child.point.z - branch_start.z);
+        if (vertical_drop <= 0.04)
+            return;
+
+        const double start_radius = std::max(tip_radius * 0.35, parent.radius);
+        const double end_radius = std::max(tip_radius * 0.32, std::min(child.radius, start_radius * 0.92));
+        const int curve_segments = std::max(2, std::min(8, 3 + level / 8));
+        const int ring_segments = std::max(10, std::min(22, 10 + int(std::ceil(start_radius * 2.2))));
+        record_tree_route(
+            result,
+            add_printable_organic_branch(
+                support_out,
+                grid,
+                settings,
+                branch_start,
+                child.point,
+                start_radius,
+                end_radius,
+                root_z,
+                curve_segments,
+                ring_segments));
+    };
+
+    std::vector<OrganicNode> current_nodes;
+    std::vector<int> current_ids;
+    current_nodes.reserve(tips.size());
+    current_ids.reserve(tips.size());
+    for (const TreeTip& tip : tips) {
+        Vec3 tip_target = tip.point;
+        tip_target.z -= std::max(0.05, settings.effective_top_z_distance_mm());
+        const double contact_radius = std::max(tip_radius * 0.34, std::min(sample_spacing * 0.28, settings.xy_distance_mm + tip_radius * 0.5));
+        ++result.tip_contacts;
+        if (tree_coverage)
+            record_coverage_sample(*tree_coverage, tip.point, true);
+        OrganicNode tip_node { tip_target, 1.0, 0.0, contact_radius, 1 };
+        current_ids.push_back(append_skeleton_node(tip_node));
+        current_nodes.push_back(tip_node);
+    }
+
+    const double branch_angle = std::clamp(settings.tree_branch_angle_deg, 18.0, 70.0) * kPi / 180.0;
+    const double max_lateral_per_mm = std::max(0.05, std::tan(branch_angle));
+    const double layer_step = std::clamp(
+        settings.interface_layer_height_mm > 0.02 ? settings.interface_layer_height_mm : 0.2,
+        0.12,
+        0.28);
+    const double top_z = std::max_element(current_nodes.begin(), current_nodes.end(), [](const OrganicNode& lhs, const OrganicNode& rhs) {
+        return lhs.point.z < rhs.point.z;
+    })->point.z;
+    const int max_layers = std::clamp(int(std::ceil((top_z - root_z) / std::max(layer_step, 0.2))) + 8, 12, 280);
+
+    auto propose_dropped_node = [&](const OrganicNode& node, const std::vector<OrganicNode>& layer_nodes, const int layer) {
+        const double dz = std::min(layer_step, std::max(0.0, node.point.z - root_z));
+        OrganicNode candidate = node;
+        candidate.point.z = std::max(root_z, node.point.z - dz);
+        candidate.distance_to_top = node.distance_to_top + dz;
+        candidate.radius = node_radius(candidate);
+
+        const double merge_scan_radius = branch_distance * (0.72 + 0.018 * std::min(layer, 55));
+        Vec3 attraction { 0.0, 0.0, 0.0 };
+        double attraction_load = 0.0;
+        int neighbor_count = 0;
+        for (const OrganicNode& other : layer_nodes) {
+            if (&other == &node)
+                continue;
+            const double distance = distance_xy(node.point, other.point);
+            if (distance <= 0.001 || distance > merge_scan_radius)
+                continue;
+            const double weight = other.load / std::max(distance, grid.cell_size * 0.45);
+            attraction = add(attraction, multiply(other.point, weight));
+            attraction_load += weight;
+            ++neighbor_count;
+        }
+
+        if (attraction_load > 0.0 && neighbor_count > 0) {
+            const Vec3 target = multiply(attraction, 1.0 / attraction_load);
+            const Vec3 delta { target.x - node.point.x, target.y - node.point.y, 0.0 };
+            const double delta_len = std::hypot(delta.x, delta.y);
+            const double max_move = std::max(0.0, dz * max_lateral_per_mm * 0.72);
+            if (delta_len > 1e-6) {
+                const double move = std::min(max_move, delta_len * 0.52);
+                candidate.point.x += delta.x / delta_len * move;
+                candidate.point.y += delta.y / delta_len * move;
+            }
+        }
+
+        const double allowed_radius = model_limited_radius(grid, candidate.point, candidate.radius);
+        candidate.radius = std::max(tip_radius * 0.32, allowed_radius);
+        if (branch_point_clear_of_model(grid, candidate.point, candidate.radius) &&
+            branch_segment_clear_of_model(grid, candidate.point, node.point, candidate.radius, node.radius))
+            return candidate;
+
+        OrganicNode vertical = candidate;
+        vertical.point.x = node.point.x;
+        vertical.point.y = node.point.y;
+        vertical.radius = std::max(tip_radius * 0.32, model_limited_radius(grid, vertical.point, vertical.radius));
+        if (branch_point_clear_of_model(grid, vertical.point, vertical.radius) &&
+            branch_segment_clear_of_model(grid, vertical.point, node.point, vertical.radius, node.radius))
+            return vertical;
+
+        const double base_escape = std::max(grid.cell_size, candidate.radius + settings.xy_distance_mm);
+        for (int ring = 1; ring <= 4; ++ring) {
+            const double radius = base_escape * double(ring);
+            for (int side = 0; side < 8; ++side) {
+                const double angle = (2.0 * kPi * double(side) / 8.0) + double(layer % 3) * 0.19;
+                OrganicNode escaped = candidate;
+                escaped.point.x = node.point.x + std::cos(angle) * radius;
+                escaped.point.y = node.point.y + std::sin(angle) * radius;
+                const double horizontal = distance_xy(escaped.point, node.point);
+                if (horizontal > dz * max_lateral_per_mm + 0.05)
+                    continue;
+                escaped.radius = std::max(tip_radius * 0.28, model_limited_radius(grid, escaped.point, escaped.radius));
+                if (branch_point_clear_of_model(grid, escaped.point, escaped.radius) &&
+                    branch_segment_clear_of_model(grid, escaped.point, node.point, escaped.radius, node.radius))
+                    return escaped;
+            }
+        }
+
+        candidate.point.x = node.point.x;
+        candidate.point.y = node.point.y;
+        candidate.radius = std::max(tip_radius * 0.26, model_limited_radius(grid, candidate.point, candidate.radius * 0.72));
+        return candidate;
+    };
+
+    for (int layer = 0; layer < max_layers && !current_nodes.empty(); ++layer) {
+        bool all_at_root = true;
+        for (const OrganicNode& node : current_nodes) {
+            if (node.point.z > root_z + 0.08) {
+                all_at_root = false;
+                break;
+            }
+        }
+        if (all_at_root)
+            break;
+
+        std::vector<OrganicNode> proposed;
+        proposed.reserve(current_nodes.size());
+        for (const OrganicNode& node : current_nodes)
+            proposed.push_back(propose_dropped_node(node, current_nodes, layer));
+
+        const double merge_radius = std::min(
+            branch_distance * 2.1,
+            std::max(branch_distance * 0.38, grid.cell_size * (1.35 + 0.05 * std::min(layer, 28))));
+        std::vector<unsigned char> used(proposed.size(), 0);
+        std::vector<OrganicNode> next_nodes;
+        std::vector<int> next_ids;
+        next_nodes.reserve(proposed.size());
+        next_ids.reserve(proposed.size());
+
+        for (int seed = 0; seed < int(proposed.size()); ++seed) {
+            if (used[std::size_t(seed)])
+                continue;
+
+            std::vector<int> group { seed };
+            used[std::size_t(seed)] = 1;
+            for (int index = seed + 1; index < int(proposed.size()); ++index) {
+                if (used[std::size_t(index)])
+                    continue;
+                const double z_gap = std::abs(proposed[std::size_t(index)].point.z - proposed[std::size_t(seed)].point.z);
+                if (z_gap > layer_step * 1.25)
+                    continue;
+                const double merge_acceptance = std::max(
+                    grid.cell_size * 1.05,
+                    (proposed[std::size_t(seed)].radius + proposed[std::size_t(index)].radius) * 0.82 + merge_radius * 0.16);
+                if (distance_xy(proposed[std::size_t(index)].point, proposed[std::size_t(seed)].point) > merge_acceptance)
+                    continue;
+                group.push_back(index);
+                used[std::size_t(index)] = 1;
+                if (int(group.size()) >= 8)
+                    break;
+            }
+
+            double load = 0.0;
+            double z_sum = 0.0;
+            Vec3 center { 0.0, 0.0, 0.0 };
+            OrganicNode parent = proposed[std::size_t(seed)];
+            parent.source_count = 0;
+            parent.distance_to_top = 0.0;
+            parent.radius = 0.0;
+            for (const int index : group) {
+                const OrganicNode& node = proposed[std::size_t(index)];
+                load += node.load;
+                center = add(center, multiply(node.point, node.load));
+                z_sum += node.point.z * node.load;
+                parent.source_count += current_nodes[std::size_t(index)].source_count;
+                parent.distance_to_top = std::max(parent.distance_to_top, node.distance_to_top);
+                parent.radius = std::max(parent.radius, node.radius);
+            }
+            center = multiply(center, 1.0 / std::max(load, 1e-6));
+            parent.point = { center.x, center.y, z_sum / std::max(load, 1e-6) };
+            parent.load = std::max(1.0, load);
+            double printable_parent_z = parent.point.z;
+            for (const int index : group) {
+                const OrganicNode& child = current_nodes[std::size_t(index)];
+                const double horizontal = distance_xy(parent.point, child.point);
+                const double required_drop = horizontal / std::max(max_lateral_per_mm, 0.05) + 0.05;
+                printable_parent_z = std::min(printable_parent_z, child.point.z - required_drop);
+            }
+            parent.point.z = std::max(root_z, printable_parent_z);
+            parent.radius = node_radius(parent);
+
+            if (!branch_point_clear_of_model(grid, parent.point, parent.radius))
+                parent.radius = std::max(tip_radius * 0.28, model_limited_radius(grid, parent.point, parent.radius * 0.75));
+
+            const int parent_id = append_skeleton_node(parent);
+            next_nodes.push_back(parent);
+            next_ids.push_back(parent_id);
+            for (const int index : group)
+                record_branch(parent_id, current_ids[std::size_t(index)], layer);
+        }
+
+        current_nodes = std::move(next_nodes);
+        current_ids = std::move(next_ids);
+    }
+
+    std::vector<OrganicNode> root_nodes = cluster_nodes(current_nodes, branch_distance * 1.8);
+    std::vector<int> root_ids;
+    root_ids.reserve(root_nodes.size());
+    for (OrganicNode& root : root_nodes) {
+        root.point.z = root_z;
+        root.radius = std::max(root.radius, organic_radius_for_distance(settings, root.distance_to_top + layer_step, root.load));
+        root_ids.push_back(append_skeleton_node(root));
+    }
+
+    for (int child_index = 0; child_index < int(current_nodes.size()); ++child_index) {
+        const OrganicNode& child = current_nodes[std::size_t(child_index)];
+        if (root_nodes.empty())
+            break;
+        const int root_index = nearest_node_index(child.point, root_nodes);
+        OrganicNode root = root_nodes[std::size_t(root_index)];
+        root.point.z = root_z;
+        root.load = std::max(root.load, child.load);
+        root.radius = std::max(root.radius, organic_radius_for_distance(settings, child.distance_to_top + std::max(0.0, child.point.z - root_z), root.load));
+        if (root_index >= 0 && root_index < int(root_ids.size())) {
+            skeleton_nodes[std::size_t(root_ids[std::size_t(root_index)])] = root;
+            record_branch(root_ids[std::size_t(root_index)], current_ids[std::size_t(child_index)], max_layers);
+        }
+    }
+
+    std::vector<std::vector<int>> outgoing(skeleton_nodes.size());
+    std::vector<int> incoming_count(skeleton_nodes.size(), 0);
+    for (int edge_index = 0; edge_index < int(skeleton_edges.size()); ++edge_index) {
+        const OrganicSkeletonEdge& edge = skeleton_edges[std::size_t(edge_index)];
+        if (edge.parent_id < 0 || edge.child_id < 0 ||
+            edge.parent_id >= int(skeleton_nodes.size()) || edge.child_id >= int(skeleton_nodes.size()))
+            continue;
+        outgoing[std::size_t(edge.parent_id)].push_back(edge_index);
+        ++incoming_count[std::size_t(edge.child_id)];
+    }
+
+    collect_organic_layer_disks(
+        tree_layer_data,
+        skeleton_nodes,
+        skeleton_edges,
+        grid,
+        root_z,
+        top_z,
+        layer_step);
+    result.branches = skeleton_edges.size();
+
+    for (const TreeTip& tip : tips) {
+        const int cell_index = grid.index(tip.ix, tip.iy);
+        if (cell_index >= int(interface_top.size()))
+            continue;
+        if (interface_top[std::size_t(cell_index)] <= interface_bottom[std::size_t(cell_index)] + 0.05)
+            continue;
+        add_tapered_tube(
+            interface_out,
+            { tip.point.x, tip.point.y, interface_bottom[std::size_t(cell_index)] },
+            { tip.point.x, tip.point.y, interface_top[std::size_t(cell_index)] },
+            tip_radius,
+            tip_radius,
+            14);
+    }
+
+    return result;
+}
+
 std::size_t mesh_contact_grid(
     const ContactGrid& grid,
     const SupportSettings& settings,
     const std::vector<unsigned char>& interface_eligible,
     SupportMesh& support_out,
-    SupportMesh& interface_out)
+    SupportMesh& interface_out,
+    SupportGenerationStats* stats,
+    CoverageSamples* coverage,
+    OrganicTreeLayerData* tree_layer_data)
 {
     std::vector<double> support_bottom(grid.top_z.size(), grid.bottom_z);
     std::vector<double> support_top = grid.top_z;
@@ -1404,9 +2862,32 @@ std::size_t mesh_contact_grid(
         }
     }
 
-    mesh_height_field(grid, support_bottom, support_top, support_out);
+    if (settings.tree_mode) {
+        const TreeMeshResult tree_result = mesh_organic_tree_grid(
+            grid,
+            settings,
+            interface_eligible,
+            support_top,
+            interface_bottom,
+            interface_top,
+            support_out,
+            interface_out,
+            coverage,
+            tree_layer_data);
+        if (stats) {
+            stats->tree_branches = tree_result.branches;
+            stats->tree_tip_contacts = tree_result.tip_contacts;
+            stats->tree_local_uprights = tree_result.local_uprights;
+            stats->tree_waypoint_branches = tree_result.waypoint_branches;
+            stats->tree_slope_reroutes = tree_result.slope_reroutes;
+            stats->tree_model_reroutes = tree_result.model_reroutes;
+        }
+        return tree_result.branches;
+    }
+
+    mesh_height_field(grid, support_bottom, support_top, settings.base_enabled ? settings.base_thickness_mm : 0.0, support_out);
     if (interface_thickness > 0.05)
-        mesh_height_field(grid, interface_bottom, interface_top, interface_out);
+        mesh_height_field(grid, interface_bottom, interface_top, 0.0, interface_out);
     return 0;
 }
 
@@ -1417,7 +2898,8 @@ SupportGenerationStats generate_orca_contact_proxy(
     CoverageSamples& coverage,
     QaStats& qa,
     SupportMesh& support_out,
-    SupportMesh& interface_out)
+    SupportMesh& interface_out,
+    OrganicTreeLayerData* tree_layer_data)
 {
     SupportGenerationStats stats;
     if (!settings.enable_support || mesh_stats.vertices.size() < 3)
@@ -1465,8 +2947,11 @@ SupportGenerationStats generate_orca_contact_proxy(
 
     const std::vector<unsigned char> interface_eligible = snapshot_occupied_cells(grid);
 
-    if (settings.base_enabled)
+    if (settings.base_enabled) {
         stats.base_cells = grow_base_footprint(grid, settings.base_margin_mm, settings.base_thickness_mm);
+        if (settings.join_uprights_bottom_enabled)
+            stats.bottom_join_cells = join_bottom_uprights(grid, settings.base_thickness_mm);
+    }
 
     restore_lower_envelope_contact_heights(grid, interface_eligible);
     clamp_grid_to_model_ceiling(grid);
@@ -1474,7 +2959,7 @@ SupportGenerationStats generate_orca_contact_proxy(
     update_coverage_from_final_grid(coverage, grid, qa);
     if (settings.interface_top_layers > 0)
         stats.interface_cells = count_masked_cells(interface_eligible);
-    stats.tree_branches = mesh_contact_grid(grid, settings, interface_eligible, support_out, interface_out);
+    stats.tree_branches = mesh_contact_grid(grid, settings, interface_eligible, support_out, interface_out, &stats, &coverage, tree_layer_data);
 
     return stats;
 }
@@ -1561,6 +3046,56 @@ void append_qa_json(std::ostringstream& out, const QaStats& qa)
     out << "}";
 }
 
+void append_tree_layer_disks_json(std::ostringstream& out, const OrganicTreeLayerData& layer_data)
+{
+    const std::size_t disk_count = layer_data.disk_count();
+    if (disk_count == 0) {
+        out << R"json("tree_layer_disks":null)json";
+        return;
+    }
+
+    out << R"json("tree_layer_disks":{"coordinate_space":"world_mm","shape":"layered_circle_unions","layer_height_mm":)json";
+    append_number(out, layer_data.layer_height);
+    out << R"json(,"bottom_z_mm":)json";
+    append_number(out, layer_data.bottom_z);
+    out << R"json(,"top_z_mm":)json";
+    append_number(out, layer_data.top_z);
+    out << R"json(,"circle_segments":)json"
+        << layer_data.circle_segments
+        << R"json(,"layer_count":)json"
+        << layer_data.layers.size()
+        << R"json(,"disk_count":)json"
+        << disk_count
+        << R"json(,"layers":[)json";
+
+    bool wrote_layer = false;
+    for (std::size_t layer_index = 0; layer_index < layer_data.layers.size(); ++layer_index) {
+        const auto& disks = layer_data.layers[layer_index];
+        if (disks.empty())
+            continue;
+        if (wrote_layer)
+            out << ",";
+        wrote_layer = true;
+        const double layer_z = layer_data.bottom_z + double(layer_index) * layer_data.layer_height;
+        out << R"json({"index":)json" << layer_index << R"json(,"z":)json";
+        append_number(out, layer_z);
+        out << R"json(,"disks":[)json";
+        for (std::size_t disk_index = 0; disk_index < disks.size(); ++disk_index) {
+            if (disk_index > 0)
+                out << ",";
+            out << "[";
+            append_number(out, disks[disk_index].x);
+            out << ",";
+            append_number(out, disks[disk_index].y);
+            out << ",";
+            append_number(out, disks[disk_index].radius);
+            out << "]";
+        }
+        out << "]}";
+    }
+    out << "]}";
+}
+
 } // namespace
 
 std::string core_status()
@@ -1570,7 +3105,7 @@ std::string core_status()
 
 std::string core_version()
 {
-    return "0.8.5";
+    return "0.8.6";
 }
 
 std::string support_option_schema_json()
@@ -1626,16 +3161,18 @@ std::string prepare_support_job_json(const std::string& job_json)
     SupportMesh interface_mesh;
     CoverageSamples coverage;
     QaStats qa;
-    const SupportGenerationStats support_stats = mesh_ready ? generate_orca_contact_proxy(mesh_stats, settings, manual_points, coverage, qa, support_mesh, interface_mesh) : SupportGenerationStats {};
-    const bool support_ready = mesh_ready && support_stats.contact_cells > 0 && (!support_mesh.triangles.empty() || !interface_mesh.triangles.empty());
+    OrganicTreeLayerData tree_layer_data;
+    const SupportGenerationStats support_stats = mesh_ready ? generate_orca_contact_proxy(mesh_stats, settings, manual_points, coverage, qa, support_mesh, interface_mesh, &tree_layer_data) : SupportGenerationStats {};
+    const bool tree_layer_ready = settings.tree_mode && tree_layer_data.disk_count() > 0;
+    const bool support_ready = mesh_ready && support_stats.contact_cells > 0 && (!support_mesh.triangles.empty() || !interface_mesh.triangles.empty() || tree_layer_ready);
 
     std::ostringstream out;
     out.precision(6);
     out << R"json({"status":")json"
         << (support_ready ? "support_mesh_generated" : (mesh_ready ? "no_support_regions" : "mesh_job_invalid"))
         << R"json(","native_target":"cradlemaker_support_core","algorithm":"cradle_lower_envelope_grid","message":")json"
-        << (settings.requested_orca_tree_mode && !Cradlemaker::OrcaSupportBridge::real_orca_tree_support_available() ?
-            "Real Orca organic tree support is not linked into WASM yet; generated the stable solid cradle fallback." :
+        << (settings.tree_mode ?
+            "WASM generated an original organic tree cradle graph from sliced underside contact samples. This is Cradlemaker-owned code, not ported Orca source." :
             "WASM generated a high-resolution lower-envelope cradle from sliced underside samples with model-clearance trimming.")
         << R"json(","job_bytes":)json"
         << job_json.size()
@@ -1689,6 +3226,8 @@ std::string prepare_support_job_json(const std::string& job_json)
     append_number(out, settings.interface_thickness_mm());
     out << R"json(,"base_enabled":)json"
         << (settings.base_enabled ? "true" : "false")
+        << R"json(,"join_uprights_bottom_enabled":)json"
+        << (settings.join_uprights_bottom_enabled ? "true" : "false")
         << R"json(,"contact_cells":)json"
         << support_stats.contact_cells
         << R"json(,"envelope_cells":)json"
@@ -1701,6 +3240,8 @@ std::string prepare_support_job_json(const std::string& job_json)
         << support_stats.closed_gap_cells
         << R"json(,"base_cells":)json"
         << support_stats.base_cells
+        << R"json(,"bottom_join_cells":)json"
+        << support_stats.bottom_join_cells
         << R"json(,"interface_cells":)json"
         << support_stats.interface_cells
         << R"json(,"edge_clearance_removed_cells":)json"
@@ -1713,14 +3254,28 @@ std::string prepare_support_job_json(const std::string& job_json)
         << (settings.requested_orca_tree_mode ? "true" : "false")
         << R"json(,"real_orca_tree_available":)json"
         << (Cradlemaker::OrcaSupportBridge::real_orca_tree_support_available() ? "true" : "false")
+        << R"json(,"original_organic_tree":)json"
+        << (settings.tree_mode ? "true" : "false")
         << R"json(,"tree_mode":)json"
         << (settings.tree_mode ? "true" : "false")
         << R"json(,"tree_branches":)json"
         << support_stats.tree_branches
+        << R"json(,"tree_tip_contacts":)json"
+        << support_stats.tree_tip_contacts
+        << R"json(,"tree_local_uprights":)json"
+        << support_stats.tree_local_uprights
+        << R"json(,"tree_waypoint_branches":)json"
+        << support_stats.tree_waypoint_branches
+        << R"json(,"tree_slope_reroutes":)json"
+        << support_stats.tree_slope_reroutes
+        << R"json(,"tree_model_reroutes":)json"
+        << support_stats.tree_model_reroutes
         << R"json(},)json";
     append_support_mesh_json(out, "support_mesh", support_mesh, settings.contact_cell_size_mm);
     out << ",";
     append_support_mesh_json(out, "interface_mesh", interface_mesh, settings.contact_cell_size_mm);
+    out << ",";
+    append_tree_layer_disks_json(out, tree_layer_data);
     out << ",";
     append_coverage_json(out, coverage);
     out << ",";

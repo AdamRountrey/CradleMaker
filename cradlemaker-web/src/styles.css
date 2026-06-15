@@ -101,13 +101,31 @@ select {
   border-top: 1px solid var(--line);
 }
 
-.control-block h2 {
+.control-block > summary {
+  cursor: pointer;
+  list-style-position: outside;
   margin: 0;
   font-size: 13px;
   line-height: 1.2;
   text-transform: uppercase;
   letter-spacing: 0;
   color: var(--muted);
+  font-weight: 760;
+}
+
+.control-block > summary::marker {
+  color: var(--accent);
+}
+
+.control-block:not([open]) {
+  gap: 0;
+}
+
+.control-note {
+  margin: -4px 0 0 24px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
 }
 
 label {
@@ -195,6 +213,12 @@ button:disabled {
   cursor: not-allowed;
 }
 
+button[data-active="true"] {
+  background: var(--accent);
+  border-color: var(--accent-strong);
+  color: #fff;
+}
+
 .file-button {
   display: grid;
   place-items: center;
@@ -240,6 +264,88 @@ button:disabled {
   color: #fff;
 }
 
+.qa-dashboard {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.qa-card {
+  min-height: 66px;
+  display: grid;
+  align-content: start;
+  gap: 4px;
+  padding: 9px 10px;
+  border: 1px solid rgba(38, 35, 31, 0.14);
+  border-left-width: 4px;
+  border-radius: 6px;
+  background: rgba(255, 250, 240, 0.72);
+}
+
+.qa-card[data-state="ok"] {
+  border-left-color: var(--accent);
+}
+
+.qa-card[data-state="working"] {
+  border-left-color: #6f91a2;
+}
+
+.qa-card[data-state="caution"],
+.qa-card[data-state="pending"] {
+  border-left-color: var(--support);
+}
+
+.qa-card[data-state="error"] {
+  border-left-color: #b84943;
+}
+
+.qa-card[data-state="idle"] {
+  border-left-color: rgba(38, 35, 31, 0.24);
+}
+
+.qa-label {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 760;
+  line-height: 1.1;
+  text-transform: uppercase;
+  letter-spacing: 0;
+}
+
+.qa-value {
+  color: var(--panel-ink);
+  font-size: 17px;
+  font-weight: 780;
+  line-height: 1.15;
+}
+
+.qa-detail {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.25;
+}
+
+.status-details {
+  border: 1px solid rgba(38, 35, 31, 0.16);
+  border-radius: 6px;
+  background: rgba(255, 250, 240, 0.42);
+}
+
+.status-details summary {
+  cursor: pointer;
+  padding: 8px 10px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.status-details .job-status {
+  border: 0;
+  border-top: 1px solid rgba(38, 35, 31, 0.12);
+  border-radius: 0 0 6px 6px;
+  background: rgba(255, 250, 240, 0.62);
+}
+
 .job-status {
   min-height: 42px;
   border: 1px solid rgba(38, 35, 31, 0.16);
@@ -254,6 +360,40 @@ button:disabled {
 .job-status[data-state="working"] {
   border-color: rgba(47, 125, 109, 0.45);
   color: var(--accent-strong);
+}
+
+.progress-shell {
+  display: grid;
+  gap: 5px;
+}
+
+.progress-shell[hidden] {
+  display: none;
+}
+
+progress {
+  width: 100%;
+  height: 10px;
+  appearance: none;
+  border: 0;
+  border-radius: 999px;
+  overflow: hidden;
+  background: rgba(38, 35, 31, 0.12);
+}
+
+progress::-webkit-progress-bar {
+  border-radius: 999px;
+  background: rgba(38, 35, 31, 0.12);
+}
+
+progress::-webkit-progress-value {
+  border-radius: 999px;
+  background: var(--accent);
+}
+
+progress::-moz-progress-bar {
+  border-radius: 999px;
+  background: var(--accent);
 }
 
 .job-status[data-state="pending"] {

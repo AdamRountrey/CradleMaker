@@ -5,7 +5,7 @@ export const ORCA_SUPPORT_OPTIONS = [
   {
     key: "support_type",
     type: "enum",
-    defaultValue: "tree(auto)",
+    defaultValue: "normal(auto)",
     values: ["normal(auto)", "tree(auto)", "normal(manual)", "tree(manual)"],
   },
   {
