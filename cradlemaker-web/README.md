@@ -53,5 +53,5 @@ The bundled sample model lives in `cradlemaker-web/samples/` so the sample loade
 - Normal cradle generation uses the current Cradlemaker WASM solid cradle engine.
 - Split-for-printing exports use Manifold WASM booleans for chunk cuts and connector sockets, with a height-field fallback if the generated cradle mesh is rejected as non-manifold.
 - Real Orca organic tree support is being isolated as an optional WASM probe. The clean web checkout does not include upstream Orca sources; fetch them locally with `cradlemaker-web\wasm\fetch-orca-support-sources.ps1` before working on the probe.
-- Tree/organic support requests intentionally fall back to the stable solid cradle until the headless Orca `PrintObject` adapter is complete.
+- Tree/organic support experiments are kept in the codebase, but the UI currently exposes only the stable `Normal auto` / `Default (Grid/Organic)` cradle workflow.
 - Manual support clicks are point marks; painted enforcer/blocker regions are still future work.
