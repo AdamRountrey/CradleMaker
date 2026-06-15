@@ -2,8 +2,8 @@
 #
 # Keep this list explicit. The point of Cradlemaker WASM is to import only the
 # support-generation boundary we need, not the monolithic libslic3r target.
-# These files are not compiled yet; they are the next import set as dependencies
-# are isolated behind cradlemaker_support_core.
+# These are upstream Orca support-generation files. Cradle solidification remains
+# Cradlemaker-owned code, not a dependency on the old modified Orca checkout.
 
 set(CRADLEMAKER_ORCA_SUPPORT_SOURCE_CANDIDATES
     "${ORCA_LIBSLIC3R_DIR}/PrintObject.cpp"
@@ -13,5 +13,4 @@ set(CRADLEMAKER_ORCA_SUPPORT_SOURCE_CANDIDATES
     "${ORCA_LIBSLIC3R_DIR}/Support/TreeModelVolumes.cpp"
     "${ORCA_LIBSLIC3R_DIR}/Support/TreeSupport.cpp"
     "${ORCA_LIBSLIC3R_DIR}/Support/TreeSupport3D.cpp"
-    "${ORCA_LIBSLIC3R_DIR}/Cradle/CradleSupport.cpp"
 )

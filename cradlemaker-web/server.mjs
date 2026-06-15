@@ -1,5 +1,5 @@
 import { createServer } from "node:http";
-import { createReadStream, statSync } from "node:fs";
+import { createReadStream, readdirSync, statSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -17,6 +17,30 @@ const types = new Map([
 
 const server = createServer((request, response) => {
   const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "127.0.0.1"}`);
+
+  if (url.pathname === "/api/samples") {
+    try {
+      const samplesDir = join(root, "cradlemaker-web", "samples");
+      const samples = readdirSync(samplesDir, { withFileTypes: true })
+        .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".stl"))
+        .map((entry) => ({
+          name: entry.name,
+          url: `/cradlemaker-web/samples/${encodeURIComponent(entry.name)}`,
+        }))
+        .sort((a, b) => a.name.localeCompare(b.name));
+
+      response.writeHead(200, {
+        "Content-Type": "application/json; charset=utf-8",
+        "Cache-Control": "no-store",
+      });
+      response.end(JSON.stringify({ samples }));
+    } catch {
+      response.writeHead(500, { "Content-Type": "application/json; charset=utf-8" });
+      response.end(JSON.stringify({ samples: [] }));
+    }
+    return;
+  }
+
   const decodedPath = decodeURIComponent(url.pathname);
   let path = normalize(join(root, decodedPath));
 

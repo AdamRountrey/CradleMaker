@@ -1,5 +1,6 @@
 *
 !/.gitignore
+!/CMakeLists.txt
 !/cradlemaker-web/
 !/cradlemaker-web/**
 !/.github/

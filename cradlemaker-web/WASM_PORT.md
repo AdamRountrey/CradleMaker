@@ -19,20 +19,18 @@ The WASM core owns:
 
 ## First Native Extraction
 
-`src/libslic3r/Cradle/CradleSupport.*` now contains the GUI-independent cradle solidification logic previously embedded in `Plater.cpp`:
+The old modified Orca checkout had GUI-independent cradle solidification experiments, but the clean Cradlemaker app should not depend on that fork. The split is now:
 
-- `support_layer_regions`
-- `accumulated_support_slices`
-- `slices_to_slab_mesh`
-- `build_support_solid`
+- Upstream Orca/libslic3r owns support region generation.
+- Cradlemaker owns museum-cradle solidification, model-clearance trimming, split connectors, QA, and STL/PLY export.
 
 The next native step is to create a small support-core entry point that:
 
 1. Builds an Orca `Model`/`PrintObject` from the uploaded mesh.
 2. Applies the support settings and manual support enforcer/blocker data.
 3. Runs Orca/libslic3r support generation.
-4. Passes the generated `SupportLayer` list to `Cradle::accumulated_support_slices`.
-5. Returns a binary STL/PLY buffer generated from `Cradle::build_support_solid`.
+4. Converts the generated `SupportLayer` polygons into Cradlemaker's watertight cradle mesh pipeline.
+5. Returns STL/PLY buffers for preview/export.
 
 ## Tooling
 
@@ -96,11 +94,14 @@ The exact target can be added after the support-core entry point is isolated eno
 Build it with:
 
 ```powershell
+.\cradlemaker-web\wasm\fetch-orca-support-sources.ps1
 $env:PATH = (Resolve-Path 'tools\emsdk\python\3.13.3_64bit').Path + ';' + $env:PATH
 & tools\strawberry-perl\c\bin\cmake.exe --build build-wasm --target cradlemaker_orca_support_probe --config Release
 ```
 
-Current status: the source set for Orca normal/tree/organic support compiles under Emscripten as object files. The probe currently depends on Orca geometry headers, Boost, Eigen, libigl, libnest2d, TBB headers, and temporary desktop dependency include roots for Cereal, generated OpenSSL config, and OCCT headers pulled indirectly through `Model.hpp`.
+The fetch script sparse-checks out upstream OrcaSlicer into the ignored local cache `orca-upstream/OrcaSlicer`. The optional CMake probe is skipped automatically when those sources are absent, so a clean Cradlemaker checkout still builds the web app.
+
+Current status: the source set for Orca normal/tree/organic support has previously compiled under Emscripten as object files, but the clean repo no longer carries the old modified Orca source tree. After fetching upstream sources, the probe still depends on Orca geometry headers, Boost, Eigen, libigl, libnest2d, TBB headers, and temporary desktop dependency include roots for Cereal, generated OpenSSL config, and OCCT headers pulled indirectly through `Model.hpp`.
 
 The probe is not runtime support generation yet. Real organic tree support becomes available only after the app can create a headless `Print` / `PrintObject`, initialize Orca config, generate object layers, invoke `TreeSupport::generate()`, and convert `SupportLayer` polygons into cradle solids.
 
@@ -114,4 +115,19 @@ The probe is not runtime support generation yet. Real organic tree support becom
 - `Slic3r::generate_tree_support_3D`
 - `Slic3r::TreeSupport3D::generate_support_areas`
 
-Then it should pass `PrintObject::support_layers()` into `Slic3r::Cradle::accumulated_support_slices` and `Slic3r::Cradle::build_support_solid`.
+Then it should convert `PrintObject::support_layers()` into Cradlemaker's watertight cradle solidification/export path.
+
+## What Orca Organic Actually Does
+
+Upstream Orca's organic mode is not a decorative tube generator. `TreeSupport::generate()` routes `smsTreeOrganic` to `generate_tree_support_3D()`, whose pipeline is:
+
+1. Detect overhang polygons from sliced object layers.
+2. Build per-layer/per-radius collision, avoidance, wall restriction, bed, and placeable-area caches in `TreeModelVolumes`.
+3. Create initial support influence areas from overhangs and support enforcers.
+4. Propagate influence areas downward layer by layer.
+5. Place support nodes inside the valid areas.
+6. Smooth branch paths while avoiding model collisions.
+7. Extrude branch meshes, slice those meshes back into support polygons, and create support/contact/interface layers.
+8. Generate final support toolpaths from those layers.
+
+Cradlemaker needs to tap the generated polygon layers before G-code/toolpath output and solidify them as independent cradle geometry.
