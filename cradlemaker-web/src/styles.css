@@ -115,6 +115,20 @@ select {
   line-height: 1.45;
 }
 
+.panel-header .legal-line {
+  justify-self: center;
+  max-width: 260px;
+  margin: 0;
+  text-align: center;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.panel-header .legal-line a {
+  color: var(--accent-strong);
+  font-weight: 700;
+}
+
 .control-block {
   display: grid;
   gap: 12px;
