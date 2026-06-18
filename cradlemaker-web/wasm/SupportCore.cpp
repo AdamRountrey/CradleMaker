@@ -4,18 +4,47 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <limits>
 #include <numeric>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace Cradlemaker::SupportCore {
 namespace {
 
 constexpr double kPi = 3.14159265358979323846;
+constexpr std::size_t kParallelTriangleThreshold = 8000;
+
+#if defined(__EMSCRIPTEN_PTHREADS__) || !defined(__EMSCRIPTEN__)
+#define CRADLEMAKER_CAN_USE_NATIVE_THREADS 1
+constexpr bool kCanUseNativeThreads = true;
+#else
+#define CRADLEMAKER_CAN_USE_NATIVE_THREADS 0
+constexpr bool kCanUseNativeThreads = false;
+#endif
+
+unsigned support_worker_count(const std::size_t triangle_count)
+{
+#if CRADLEMAKER_CAN_USE_NATIVE_THREADS
+    if (!kCanUseNativeThreads)
+        return 1;
+    if (triangle_count < kParallelTriangleThreshold)
+        return 1;
+
+    const unsigned hardware = std::max(1u, std::thread::hardware_concurrency());
+    const unsigned by_work = std::max(1u, unsigned(triangle_count / kParallelTriangleThreshold));
+    return std::min({ hardware, by_work, 8u });
+#else
+    (void)triangle_count;
+    return 1;
+#endif
+}
 
 struct Vec3 {
     double x = 0.0;
@@ -43,6 +72,19 @@ struct SupportMesh {
     std::vector<std::array<int, 3>> triangles;
 };
 
+struct PackedSupportMesh {
+    std::vector<float> vertices;
+    std::vector<std::uint32_t> triangles;
+};
+
+struct LastBinarySupportResult {
+    PackedSupportMesh support;
+    PackedSupportMesh interface_mesh;
+};
+
+LastBinarySupportResult g_last_binary_result;
+std::vector<float> g_input_vertices;
+
 struct CoverageCell {
     Vec3 center;
     bool supported = false;
@@ -54,6 +96,7 @@ struct SupportSettings {
     bool interface_enabled = false;
     bool foam_gap_enabled = false;
     bool join_uprights_bottom_enabled = true;
+    bool merge_nearby_columns_enabled = true;
     bool remove_small_overhangs = true;
     bool tree_mode = false;
     bool requested_orca_tree_mode = false;
@@ -127,6 +170,9 @@ struct SupportGenerationStats {
     std::size_t contact_cells = 0;
     std::size_t base_cells = 0;
     std::size_t bottom_join_cells = 0;
+    std::size_t column_merge_cells = 0;
+    std::size_t column_components_before = 0;
+    std::size_t column_components_after = 0;
     std::size_t interface_cells = 0;
     std::size_t edge_clearance_removed_cells = 0;
     std::size_t foam_gap_removed_cells = 0;
@@ -137,6 +183,21 @@ struct SupportGenerationStats {
     std::size_t tree_waypoint_branches = 0;
     std::size_t tree_slope_reroutes = 0;
     std::size_t tree_model_reroutes = 0;
+    double timing_grid_ms = 0.0;
+    double timing_model_ceiling_ms = 0.0;
+    double timing_overhang_ms = 0.0;
+    double timing_lower_envelope_ms = 0.0;
+    double timing_prune_ms = 0.0;
+    double timing_manual_ms = 0.0;
+    double timing_gap_and_clearance_ms = 0.0;
+    double timing_qa_ms = 0.0;
+    double timing_base_ms = 0.0;
+    double timing_mesh_ms = 0.0;
+    double timing_input_parse_ms = 0.0;
+    double timing_settings_parse_ms = 0.0;
+    double timing_generation_total_ms = 0.0;
+    double timing_binary_pack_ms = 0.0;
+    double timing_json_metadata_ms = 0.0;
 };
 
 struct TreeLayerDisk {
@@ -436,6 +497,7 @@ SupportSettings read_support_settings(const std::string& json)
     settings.enable_support = read_bool_field(json, "enable_support", settings.enable_support);
     settings.base_enabled = read_bool_field(json, "base_enabled", settings.base_enabled);
     settings.join_uprights_bottom_enabled = read_bool_field(json, "join_uprights_bottom_enabled", settings.join_uprights_bottom_enabled);
+    settings.merge_nearby_columns_enabled = read_bool_field(json, "merge_nearby_columns_enabled", settings.merge_nearby_columns_enabled);
     settings.interface_enabled = read_bool_field(json, "support_interface_enabled", settings.interface_enabled);
     settings.foam_gap_enabled = read_bool_field(json, "foam_gap_enabled", settings.foam_gap_enabled);
     settings.remove_small_overhangs = read_bool_field(json, "support_remove_small_overhang", settings.remove_small_overhangs);
@@ -1044,6 +1106,8 @@ bool sample_cell_triangle_z(const ContactGrid& grid, const int ix, const int iy,
     return false;
 }
 
+double slope_adaptive_clearance_mm(const ContactGrid& grid, const SupportSettings& settings, const Vec3& normal);
+
 ContactGrid make_contact_grid(const MeshStats& mesh_stats, const SupportSettings& settings)
 {
     const double bounds_margin = settings.xy_distance_mm + settings.base_margin_mm + settings.contact_cell_size_mm;
@@ -1133,32 +1197,105 @@ void mark_model_side_wall_clearance(ContactGrid& grid, const SupportSettings& se
 
 void populate_model_collision_ceiling(ContactGrid& grid, const MeshStats& mesh_stats, const SupportSettings& settings)
 {
-    for (std::size_t vertex_index = 0; vertex_index + 2 < mesh_stats.vertices.size(); vertex_index += 3) {
-        const Vec3 a = mesh_stats.vertices[vertex_index];
-        const Vec3 b = mesh_stats.vertices[vertex_index + 1];
-        const Vec3 c = mesh_stats.vertices[vertex_index + 2];
-        if (triangle_area_2d(a, b, c) <= 1e-8) {
-            mark_model_side_wall_clearance(grid, settings, a, b, c);
-            continue;
-        }
+    const std::size_t triangle_count = mesh_stats.vertices.size() / 3;
+    const unsigned worker_count = support_worker_count(triangle_count);
+    if (worker_count <= 1) {
+        for (std::size_t vertex_index = 0; vertex_index + 2 < mesh_stats.vertices.size(); vertex_index += 3) {
+            const Vec3 a = mesh_stats.vertices[vertex_index];
+            const Vec3 b = mesh_stats.vertices[vertex_index + 1];
+            const Vec3 c = mesh_stats.vertices[vertex_index + 2];
+            if (triangle_area_2d(a, b, c) <= 1e-8) {
+                mark_model_side_wall_clearance(grid, settings, a, b, c);
+                continue;
+            }
 
-        const double expand = grid.cell_size * 0.75;
-        const int min_ix = int(std::floor((std::min({ a.x, b.x, c.x }) - expand - grid.origin_x) / grid.cell_size));
-        const int max_ix = int(std::floor((std::max({ a.x, b.x, c.x }) + expand - grid.origin_x) / grid.cell_size));
-        const int min_iy = int(std::floor((std::min({ a.y, b.y, c.y }) - expand - grid.origin_y) / grid.cell_size));
-        const int max_iy = int(std::floor((std::max({ a.y, b.y, c.y }) + expand - grid.origin_y) / grid.cell_size));
+            const Vec3 normal = cross(subtract(b, a), subtract(c, a));
+            const double adaptive_clearance = slope_adaptive_clearance_mm(grid, settings, normal);
+            const double expand = grid.cell_size * 0.75;
+            const int min_ix = int(std::floor((std::min({ a.x, b.x, c.x }) - expand - grid.origin_x) / grid.cell_size));
+            const int max_ix = int(std::floor((std::max({ a.x, b.x, c.x }) + expand - grid.origin_x) / grid.cell_size));
+            const int min_iy = int(std::floor((std::min({ a.y, b.y, c.y }) - expand - grid.origin_y) / grid.cell_size));
+            const int max_iy = int(std::floor((std::max({ a.y, b.y, c.y }) + expand - grid.origin_y) / grid.cell_size));
 
-        for (int iy = min_iy; iy <= max_iy; ++iy) {
-            for (int ix = min_ix; ix <= max_ix; ++ix) {
-                if (!grid.inside(ix, iy))
-                    continue;
+            for (int iy = min_iy; iy <= max_iy; ++iy) {
+                for (int ix = min_ix; ix <= max_ix; ++ix) {
+                    if (!grid.inside(ix, iy))
+                        continue;
 
-                double sampled_z = std::numeric_limits<double>::max();
-                if (sample_cell_triangle_z(grid, ix, iy, a, b, c, sampled_z))
-                    mark_model_ceiling_cell(grid, ix, iy, sampled_z - settings.effective_top_z_distance_mm());
+                    double sampled_z = std::numeric_limits<double>::max();
+                    if (sample_cell_triangle_z(grid, ix, iy, a, b, c, sampled_z))
+                        mark_model_ceiling_cell(grid, ix, iy, sampled_z - settings.effective_top_z_distance_mm() - adaptive_clearance);
+                }
             }
         }
+        return;
     }
+
+#if CRADLEMAKER_CAN_USE_NATIVE_THREADS
+    std::vector<ContactGrid> local_grids;
+    local_grids.reserve(worker_count);
+    for (unsigned worker = 0; worker < worker_count; ++worker) {
+        ContactGrid local;
+        local.origin_x = grid.origin_x;
+        local.origin_y = grid.origin_y;
+        local.cell_size = grid.cell_size;
+        local.bottom_z = grid.bottom_z;
+        local.cols = grid.cols;
+        local.rows = grid.rows;
+        local.model_ceiling_z.assign(grid.model_ceiling_z.size(), std::numeric_limits<double>::max());
+        local_grids.push_back(std::move(local));
+    }
+
+    auto process_range = [&](const unsigned worker, const std::size_t first_triangle, const std::size_t last_triangle) {
+        ContactGrid& local_grid = local_grids[worker];
+        for (std::size_t triangle_index = first_triangle; triangle_index < last_triangle; ++triangle_index) {
+            const std::size_t vertex_index = triangle_index * 3;
+            const Vec3 a = mesh_stats.vertices[vertex_index];
+            const Vec3 b = mesh_stats.vertices[vertex_index + 1];
+            const Vec3 c = mesh_stats.vertices[vertex_index + 2];
+            if (triangle_area_2d(a, b, c) <= 1e-8) {
+                mark_model_side_wall_clearance(local_grid, settings, a, b, c);
+                continue;
+            }
+
+            const Vec3 normal = cross(subtract(b, a), subtract(c, a));
+            const double adaptive_clearance = slope_adaptive_clearance_mm(local_grid, settings, normal);
+            const double expand = local_grid.cell_size * 0.75;
+            const int min_ix = int(std::floor((std::min({ a.x, b.x, c.x }) - expand - local_grid.origin_x) / local_grid.cell_size));
+            const int max_ix = int(std::floor((std::max({ a.x, b.x, c.x }) + expand - local_grid.origin_x) / local_grid.cell_size));
+            const int min_iy = int(std::floor((std::min({ a.y, b.y, c.y }) - expand - local_grid.origin_y) / local_grid.cell_size));
+            const int max_iy = int(std::floor((std::max({ a.y, b.y, c.y }) + expand - local_grid.origin_y) / local_grid.cell_size));
+
+            for (int iy = min_iy; iy <= max_iy; ++iy) {
+                for (int ix = min_ix; ix <= max_ix; ++ix) {
+                    if (!local_grid.inside(ix, iy))
+                        continue;
+
+                    double sampled_z = std::numeric_limits<double>::max();
+                    if (sample_cell_triangle_z(local_grid, ix, iy, a, b, c, sampled_z))
+                        mark_model_ceiling_cell(local_grid, ix, iy, sampled_z - settings.effective_top_z_distance_mm() - adaptive_clearance);
+                }
+            }
+        }
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count > 0 ? worker_count - 1 : 0);
+    const std::size_t chunk = (triangle_count + worker_count - 1) / worker_count;
+    for (unsigned worker = 1; worker < worker_count; ++worker) {
+        const std::size_t first = std::min<std::size_t>(triangle_count, std::size_t(worker) * chunk);
+        const std::size_t last = std::min<std::size_t>(triangle_count, first + chunk);
+        workers.emplace_back(process_range, worker, first, last);
+    }
+    process_range(0, 0, std::min<std::size_t>(triangle_count, chunk));
+    for (std::thread& worker : workers)
+        worker.join();
+
+    for (const ContactGrid& local_grid : local_grids) {
+        for (std::size_t index = 0; index < grid.model_ceiling_z.size(); ++index)
+            grid.model_ceiling_z[index] = std::min(grid.model_ceiling_z[index], local_grid.model_ceiling_z[index]);
+    }
+#endif
 }
 
 double clamp_to_model_ceiling(const ContactGrid& grid, const int ix, const int iy, const double top_z)
@@ -1167,6 +1304,24 @@ double clamp_to_model_ceiling(const ContactGrid& grid, const int ix, const int i
         return top_z;
 
     return std::min(top_z, grid.model_ceiling(ix, iy));
+}
+
+double slope_adaptive_clearance_mm(const ContactGrid& grid, const SupportSettings& settings, const Vec3& normal)
+{
+    const double normal_length = length(normal);
+    if (normal_length <= 1e-9)
+        return 0.0;
+
+    const double nz = std::abs(normal.z) / normal_length;
+    const double nxy = std::sqrt(std::max(0.0, 1.0 - nz * nz));
+    if (nxy <= 1e-6)
+        return 0.0;
+
+    const double slope = nxy / std::max(0.08, nz);
+    const double sample_radius = grid.cell_size * 0.58 + settings.xy_distance_mm * 0.35;
+    const double adaptive = slope * sample_radius;
+    const double cap = std::max(grid.cell_size * 2.25, settings.xy_distance_mm * 3.0);
+    return std::clamp(adaptive, 0.0, cap);
 }
 
 void mark_contact_cell(ContactGrid& grid, const int ix, const int iy, const double top_z)
@@ -1276,6 +1431,108 @@ std::size_t mark_lower_envelope_contacts(ContactGrid& grid, const MeshStats& mes
 {
     std::size_t marked_cells = 0;
     const double min_surface_normal_z = minimum_lower_envelope_normal_z(settings);
+    const std::size_t triangle_count = mesh_stats.vertices.size() / 3;
+    const unsigned worker_count = support_worker_count(triangle_count);
+
+#if CRADLEMAKER_CAN_USE_NATIVE_THREADS
+    if (worker_count > 1) {
+        (void)coverage;
+        std::vector<ContactGrid> local_grids;
+        local_grids.reserve(worker_count);
+        for (unsigned worker = 0; worker < worker_count; ++worker) {
+            ContactGrid local;
+            local.origin_x = grid.origin_x;
+            local.origin_y = grid.origin_y;
+            local.cell_size = grid.cell_size;
+            local.bottom_z = grid.bottom_z;
+            local.cols = grid.cols;
+            local.rows = grid.rows;
+            local.model_ceiling_z = grid.model_ceiling_z;
+            local.top_z.assign(grid.top_z.size(), grid.bottom_z);
+            local.lower_envelope_z.assign(grid.lower_envelope_z.size(), std::numeric_limits<double>::max());
+            local_grids.push_back(std::move(local));
+        }
+
+        auto process_range = [&](const unsigned worker, const std::size_t first_triangle, const std::size_t last_triangle) {
+            ContactGrid& local_grid = local_grids[worker];
+            for (std::size_t triangle_index = first_triangle; triangle_index < last_triangle; ++triangle_index) {
+                const std::size_t vertex_index = triangle_index * 3;
+                const Vec3 a = mesh_stats.vertices[vertex_index];
+                const Vec3 b = mesh_stats.vertices[vertex_index + 1];
+                const Vec3 c = mesh_stats.vertices[vertex_index + 2];
+                if (triangle_area_2d(a, b, c) <= 1e-8)
+                    continue;
+
+                const Vec3 normal = cross(subtract(b, a), subtract(c, a));
+                const double normal_length = length(normal);
+                if (normal_length <= 1e-9)
+                    continue;
+
+                const double normal_z = normal.z / normal_length;
+                if (std::abs(normal_z) < min_surface_normal_z)
+                    continue;
+
+                const double adaptive_clearance = slope_adaptive_clearance_mm(local_grid, settings, normal);
+                const double expand = local_grid.cell_size * 0.9;
+                const int min_ix = int(std::floor((std::min({ a.x, b.x, c.x }) - expand - local_grid.origin_x) / local_grid.cell_size));
+                const int max_ix = int(std::floor((std::max({ a.x, b.x, c.x }) + expand - local_grid.origin_x) / local_grid.cell_size));
+                const int min_iy = int(std::floor((std::min({ a.y, b.y, c.y }) - expand - local_grid.origin_y) / local_grid.cell_size));
+                const int max_iy = int(std::floor((std::max({ a.y, b.y, c.y }) + expand - local_grid.origin_y) / local_grid.cell_size));
+
+                for (int iy = min_iy; iy <= max_iy; ++iy) {
+                    for (int ix = min_ix; ix <= max_ix; ++ix) {
+                        double model_z = 0.0;
+                        if (!sample_cell_triangle_z(local_grid, ix, iy, a, b, c, model_z))
+                            continue;
+
+                        const double top_z = std::max(local_grid.bottom_z, model_z - settings.effective_top_z_distance_mm() - adaptive_clearance);
+                        if (local_grid.has_model_ceiling(ix, iy) && top_z > local_grid.model_ceiling(ix, iy) + local_grid.cell_size * 0.1)
+                            continue;
+                        if (top_z <= local_grid.bottom_z + 0.05)
+                            continue;
+                        mark_lower_envelope_target_cell(local_grid, ix, iy, top_z);
+                        mark_lower_envelope_cell(local_grid, ix, iy, top_z);
+                    }
+                }
+            }
+        };
+
+        std::vector<std::thread> workers;
+        workers.reserve(worker_count > 0 ? worker_count - 1 : 0);
+        const std::size_t chunk = (triangle_count + worker_count - 1) / worker_count;
+        for (unsigned worker = 1; worker < worker_count; ++worker) {
+            const std::size_t first = std::min<std::size_t>(triangle_count, std::size_t(worker) * chunk);
+            const std::size_t last = std::min<std::size_t>(triangle_count, first + chunk);
+            workers.emplace_back(process_range, worker, first, last);
+        }
+        process_range(0, 0, std::min<std::size_t>(triangle_count, chunk));
+        for (std::thread& worker : workers)
+            worker.join();
+
+        for (const ContactGrid& local_grid : local_grids) {
+            for (std::size_t index = 0; index < grid.top_z.size(); ++index) {
+                if (local_grid.lower_envelope_z[index] < grid.lower_envelope_z[index])
+                    grid.lower_envelope_z[index] = local_grid.lower_envelope_z[index];
+
+                if (local_grid.top_z[index] <= grid.bottom_z + 0.05)
+                    continue;
+                if (grid.top_z[index] <= grid.bottom_z + 0.05 || local_grid.top_z[index] < grid.top_z[index])
+                    grid.top_z[index] = local_grid.top_z[index];
+            }
+        }
+
+        for (std::size_t index = 0; index < grid.lower_envelope_z.size(); ++index) {
+            if (grid.lower_envelope_z[index] < std::numeric_limits<double>::max() * 0.5 &&
+                grid.top_z[index] > grid.bottom_z + 0.05) {
+                ++marked_cells;
+            }
+        }
+        return marked_cells;
+    }
+#else
+    (void)worker_count;
+#endif
+
     for (std::size_t vertex_index = 0; vertex_index + 2 < mesh_stats.vertices.size(); vertex_index += 3) {
         const Vec3 a = mesh_stats.vertices[vertex_index];
         const Vec3 b = mesh_stats.vertices[vertex_index + 1];
@@ -1292,6 +1549,7 @@ std::size_t mark_lower_envelope_contacts(ContactGrid& grid, const MeshStats& mes
         if (std::abs(normal_z) < min_surface_normal_z)
             continue;
 
+        const double adaptive_clearance = slope_adaptive_clearance_mm(grid, settings, normal);
         const double expand = grid.cell_size * 0.9;
         const int min_ix = int(std::floor((std::min({ a.x, b.x, c.x }) - expand - grid.origin_x) / grid.cell_size));
         const int max_ix = int(std::floor((std::max({ a.x, b.x, c.x }) + expand - grid.origin_x) / grid.cell_size));
@@ -1304,7 +1562,7 @@ std::size_t mark_lower_envelope_contacts(ContactGrid& grid, const MeshStats& mes
                 if (!sample_cell_triangle_z(grid, ix, iy, a, b, c, model_z))
                     continue;
 
-                const double top_z = std::max(grid.bottom_z, model_z - settings.effective_top_z_distance_mm());
+                const double top_z = std::max(grid.bottom_z, model_z - settings.effective_top_z_distance_mm() - adaptive_clearance);
                 if (grid.has_model_ceiling(ix, iy) && top_z > grid.model_ceiling(ix, iy) + grid.cell_size * 0.1)
                     continue;
                 const bool supportable = top_z > grid.bottom_z + 0.05;
@@ -1677,6 +1935,153 @@ std::size_t join_bottom_uprights(ContactGrid& grid, const double base_thickness_
     return joined_cells;
 }
 
+double column_component_threshold(const ContactGrid& grid, const SupportSettings& settings)
+{
+    const double base_top = settings.base_enabled ? settings.base_thickness_mm : grid.bottom_z;
+    return base_top + std::max(0.15, grid.cell_size * 0.25);
+}
+
+std::size_t count_column_components(const ContactGrid& grid, const SupportSettings& settings)
+{
+    const double min_column_top = column_component_threshold(grid, settings);
+    std::vector<unsigned char> visited(grid.top_z.size(), 0);
+    std::vector<int> stack;
+    stack.reserve(256);
+    std::size_t components = 0;
+
+    auto is_column = [&](const int ix, const int iy) {
+        return grid.inside(ix, iy) && grid.top_z[grid.index(ix, iy)] > min_column_top;
+    };
+
+    for (int iy = 0; iy < grid.rows; ++iy) {
+        for (int ix = 0; ix < grid.cols; ++ix) {
+            const int start_index = grid.index(ix, iy);
+            if (visited[start_index] || !is_column(ix, iy))
+                continue;
+
+            ++components;
+            visited[start_index] = 1;
+            stack.push_back(start_index);
+
+            while (!stack.empty()) {
+                const int cell_index = stack.back();
+                stack.pop_back();
+                const int cell_x = cell_index % grid.cols;
+                const int cell_y = cell_index / grid.cols;
+
+                constexpr std::array<std::array<int, 2>, 4> neighbors {{
+                    {{ -1, 0 }},
+                    {{ 1, 0 }},
+                    {{ 0, -1 }},
+                    {{ 0, 1 }}
+                }};
+
+                for (const auto& offset : neighbors) {
+                    const int nx = cell_x + offset[0];
+                    const int ny = cell_y + offset[1];
+                    if (!grid.inside(nx, ny))
+                        continue;
+                    const int neighbor_index = grid.index(nx, ny);
+                    if (visited[neighbor_index] || !is_column(nx, ny))
+                        continue;
+                    visited[neighbor_index] = 1;
+                    stack.push_back(neighbor_index);
+                }
+            }
+        }
+    }
+
+    return components;
+}
+
+std::size_t merge_nearby_columns(ContactGrid& grid, const SupportSettings& settings)
+{
+    if (!settings.merge_nearby_columns_enabled || settings.tree_mode)
+        return 0;
+
+    const double base_top = settings.base_enabled ? settings.base_thickness_mm : grid.bottom_z;
+    const double min_column_top = column_component_threshold(grid, settings);
+    const double merge_ceiling_clearance = std::max(0.2, grid.cell_size * 0.25);
+    const double merge_radius_mm = std::clamp(settings.contact_cell_size_mm * 18.0, 8.0, 22.0);
+    const int merge_radius_cells = std::max(1, int(std::ceil(merge_radius_mm / grid.cell_size)));
+    const std::vector<double> source = grid.top_z;
+    std::vector<double> candidate = grid.top_z;
+    std::size_t merged_cells = 0;
+
+    auto source_column = [&](const int ix, const int iy) {
+        return grid.inside(ix, iy) && source[grid.index(ix, iy)] > min_column_top;
+    };
+
+    auto safe_merge_top = [&](const int ix, const int iy, const double desired_top) {
+        if (!grid.inside(ix, iy))
+            return grid.bottom_z;
+        if (!grid.has_model_ceiling(ix, iy))
+            return desired_top;
+        return std::min(desired_top, grid.model_ceiling(ix, iy) - merge_ceiling_clearance);
+    };
+
+    auto ray_hit_top = [&](const int ix, const int iy, const int dx, const int dy) {
+        double hit_top = grid.bottom_z;
+        for (int step = 1; step <= merge_radius_cells; ++step) {
+            const int nx = ix + dx * step;
+            const int ny = iy + dy * step;
+            if (!grid.inside(nx, ny))
+                break;
+            if (!source_column(nx, ny))
+                continue;
+            hit_top = source[grid.index(nx, ny)];
+            break;
+        }
+        return hit_top;
+    };
+
+    auto paired_bridge_top = [&](const int ix, const int iy, const int dx, const int dy) {
+        const double forward = ray_hit_top(ix, iy, dx, dy);
+        if (forward <= min_column_top)
+            return grid.bottom_z;
+        const double backward = ray_hit_top(ix, iy, -dx, -dy);
+        if (backward <= min_column_top)
+            return grid.bottom_z;
+        return std::min(forward, backward);
+    };
+
+    constexpr std::array<std::array<int, 2>, 4> bridge_axes {{
+        {{ 1, 0 }},
+        {{ 0, 1 }},
+        {{ 1, 1 }},
+        {{ 1, -1 }}
+    }};
+
+    for (int iy = 0; iy < grid.rows; ++iy) {
+        for (int ix = 0; ix < grid.cols; ++ix) {
+            const int cell_index = grid.index(ix, iy);
+            if (source[cell_index] > min_column_top)
+                continue;
+
+            double best_top = grid.bottom_z;
+            for (const auto& axis : bridge_axes) {
+                const double bridge_top = paired_bridge_top(ix, iy, axis[0], axis[1]);
+                if (bridge_top > best_top)
+                    best_top = bridge_top;
+            }
+
+            const double clamped_top = safe_merge_top(ix, iy, best_top);
+            if (clamped_top <= min_column_top)
+                continue;
+            candidate[cell_index] = std::max(candidate[cell_index], clamped_top);
+        }
+    }
+
+    for (std::size_t index = 0; index < grid.top_z.size(); ++index) {
+        if (candidate[index] <= grid.top_z[index] + 0.05)
+            continue;
+        grid.top_z[index] = candidate[index];
+        ++merged_cells;
+    }
+
+    return merged_cells;
+}
+
 void smooth_contact_heights(ContactGrid& grid, const double base_thickness_mm)
 {
     std::vector<double> smoothed = grid.top_z;
@@ -1916,6 +2321,35 @@ double layer_corner_value(
     return found ? value : fallback;
 }
 
+double corner_model_ceiling(const ContactGrid& grid, const int corner_ix, const int corner_iy, const double fallback)
+{
+    double ceiling = fallback;
+    bool found = false;
+
+    for (int dy = -1; dy <= 0; ++dy) {
+        for (int dx = -1; dx <= 0; ++dx) {
+            const int ix = corner_ix + dx;
+            const int iy = corner_iy + dy;
+            if (!grid.has_model_ceiling(ix, iy))
+                continue;
+
+            const double candidate = grid.model_ceiling(ix, iy);
+            // Corners are shared by neighboring cells. Use the highest nearby
+            // ceiling so a valid tall contact cell is not crushed by a lower
+            // side-wall/base neighbor that merely touches the same corner.
+            ceiling = found ? std::max(ceiling, candidate) : candidate;
+            found = true;
+        }
+    }
+
+    return found ? ceiling : fallback;
+}
+
+double clamp_corner_to_model_ceiling(const ContactGrid& grid, const int corner_ix, const int corner_iy, const double top_z)
+{
+    return std::min(top_z, corner_model_ceiling(grid, corner_ix, corner_iy, top_z));
+}
+
 void add_cell_top_terrain(
     SupportMesh& out,
     const double x0,
@@ -1992,10 +2426,10 @@ void mesh_height_field(const ContactGrid& grid, const std::vector<double>& botto
             const double z0 = bottom_z[grid.index(ix, iy)];
             const double z1 = top_z[grid.index(ix, iy)];
 
-            const double top00 = layer_corner_value(grid, bottom_z, top_z, top_z, ix, iy, shoulder_z, true, z1);
-            const double top10 = layer_corner_value(grid, bottom_z, top_z, top_z, ix + 1, iy, shoulder_z, true, z1);
-            const double top11 = layer_corner_value(grid, bottom_z, top_z, top_z, ix + 1, iy + 1, shoulder_z, true, z1);
-            const double top01 = layer_corner_value(grid, bottom_z, top_z, top_z, ix, iy + 1, shoulder_z, true, z1);
+            const double top00 = clamp_corner_to_model_ceiling(grid, ix, iy, layer_corner_value(grid, bottom_z, top_z, top_z, ix, iy, shoulder_z, true, z1));
+            const double top10 = clamp_corner_to_model_ceiling(grid, ix + 1, iy, layer_corner_value(grid, bottom_z, top_z, top_z, ix + 1, iy, shoulder_z, true, z1));
+            const double top11 = clamp_corner_to_model_ceiling(grid, ix + 1, iy + 1, layer_corner_value(grid, bottom_z, top_z, top_z, ix + 1, iy + 1, shoulder_z, true, z1));
+            const double top01 = clamp_corner_to_model_ceiling(grid, ix, iy + 1, layer_corner_value(grid, bottom_z, top_z, top_z, ix, iy + 1, shoulder_z, true, z1));
             const double bottom00 = layer_corner_value(grid, bottom_z, top_z, bottom_z, ix, iy, 0.0, false, z0);
             const double bottom10 = layer_corner_value(grid, bottom_z, top_z, bottom_z, ix + 1, iy, 0.0, false, z0);
             const double bottom11 = layer_corner_value(grid, bottom_z, top_z, bottom_z, ix + 1, iy + 1, 0.0, false, z0);
@@ -2406,6 +2840,32 @@ bool choose_avoidance_waypoint(
     }
 
     return false;
+}
+
+MeshStats mesh_stats_from_vertex_values(const std::vector<float>& values)
+{
+    MeshStats stats;
+    stats.vertex_values = values.size();
+    stats.vertex_count = stats.vertex_values / 3;
+    stats.triangle_count = stats.vertex_count / 3;
+    stats.vertices.reserve(stats.vertex_count);
+
+    for (std::size_t index = 0; index + 2 < values.size(); index += 3) {
+        const Vec3 vertex {
+            static_cast<double>(values[index]),
+            static_cast<double>(values[index + 1]),
+            static_cast<double>(values[index + 2])
+        };
+        stats.min_x = std::min(stats.min_x, vertex.x);
+        stats.max_x = std::max(stats.max_x, vertex.x);
+        stats.min_y = std::min(stats.min_y, vertex.y);
+        stats.max_y = std::max(stats.max_y, vertex.y);
+        stats.min_z = std::min(stats.min_z, vertex.z);
+        stats.max_z = std::max(stats.max_z, vertex.z);
+        stats.vertices.push_back(vertex);
+    }
+
+    return stats;
 }
 
 TreeRouteResult add_printable_organic_branch(
@@ -2905,9 +3365,20 @@ SupportGenerationStats generate_orca_contact_proxy(
     if (!settings.enable_support || mesh_stats.vertices.size() < 3)
         return stats;
 
+    using Clock = std::chrono::steady_clock;
+    auto phase_start = Clock::now();
+    const auto mark_ms = [&phase_start]() {
+        const auto now = Clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(now - phase_start).count();
+        phase_start = now;
+        return ms;
+    };
+
     const double support_cutoff_z = -std::sin(settings.threshold_angle_deg * kPi / 180.0);
     ContactGrid grid = make_contact_grid(mesh_stats, settings);
+    stats.timing_grid_ms = mark_ms();
     populate_model_collision_ceiling(grid, mesh_stats, settings);
+    stats.timing_model_ceiling_ms = mark_ms();
 
     for (std::size_t vertex_index = 0; vertex_index + 2 < mesh_stats.vertices.size(); vertex_index += 3) {
         const Vec3 a = mesh_stats.vertices[vertex_index];
@@ -2924,15 +3395,19 @@ SupportGenerationStats generate_orca_contact_proxy(
 
         ++stats.overhang_facets;
     }
+    stats.timing_overhang_ms = mark_ms();
 
     stats.envelope_cells = mark_lower_envelope_contacts(grid, mesh_stats, settings, coverage);
+    stats.timing_lower_envelope_ms = mark_ms();
     stats.pruned_sparse_cells = prune_sparse_auto_contacts(grid);
     stats.pruned_small_island_cells = prune_small_contact_islands(grid, settings);
+    stats.timing_prune_ms = mark_ms();
 
     for (const Vec3& point : manual_points) {
         if (mark_manual_support(grid, point, settings) > 0)
             ++stats.manual_points;
     }
+    stats.timing_manual_ms = mark_ms();
 
     stats.closed_gap_cells = close_contact_gaps(grid);
     clamp_grid_to_model_ceiling(grid);
@@ -2940,8 +3415,10 @@ SupportGenerationStats generate_orca_contact_proxy(
     stats.foam_gap_removed_cells = apply_xy_edge_clearance(grid, settings.effective_foam_gap_xy_mm());
     clamp_grid_to_model_ceiling(grid);
     stats.contact_cells = count_contact_cells(grid);
+    stats.timing_gap_and_clearance_ms = mark_ms();
     qa = evaluate_support_qa(grid, settings);
     update_coverage_from_final_grid(coverage, grid, qa);
+    stats.timing_qa_ms += mark_ms();
     if (stats.contact_cells == 0)
         return stats;
 
@@ -2952,14 +3429,20 @@ SupportGenerationStats generate_orca_contact_proxy(
         if (settings.join_uprights_bottom_enabled)
             stats.bottom_join_cells = join_bottom_uprights(grid, settings.base_thickness_mm);
     }
+    stats.column_components_before = count_column_components(grid, settings);
+    stats.column_merge_cells = merge_nearby_columns(grid, settings);
+    stats.column_components_after = count_column_components(grid, settings);
+    stats.timing_base_ms = mark_ms();
 
     restore_lower_envelope_contact_heights(grid, interface_eligible);
     clamp_grid_to_model_ceiling(grid);
     qa = evaluate_support_qa(grid, settings);
     update_coverage_from_final_grid(coverage, grid, qa);
+    stats.timing_qa_ms += mark_ms();
     if (settings.interface_top_layers > 0)
         stats.interface_cells = count_masked_cells(interface_eligible);
     stats.tree_branches = mesh_contact_grid(grid, settings, interface_eligible, support_out, interface_out, &stats, &coverage, tree_layer_data);
+    stats.timing_mesh_ms = mark_ms();
 
     return stats;
 }
@@ -2996,6 +3479,36 @@ void append_support_mesh_json(std::ostringstream& out, const char* key, const Su
         out << mesh.triangles[index][0] << "," << mesh.triangles[index][1] << "," << mesh.triangles[index][2];
     }
     out << "]}";
+}
+
+void pack_support_mesh(const SupportMesh& mesh, PackedSupportMesh& packed)
+{
+    packed.vertices.clear();
+    packed.vertices.reserve(mesh.vertices.size() * 3);
+    for (const Vec3& vertex : mesh.vertices) {
+        packed.vertices.push_back(static_cast<float>(vertex.x));
+        packed.vertices.push_back(static_cast<float>(vertex.y));
+        packed.vertices.push_back(static_cast<float>(vertex.z));
+    }
+
+    packed.triangles.clear();
+    packed.triangles.reserve(mesh.triangles.size() * 3);
+    for (const auto& triangle : mesh.triangles) {
+        packed.triangles.push_back(static_cast<std::uint32_t>(std::max(0, triangle[0])));
+        packed.triangles.push_back(static_cast<std::uint32_t>(std::max(0, triangle[1])));
+        packed.triangles.push_back(static_cast<std::uint32_t>(std::max(0, triangle[2])));
+    }
+}
+
+void append_support_mesh_metadata_json(std::ostringstream& out, const char* key, const PackedSupportMesh& mesh, const double cell_size_mm)
+{
+    out << "\"" << key << R"json(":{"coordinate_space":"world_mm","triangle_encoding":"indexed_triangles","binary_encoding":"wasm_typed_arrays","cell_size_mm":)json";
+    append_number(out, cell_size_mm);
+    out << R"json(,"vertex_count":)json"
+        << (mesh.vertices.size() / 3)
+        << R"json(,"triangle_count":)json"
+        << (mesh.triangles.size() / 3)
+        << R"json(,"vertices":null,"triangles":null})json";
 }
 
 void append_coverage_json(std::ostringstream& out, const CoverageSamples& coverage)
@@ -3147,24 +3660,48 @@ std::string support_core_plan_json()
     return Cradlemaker::OrcaSupportBridge::real_orca_support_plan_json();
 }
 
-std::string prepare_support_job_json(const std::string& job_json)
+std::string prepare_support_job_json_impl(const std::string& job_json, const bool binary_meshes, const bool buffered_input)
 {
+    using Clock = std::chrono::steady_clock;
+    auto phase_start = Clock::now();
+    const auto mark_ms = [&phase_start]() {
+        const auto now = Clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(now - phase_start).count();
+        phase_start = now;
+        return ms;
+    };
+
     MeshStats mesh_stats;
-    const bool parsed_vertices = parse_numeric_array_after_key(job_json, "vertices", mesh_stats);
+    const bool parsed_vertices = buffered_input
+        ? ((mesh_stats = mesh_stats_from_vertex_values(g_input_vertices)).vertex_values > 0)
+        : parse_numeric_array_after_key(job_json, "vertices", mesh_stats);
     const std::size_t declared_vertex_count = read_unsigned_field(job_json, "vertex_count");
     const std::size_t declared_triangle_count = read_unsigned_field(job_json, "triangle_count");
     const bool nonindexed_triplets = contains_json_string(job_json, "nonindexed_triplets");
     const bool mesh_ready = parsed_vertices && mesh_stats.vertex_values > 0 && mesh_stats.vertex_values % 9 == 0 && nonindexed_triplets;
+    const double input_parse_ms = mark_ms();
     const SupportSettings settings = read_support_settings(job_json);
     const std::vector<Vec3> manual_points = read_manual_support_points(job_json);
+    const double settings_parse_ms = mark_ms();
     SupportMesh support_mesh;
     SupportMesh interface_mesh;
     CoverageSamples coverage;
     QaStats qa;
     OrganicTreeLayerData tree_layer_data;
-    const SupportGenerationStats support_stats = mesh_ready ? generate_orca_contact_proxy(mesh_stats, settings, manual_points, coverage, qa, support_mesh, interface_mesh, &tree_layer_data) : SupportGenerationStats {};
+    SupportGenerationStats support_stats = mesh_ready ? generate_orca_contact_proxy(mesh_stats, settings, manual_points, coverage, qa, support_mesh, interface_mesh, &tree_layer_data) : SupportGenerationStats {};
+    support_stats.timing_input_parse_ms = input_parse_ms;
+    support_stats.timing_settings_parse_ms = settings_parse_ms;
+    support_stats.timing_generation_total_ms = mark_ms();
     const bool tree_layer_ready = settings.tree_mode && tree_layer_data.disk_count() > 0;
     const bool support_ready = mesh_ready && support_stats.contact_cells > 0 && (!support_mesh.triangles.empty() || !interface_mesh.triangles.empty() || tree_layer_ready);
+    if (binary_meshes) {
+        pack_support_mesh(support_mesh, g_last_binary_result.support);
+        pack_support_mesh(interface_mesh, g_last_binary_result.interface_mesh);
+        support_stats.timing_binary_pack_ms = mark_ms();
+    } else {
+        support_stats.timing_binary_pack_ms = 0.0;
+        phase_start = Clock::now();
+    }
 
     std::ostringstream out;
     out.precision(6);
@@ -3228,6 +3765,8 @@ std::string prepare_support_job_json(const std::string& job_json)
         << (settings.base_enabled ? "true" : "false")
         << R"json(,"join_uprights_bottom_enabled":)json"
         << (settings.join_uprights_bottom_enabled ? "true" : "false")
+        << R"json(,"merge_nearby_columns_enabled":)json"
+        << (settings.merge_nearby_columns_enabled ? "true" : "false")
         << R"json(,"contact_cells":)json"
         << support_stats.contact_cells
         << R"json(,"envelope_cells":)json"
@@ -3242,6 +3781,12 @@ std::string prepare_support_job_json(const std::string& job_json)
         << support_stats.base_cells
         << R"json(,"bottom_join_cells":)json"
         << support_stats.bottom_join_cells
+        << R"json(,"column_merge_cells":)json"
+        << support_stats.column_merge_cells
+        << R"json(,"column_components_before":)json"
+        << support_stats.column_components_before
+        << R"json(,"column_components_after":)json"
+        << support_stats.column_components_after
         << R"json(,"interface_cells":)json"
         << support_stats.interface_cells
         << R"json(,"edge_clearance_removed_cells":)json"
@@ -3270,18 +3815,137 @@ std::string prepare_support_job_json(const std::string& job_json)
         << support_stats.tree_slope_reroutes
         << R"json(,"tree_model_reroutes":)json"
         << support_stats.tree_model_reroutes
+        << R"json(,"timings_ms":{"grid":)json";
+    append_number(out, support_stats.timing_grid_ms);
+    out << R"json(,"model_ceiling":)json";
+    append_number(out, support_stats.timing_model_ceiling_ms);
+    out << R"json(,"overhang_scan":)json";
+    append_number(out, support_stats.timing_overhang_ms);
+    out << R"json(,"lower_envelope":)json";
+    append_number(out, support_stats.timing_lower_envelope_ms);
+    out << R"json(,"prune":)json";
+    append_number(out, support_stats.timing_prune_ms);
+    out << R"json(,"manual":)json";
+    append_number(out, support_stats.timing_manual_ms);
+    out << R"json(,"gap_clearance":)json";
+    append_number(out, support_stats.timing_gap_and_clearance_ms);
+    out << R"json(,"native_qa":)json";
+    append_number(out, support_stats.timing_qa_ms);
+    out << R"json(,"base_join":)json";
+    append_number(out, support_stats.timing_base_ms);
+    out << R"json(,"mesh":)json";
+    append_number(out, support_stats.timing_mesh_ms);
+    out << R"json(,"input_parse":)json";
+    append_number(out, support_stats.timing_input_parse_ms);
+    out << R"json(,"settings_parse":)json";
+    append_number(out, support_stats.timing_settings_parse_ms);
+    out << R"json(,"generation_total":)json";
+    append_number(out, support_stats.timing_generation_total_ms);
+    out << R"json(,"binary_pack":)json";
+    append_number(out, support_stats.timing_binary_pack_ms);
+    out << R"json(})json"
         << R"json(},)json";
-    append_support_mesh_json(out, "support_mesh", support_mesh, settings.contact_cell_size_mm);
+    phase_start = Clock::now();
+    if (binary_meshes)
+        append_support_mesh_metadata_json(out, "support_mesh", g_last_binary_result.support, settings.contact_cell_size_mm);
+    else
+        append_support_mesh_json(out, "support_mesh", support_mesh, settings.contact_cell_size_mm);
     out << ",";
-    append_support_mesh_json(out, "interface_mesh", interface_mesh, settings.contact_cell_size_mm);
+    if (binary_meshes)
+        append_support_mesh_metadata_json(out, "interface_mesh", g_last_binary_result.interface_mesh, settings.contact_cell_size_mm);
+    else
+        append_support_mesh_json(out, "interface_mesh", interface_mesh, settings.contact_cell_size_mm);
+    const double mesh_json_ms = mark_ms();
     out << ",";
     append_tree_layer_disks_json(out, tree_layer_data);
+    const double tree_json_ms = mark_ms();
     out << ",";
     append_coverage_json(out, coverage);
+    const double coverage_json_ms = mark_ms();
     out << ",";
     append_qa_json(out, qa);
+    const double qa_json_ms = mark_ms();
+    out << R"json(,"top_level_timings_ms":{"mesh_json":)json";
+    append_number(out, mesh_json_ms);
+    out << R"json(,"tree_json":)json";
+    append_number(out, tree_json_ms);
+    out << R"json(,"coverage_json":)json";
+    append_number(out, coverage_json_ms);
+    out << R"json(,"qa_json":)json";
+    append_number(out, qa_json_ms);
+    out << R"json(})json";
     out << "}";
     return out.str();
+}
+
+std::string prepare_support_job_json(const std::string& job_json)
+{
+    return prepare_support_job_json_impl(job_json, false, false);
+}
+
+std::string prepare_support_job_binary_json(const std::string& job_json)
+{
+    return prepare_support_job_json_impl(job_json, true, false);
+}
+
+std::string prepare_support_job_buffered_input_binary_json(const std::string& job_json)
+{
+    return prepare_support_job_json_impl(job_json, true, true);
+}
+
+void allocate_input_vertices(const std::size_t value_count)
+{
+    g_input_vertices.assign(value_count, 0.0f);
+}
+
+std::uintptr_t input_vertices_ptr()
+{
+    return reinterpret_cast<std::uintptr_t>(g_input_vertices.data());
+}
+
+std::size_t input_vertices_length()
+{
+    return g_input_vertices.size();
+}
+
+std::uintptr_t last_support_vertices_ptr()
+{
+    return reinterpret_cast<std::uintptr_t>(g_last_binary_result.support.vertices.data());
+}
+
+std::size_t last_support_vertices_length()
+{
+    return g_last_binary_result.support.vertices.size();
+}
+
+std::uintptr_t last_support_triangles_ptr()
+{
+    return reinterpret_cast<std::uintptr_t>(g_last_binary_result.support.triangles.data());
+}
+
+std::size_t last_support_triangles_length()
+{
+    return g_last_binary_result.support.triangles.size();
+}
+
+std::uintptr_t last_interface_vertices_ptr()
+{
+    return reinterpret_cast<std::uintptr_t>(g_last_binary_result.interface_mesh.vertices.data());
+}
+
+std::size_t last_interface_vertices_length()
+{
+    return g_last_binary_result.interface_mesh.vertices.size();
+}
+
+std::uintptr_t last_interface_triangles_ptr()
+{
+    return reinterpret_cast<std::uintptr_t>(g_last_binary_result.interface_mesh.triangles.data());
+}
+
+std::size_t last_interface_triangles_length()
+{
+    return g_last_binary_result.interface_mesh.triangles.size();
 }
 
 } // namespace Cradlemaker::SupportCore

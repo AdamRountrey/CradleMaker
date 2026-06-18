@@ -2,7 +2,7 @@
 
 CradleMaker is a standalone web app for making printable support cradles for museum objects and other physical artifacts. It imports STL models, generates a solid cradle/support mesh, checks the result with QA summaries, and exports printable STL/PLY files without requiring a full slicer UI.
 
-The app is designed around museum handling needs: predictable support surfaces, object clearance checks, optional soft-interface or foam-gap workflows, and split-for-printing tools for cradles larger than a printer bed.
+The app is designed around museum handling needs: predictable support surfaces, object clearance checks, optional soft-interface or foam-gap workflows, split-for-printing tools for cradles larger than a printer bed, and CNC foam relief previews for subtractive Ethafoam cradles.
 
 ## Try It
 
@@ -34,7 +34,14 @@ http://127.0.0.1:5177/cradlemaker-web/
 - Optional foam gap clearance for adding padding after printing.
 - Split preview for large cradles, with per-chunk STL export and manifest export.
 - Z-slide dovetail connector work for split chunks.
+- CNC foam workflow for ShopBot/VCarve-style top-side relief carving from foam blocks.
 - GitHub Pages deployment from the static `cradlemaker-web/` folder.
+
+## License
+
+CradleMaker is source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE). Noncommercial use is permitted; commercial use is not permitted without separate permission from the copyright holder.
+
+Because the license restricts commercial use, this project should not be described as OSI-approved open source. Third-party components retain their own license terms; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Project Layout
 
@@ -52,5 +59,7 @@ cradlemaker-web/
 ## Notes
 
 Organic/tree support experiments are kept in the codebase for future work, but the current UI intentionally exposes only the stable `Normal auto` / `Default (Grid/Organic)` cradle workflow.
+
+The CNC foam workflow exports a 3D STL relief/block for VCarve import. It auto-fits model lift by default when the carve is too deep, with a manual lift override when needed, and limits the cavity surface with a flat-end or ball-nose cutter envelope so the preview does not show details the chosen tool cannot reach. It does not generate ShopBot toolpaths.
 
 The repository does not ship OrcaSlicer source. Any Orca-related probe scripts fetch reference sources into ignored local folders for development only.

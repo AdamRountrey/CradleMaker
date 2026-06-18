@@ -15,6 +15,12 @@ const types = new Map([
   [".wasm", "application/wasm"],
 ]);
 
+const commonHeaders = {
+  "Cache-Control": "no-store",
+  "Cross-Origin-Opener-Policy": "same-origin",
+  "Cross-Origin-Embedder-Policy": "require-corp",
+};
+
 const server = createServer((request, response) => {
   const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "127.0.0.1"}`);
 
@@ -31,7 +37,7 @@ const server = createServer((request, response) => {
 
       response.writeHead(200, {
         "Content-Type": "application/json; charset=utf-8",
-        "Cache-Control": "no-store",
+        ...commonHeaders,
       });
       response.end(JSON.stringify({ samples }));
     } catch {
@@ -60,11 +66,21 @@ const server = createServer((request, response) => {
   }
 
   try {
+    const stream = createReadStream(path);
+    stream.on("error", (error) => {
+      if (!response.headersSent) {
+        response.writeHead(500, {
+          "Content-Type": "text/plain; charset=utf-8",
+          ...commonHeaders,
+        });
+      }
+      response.end(`Server error: ${error.code ?? "read failed"}`);
+    });
     response.writeHead(200, {
       "Content-Type": types.get(extname(path).toLowerCase()) ?? "application/octet-stream",
-      "Cache-Control": "no-store",
+      ...commonHeaders,
     });
-    createReadStream(path).pipe(response);
+    stream.pipe(response);
   } catch {
     response.writeHead(500);
     response.end("Server error");
@@ -72,5 +88,5 @@ const server = createServer((request, response) => {
 });
 
 server.listen(port, "127.0.0.1", () => {
-  console.log(`Cradlemaker web prototype: http://127.0.0.1:${port}/cradlemaker-web/`);
+  console.log(`CradleMaker web prototype: http://127.0.0.1:${port}/cradlemaker-web/`);
 });
