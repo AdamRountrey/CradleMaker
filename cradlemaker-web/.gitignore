@@ -1,2 +1,4 @@
 .work/
 *.log
+src/wasm/cradlemaker-core-pthread.js
+src/wasm/cradlemaker-core-pthread.wasm

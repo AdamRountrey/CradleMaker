@@ -45,6 +45,36 @@ string(REPLACE
     contents "${contents}"
 )
 string(REPLACE
+    "Module[\"monitorRunDependencies\"]?.(runDependencies);"
+    "if(Module[\"monitorRunDependencies\"]){Module[\"monitorRunDependencies\"](runDependencies)}"
+    contents "${contents}"
+)
+string(REPLACE
+    "Module[\"monitorRunDependencies\"]?.(runDependencies)"
+    "if(Module[\"monitorRunDependencies\"]){Module[\"monitorRunDependencies\"](runDependencies)}"
+    contents "${contents}"
+)
+string(REPLACE
+    "Module['monitorRunDependencies']?.(runDependencies);"
+    "if(Module['monitorRunDependencies']){Module['monitorRunDependencies'](runDependencies)}"
+    contents "${contents}"
+)
+string(REPLACE
+    "Module['monitorRunDependencies']?.(runDependencies)"
+    "if(Module['monitorRunDependencies']){Module['monitorRunDependencies'](runDependencies)}"
+    contents "${contents}"
+)
+string(REPLACE
+    "Module[\"onExit\"]?.(code);"
+    "if(Module[\"onExit\"]){Module[\"onExit\"](code)}"
+    contents "${contents}"
+)
+string(REPLACE
+    "Module['onExit']?.(code);"
+    "if(Module['onExit']){Module['onExit'](code)}"
+    contents "${contents}"
+)
+string(REPLACE
     "wasmBinaryFile??=findWasmBinary();"
     "if(wasmBinaryFile==null){wasmBinaryFile=findWasmBinary()}"
     contents "${contents}"
@@ -100,8 +130,23 @@ string(REPLACE
     contents "${contents}"
 )
 string(REPLACE
+    "globalThis.navigator?.language ?? \"C\""
+    "(globalThis.navigator&&globalThis.navigator.language||\"C\")"
+    contents "${contents}"
+)
+string(REPLACE
     "globalThis.navigator?.language ?? 'C'"
     "(globalThis.navigator&&globalThis.navigator.language||'C')"
+    contents "${contents}"
+)
+string(REPLACE
+    "globalThis.navigator?.userAgent"
+    "(globalThis.navigator&&globalThis.navigator.userAgent)"
+    contents "${contents}"
+)
+string(REPLACE
+    "targetWorker?.postMessage(d);"
+    "if(targetWorker){targetWorker.postMessage(d)}"
     contents "${contents}"
 )
 string(REPLACE

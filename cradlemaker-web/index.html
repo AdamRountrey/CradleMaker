@@ -3,8 +3,8 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Cradlemaker</title>
-    <link rel="stylesheet" href="./src/styles.css" />
+    <title>CradleMaker</title>
+    <link rel="stylesheet" href="./src/styles.css?v=brand-logo-1" />
     <script type="importmap">
       {
         "imports": {
@@ -14,6 +14,43 @@
       }
     </script>
     <script>
+      (() => {
+        const reloadKey = "cradlemaker:coi-service-worker-reload:v1";
+        const canRegister =
+          "serviceWorker" in navigator &&
+          window.isSecureContext &&
+          location.protocol !== "file:";
+
+        if (window.crossOriginIsolated) {
+          sessionStorage.removeItem(reloadKey);
+          return;
+        }
+
+        if (!canRegister) return;
+
+        const reloadOnce = () => {
+          if (sessionStorage.getItem(reloadKey) === "1") return;
+          sessionStorage.setItem(reloadKey, "1");
+          location.reload();
+        };
+
+        navigator.serviceWorker
+          .register("./coi-serviceworker.js", { scope: "./", updateViaCache: "none" })
+          .then(async (registration) => {
+            await navigator.serviceWorker.ready;
+            if (navigator.serviceWorker.controller) {
+              reloadOnce();
+              return;
+            }
+
+            navigator.serviceWorker.addEventListener("controllerchange", reloadOnce, { once: true });
+            if (registration.active) window.setTimeout(reloadOnce, 250);
+          })
+          .catch((error) => {
+            console.warn("Cross-origin isolation service worker registration failed.", error);
+          });
+      })();
+
       window.addEventListener("error", (event) => {
         const target = document.querySelector("#model-status");
         const job = document.querySelector("#job-status");
@@ -42,9 +79,21 @@
 
       <aside class="tool-panel">
         <header class="panel-header">
-          <h1>Cradlemaker</h1>
-          <p>Import an object, place supports, export the cradle.</p>
+          <img class="brand-logo" src="./assets/cradlemaker-logo.png" alt="CradleMaker" />
+          <h1 class="sr-only">CradleMaker</h1>
+          <p>Design, support, preserve museum cradles.</p>
         </header>
+
+        <details class="control-block" open>
+          <summary>Workflow</summary>
+          <label>
+            Mode
+            <select id="workflow-mode">
+              <option value="print" selected>Print cradle</option>
+              <option value="cnc">CNC foam</option>
+            </select>
+          </label>
+        </details>
 
         <details class="control-block" open>
           <summary>Model</summary>
@@ -72,7 +121,7 @@
             <select id="model-display-mode">
               <option value="solid" selected>Solid inspection</option>
               <option value="ghost">Ghosted context</option>
-              <option value="hidden">Hidden cradle view</option>
+              <option value="hidden">Hidden model</option>
             </select>
           </label>
           <label>
@@ -90,13 +139,13 @@
             </select>
           </label>
           <button id="apply-rotation-preset" type="button">Apply rotation</button>
-          <label>
+          <label class="print-workflow">
             Elevation <output id="elevation-value">18 mm</output>
             <input id="elevation" type="range" min="0" max="120" step="1" value="18" />
           </label>
         </details>
 
-        <details class="control-block" open>
+        <details class="control-block print-workflow" open>
           <summary>Supports</summary>
           <label>
             Type
@@ -209,7 +258,7 @@
           </div>
         </details>
 
-        <details class="control-block">
+        <details class="control-block print-workflow">
           <summary>Cradle</summary>
           <label class="inline-toggle">
             <input id="base-enabled" type="checkbox" checked />
@@ -229,7 +278,7 @@
           </label>
         </details>
 
-        <details class="control-block">
+        <details class="control-block print-workflow">
           <summary>Split for printing</summary>
           <label>
             Plate preset
@@ -279,19 +328,83 @@
           </div>
         </details>
 
+        <details class="control-block cnc-workflow" hidden open>
+          <summary>CNC foam</summary>
+          <div class="compact-grid">
+            <label class="param-cell">
+              <span class="param-label">Block width</span>
+              <input id="cnc-block-width" type="number" min="25" max="2500" step="1" value="300" />
+            </label>
+            <label class="param-cell">
+              <span class="param-label">Block depth</span>
+              <input id="cnc-block-depth" type="number" min="25" max="2500" step="1" value="300" />
+            </label>
+            <label class="param-cell">
+              <span class="param-label">Block height</span>
+              <input id="cnc-block-height" type="number" min="10" max="500" step="1" value="76.2" />
+            </label>
+            <label class="param-cell">
+              <span class="param-label">Surface resolution (mm)</span>
+              <input id="cnc-resolution" type="number" min="0.2" max="4" step="0.05" value="0.5" />
+              <output id="cnc-resolution-value" class="param-note">0.5 mm grid</output>
+            </label>
+            <label class="param-cell">
+              <span class="param-label">Tool stickout (in)</span>
+              <input id="cnc-tool-stickout-in" type="number" min="0.1" max="6" step="0.05" value="1" />
+              <output id="cnc-stickout-value" class="param-note">25.4 mm</output>
+            </label>
+            <label class="param-cell">
+              <span class="param-label">Bit diameter (in)</span>
+              <input id="cnc-bit-diameter-in" type="number" min="0.02" max="2" step="0.01" value="0.25" />
+              <output id="cnc-bit-diameter-value" class="param-note">6.35 mm</output>
+            </label>
+            <label class="param-cell">
+              <span class="param-label">Tool end</span>
+              <select id="cnc-tool-end">
+                <option value="flat" selected>Flat end mill</option>
+                <option value="ball">Ball nose</option>
+              </select>
+            </label>
+            <label class="param-cell">
+              <span class="param-label">Cavity clearance</span>
+              <input id="cnc-clearance" type="number" min="0" max="20" step="0.1" value="1" />
+            </label>
+          </div>
+          <label class="inline-toggle">
+            <input id="cnc-auto-lift" type="checkbox" checked />
+            Auto-fit model height
+          </label>
+          <label class="param-cell">
+            <span class="param-label">Model offset</span>
+            <input id="cnc-model-lift" type="range" min="0" max="120" step="0.5" value="0" />
+            <output id="cnc-model-lift-value" class="param-note">0 mm</output>
+          </label>
+          <div class="button-grid">
+            <button id="cnc-generate" type="button">Preview CNC foam</button>
+            <button id="cnc-auto-fit" type="button">Auto-fit height</button>
+            <button id="cnc-clear" type="button">Clear CNC preview</button>
+          </div>
+          <div id="cnc-status" class="job-status" role="status">Load a model to preview a foam relief.</div>
+          <p class="hint">Exports a top-side 3-axis STL relief for VCarve. No toolpaths are generated.</p>
+        </details>
+
         <details class="control-block">
           <summary>Export</summary>
-          <div class="export-grid">
+          <div class="export-grid print-workflow">
             <button id="export-stl" class="primary-action" type="button">Export cradle STL</button>
             <button id="export-ply" type="button">Export cradle PLY</button>
             <button id="export-interface-stl" type="button">Export interface STL</button>
             <button id="export-interface-ply" type="button">Export interface PLY</button>
           </div>
-          <p class="hint">Use Manual marks in Supports when you need to place manual support intent.</p>
+          <div class="export-grid cnc-workflow" hidden>
+            <button id="export-cnc-stl" class="primary-action" type="button">Export foam relief STL</button>
+          </div>
+          <p class="hint print-workflow">Use Manual marks in Supports when you need to place manual support intent.</p>
+          <p class="hint cnc-workflow" hidden>Import the exported STL into VCarve as a 3D relief/component.</p>
         </details>
       </aside>
     </main>
 
-    <script type="module" src="./src/main.js?v=orca-wasm-131"></script>
+    <script type="module" src="./src/main.js?v=column-bridge-1"></script>
   </body>
 </html>

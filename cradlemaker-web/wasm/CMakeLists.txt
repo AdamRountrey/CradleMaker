@@ -6,6 +6,7 @@ endif()
 
 set(ORCA_LIBSLIC3R_DIR "${CRADLEMAKER_DEFAULT_ORCA_LIBSLIC3R_DIR}" CACHE PATH
     "Path to upstream OrcaSlicer src/libslic3r for the optional support probe")
+option(CRADLEMAKER_ENABLE_PTHREADS "Build Cradlemaker WASM with pthread support" OFF)
 
 include(OrcaSupportSources.cmake)
 
@@ -93,11 +94,19 @@ target_include_directories(cradlemaker_support_core
         "${CMAKE_CURRENT_SOURCE_DIR}"
 )
 
+if(CRADLEMAKER_ENABLE_PTHREADS)
+    target_compile_options(cradlemaker_support_core PRIVATE -pthread)
+endif()
+
 add_executable(cradlemaker_wasm CradlemakerCore.cpp)
 
 target_compile_features(cradlemaker_wasm PRIVATE cxx_std_17)
 
 target_link_libraries(cradlemaker_wasm PRIVATE cradlemaker_support_core)
+
+if(CRADLEMAKER_ENABLE_PTHREADS)
+    target_compile_options(cradlemaker_wasm PRIVATE -pthread)
+endif()
 
 target_link_options(cradlemaker_wasm PRIVATE
     --bind
@@ -107,6 +116,14 @@ target_link_options(cradlemaker_wasm PRIVATE
     -sENVIRONMENT=web,worker
     -sALLOW_MEMORY_GROWTH=1
 )
+
+if(CRADLEMAKER_ENABLE_PTHREADS)
+    target_link_options(cradlemaker_wasm PRIVATE
+        -pthread
+        -sUSE_PTHREADS=1
+        -sPTHREAD_POOL_SIZE=8
+    )
+endif()
 
 set_target_properties(cradlemaker_wasm PROPERTIES
     OUTPUT_NAME "cradlemaker-core"

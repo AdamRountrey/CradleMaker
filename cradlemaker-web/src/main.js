@@ -3,15 +3,11 @@ import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { STLLoader } from "three/addons/loaders/STLLoader.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
 import createManifoldModule from "../vendor/manifold/manifold.js";
-import { getSupportOptionSchema, prepareSupportJob } from "./wasmCore.js?v=organic-voxel-1";
+import { getSupportOptionSchema, prepareSupportJob, prewarmSupportCore } from "./wasmCore.js?v=column-bridge-1";
 import { defaultOrcaSupportConfig } from "./orcaSupportOptions.js?v=organic-voxel-1";
 
 const DEFAULT_SAMPLE_MODELS = [
   "TruckAntennaMount1.stl",
-  "LaserPlugV1.stl",
-  "LaserMastStepPlugV1.stl",
-  "FullHexParametric HTD 5M - Universal v3 v3_31T.stl",
-  "HTD 5M Pulley_24T_AndyMarkDims.stl",
 ];
 const BED_SIZE = 220;
 const CONNECTOR_MIN_ROOF_ANGLE_DEG = 45;
@@ -25,7 +21,15 @@ const DEFAULT_SUPPORT_CONFIG = defaultOrcaSupportConfig();
 const MESH_COORDINATE_PRECISION = 100000;
 const STABLE_SUPPORT_TYPE = "normal(auto)";
 const STABLE_SUPPORT_STYLE = "default";
+const INCH_TO_MM = 25.4;
+const CNC_TOOL_SAFETY_MARGIN_MM = 1.5;
+const CNC_MIN_FLOOR_THICKNESS_MM = 6;
+const CNC_MAX_GRID_CELLS = 900000;
+const ENABLE_MODEL_MANIFOLD_PREWARM = false;
 let manifoldCorePromise = null;
+let qaWorker = null;
+let nextQaWorkerRequestId = 1;
+const qaWorkerRequests = new Map();
 
 const viewport = document.querySelector("#viewport");
 const modelStatus = document.querySelector("#model-status");
@@ -41,6 +45,7 @@ function setStartupStatus(message) {
 setStartupStatus("Viewer module loaded; creating scene...");
 
 const controlsEl = {
+  workflowMode: document.querySelector("#workflow-mode"),
   file: document.querySelector("#model-file"),
   sampleModel: document.querySelector("#sample-model"),
   loadSample: document.querySelector("#load-sample"),
@@ -101,6 +106,21 @@ const controlsEl = {
   jobProgressShell: document.querySelector("#job-progress-shell"),
   splitProgress: document.querySelector("#split-progress"),
   splitProgressShell: document.querySelector("#split-progress-shell"),
+  cncBlockWidth: document.querySelector("#cnc-block-width"),
+  cncBlockDepth: document.querySelector("#cnc-block-depth"),
+  cncBlockHeight: document.querySelector("#cnc-block-height"),
+  cncResolution: document.querySelector("#cnc-resolution"),
+  cncToolStickoutIn: document.querySelector("#cnc-tool-stickout-in"),
+  cncBitDiameterIn: document.querySelector("#cnc-bit-diameter-in"),
+  cncToolEnd: document.querySelector("#cnc-tool-end"),
+  cncClearance: document.querySelector("#cnc-clearance"),
+  cncAutoLift: document.querySelector("#cnc-auto-lift"),
+  cncModelLift: document.querySelector("#cnc-model-lift"),
+  cncGenerate: document.querySelector("#cnc-generate"),
+  cncAutoFit: document.querySelector("#cnc-auto-fit"),
+  cncClear: document.querySelector("#cnc-clear"),
+  cncStatus: document.querySelector("#cnc-status"),
+  exportCncStl: document.querySelector("#export-cnc-stl"),
 };
 
 const outputs = {
@@ -116,6 +136,10 @@ const outputs = {
   splitBuildMargin: document.querySelector("#split-build-margin-value"),
   splitConnectorClearance: document.querySelector("#split-connector-clearance-value"),
   splitConnectorSize: document.querySelector("#split-connector-size-value"),
+  cncStickout: document.querySelector("#cnc-stickout-value"),
+  cncResolution: document.querySelector("#cnc-resolution-value"),
+  cncBitDiameter: document.querySelector("#cnc-bit-diameter-value"),
+  cncModelLift: document.querySelector("#cnc-model-lift-value"),
 };
 
 const state = {
@@ -135,6 +159,15 @@ const state = {
   manualSupports: [],
   supportMarkerObjects: new Map(),
   nextManualId: 1,
+  workflowMode: "print",
+  cncMesh: null,
+  cncQa: null,
+  modelPayloadCache: null,
+  modelManifoldCache: null,
+  modelQaCache: null,
+  modelCenterOfMassCache: null,
+  modelManifoldPrewarmToken: 0,
+  modelManifoldPrewarmTimer: null,
 };
 
 const scene = new THREE.Scene();
@@ -175,16 +208,20 @@ transformControls.addEventListener("dragging-changed", (event) => {
 
 transformControls.addEventListener("objectChange", () => {
   clearGeneratedSupport();
-  applyElevation();
+  clearCncPreview();
+  invalidateModelPayloadCache();
+  applyModelTransform();
+  scheduleModelManifoldPrewarm();
   updateManualMarkers();
 });
 
 const modelGroup = new THREE.Group();
 const supportGroup = new THREE.Group();
+const cncGroup = new THREE.Group();
 const splitGroup = new THREE.Group();
 const coverageGroup = new THREE.Group();
 const markerGroup = new THREE.Group();
-scene.add(modelGroup, supportGroup, splitGroup, coverageGroup, markerGroup);
+scene.add(modelGroup, supportGroup, cncGroup, splitGroup, coverageGroup, markerGroup);
 
 const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
@@ -217,6 +254,30 @@ const materialInterface = new THREE.MeshStandardMaterial({
   opacity: 1,
   side: THREE.DoubleSide,
   flatShading: true,
+});
+
+const materialCncFoam = new THREE.MeshStandardMaterial({
+  color: 0xd5dfc6,
+  roughness: 0.92,
+  metalness: 0,
+  transparent: false,
+  opacity: 1,
+  side: THREE.DoubleSide,
+  flatShading: true,
+});
+const materialCncUnreachable = new THREE.MeshBasicMaterial({
+  color: 0xc9463a,
+  transparent: true,
+  opacity: 0.62,
+  side: THREE.DoubleSide,
+  depthWrite: false,
+});
+const materialCncIntersection = new THREE.MeshBasicMaterial({
+  color: 0xff4a2a,
+  transparent: true,
+  opacity: 0.36,
+  side: THREE.DoubleSide,
+  depthWrite: false,
 });
 
 const materialMarkerManual = new THREE.MeshStandardMaterial({ color: 0xf1c453, roughness: 0.58 });
@@ -279,8 +340,14 @@ resize();
 renderer.setAnimationLoop(render);
 modelStatus.textContent = "Viewer ready; load or import a model";
 setJobStatus("Support core will load when supports are generated.", "idle");
+schedulePrintCorePrewarm();
 
 function bindControls() {
+  controlsEl.workflowMode?.addEventListener("change", () => {
+    state.workflowMode = controlsEl.workflowMode.value === "cnc" ? "cnc" : "print";
+    syncWorkflowPanels();
+    updateButtons();
+  });
   controlsEl.file.addEventListener("change", async (event) => {
     const file = event.target.files?.[0];
     if (!file) return;
@@ -317,6 +384,32 @@ function bindControls() {
   });
   controlsEl.exportInterfacePly?.addEventListener("click", () => {
     exportInterfacePly();
+  });
+  controlsEl.cncGenerate?.addEventListener("click", () => {
+    generateCncFoamPreview().catch((error) => {
+      console.error(error);
+      setCncStatus(`CNC preview failed: ${error?.message || error}`, "error");
+      updateButtons();
+    });
+  });
+  controlsEl.cncAutoFit?.addEventListener("click", () => {
+    autoFitCncLift().catch((error) => {
+      console.error(error);
+      setCncStatus(`Auto-fit failed: ${error?.message || error}`, "error");
+      updateButtons();
+    });
+  });
+  controlsEl.cncClear?.addEventListener("click", () => clearCncPreview());
+  controlsEl.exportCncStl?.addEventListener("click", () => exportCncFoamStl());
+  controlsEl.cncAutoLift?.addEventListener("change", () => {
+    clearCncPreview();
+    syncCncLiftControls();
+    applyModelTransform();
+    updateButtons();
+  });
+  controlsEl.cncToolEnd?.addEventListener("change", () => {
+    clearCncPreview();
+    updateButtons();
   });
   controlsEl.previewSplit?.addEventListener("click", () => {
     previewSplitPlan().catch((error) => {
@@ -367,6 +460,14 @@ function bindControls() {
     controlsEl.splitBuildMargin,
     controlsEl.splitConnectorClearance,
     controlsEl.splitConnectorSize,
+    controlsEl.cncBlockWidth,
+    controlsEl.cncBlockDepth,
+    controlsEl.cncBlockHeight,
+    controlsEl.cncResolution,
+    controlsEl.cncToolStickoutIn,
+    controlsEl.cncBitDiameterIn,
+    controlsEl.cncClearance,
+    controlsEl.cncModelLift,
   ].filter(Boolean)) {
     input.addEventListener("input", () => {
       if (
@@ -378,6 +479,21 @@ function bindControls() {
         input === controlsEl.splitConnectorSize
       ) {
         clearSplitPreview();
+      } else if (
+        input === controlsEl.cncBlockWidth ||
+        input === controlsEl.cncBlockDepth ||
+        input === controlsEl.cncBlockHeight ||
+        input === controlsEl.cncResolution ||
+        input === controlsEl.cncToolStickoutIn ||
+        input === controlsEl.cncBitDiameterIn ||
+        input === controlsEl.cncClearance ||
+        input === controlsEl.cncModelLift
+      ) {
+        if (input === controlsEl.cncModelLift && controlsEl.cncAutoLift) {
+          controlsEl.cncAutoLift.checked = false;
+          syncCncLiftControls();
+        }
+        clearCncPreview();
       } else {
         clearGeneratedSupport();
       }
@@ -402,8 +518,50 @@ function bindControls() {
     });
   }
   syncOptionPanels();
+  syncWorkflowPanels();
   renderer.domElement.addEventListener("pointerdown", onPointerDown);
   window.addEventListener("resize", resize);
+}
+
+function schedulePrintCorePrewarm() {
+  const warm = () => {
+    prewarmSupportCore().catch((error) => {
+      console.warn("Print support prewarm failed.", error);
+    });
+  };
+  if (typeof window.requestIdleCallback === "function") {
+    window.requestIdleCallback(warm, { timeout: 3500 });
+  } else {
+    window.setTimeout(warm, 1200);
+  }
+}
+
+function syncWorkflowPanels() {
+  const mode = controlsEl.workflowMode?.value === "cnc" ? "cnc" : "print";
+  state.workflowMode = mode;
+  for (const element of document.querySelectorAll(".print-workflow")) {
+    element.hidden = mode !== "print";
+  }
+  for (const element of document.querySelectorAll(".cnc-workflow")) {
+    element.hidden = mode !== "cnc";
+  }
+  if (mode === "print") {
+    cncGroup.visible = false;
+    supportGroup.visible = true;
+    coverageGroup.visible = state.coverageVisible;
+  } else {
+    cncGroup.visible = true;
+    supportGroup.visible = false;
+    splitGroup.visible = false;
+    coverageGroup.visible = false;
+  }
+  applyModelTransform();
+  syncCncLiftControls();
+}
+
+function syncCncLiftControls() {
+  if (!controlsEl.cncModelLift || !controlsEl.cncAutoLift) return;
+  controlsEl.cncModelLift.disabled = controlsEl.cncAutoLift.checked;
 }
 
 function syncOptionPanels() {
@@ -507,6 +665,7 @@ function loadStlGeometry(geometry, label) {
   geometry.computeBoundingSphere();
 
   state.sourceGeometry = geometry.clone();
+  invalidateModelPayloadCache();
   state.modelMesh = new THREE.Mesh(geometry, materialModel);
   state.modelMesh.name = label;
   modelGroup.add(state.modelMesh);
@@ -526,12 +685,15 @@ function loadStlGeometry(geometry, label) {
   updateManualMarkers();
   updateOutputs();
   updateButtons();
+  scheduleModelManifoldPrewarm();
   modelStatus.textContent = `${label} loaded`;
 }
 
 function clearSceneModel() {
   modelGroup.clear();
   supportGroup.clear();
+  cncGroup.clear();
+  splitGroup.clear();
   coverageGroup.clear();
   markerGroup.clear();
   state.modelMesh = null;
@@ -540,7 +702,13 @@ function clearSceneModel() {
   state.sourceGeometry = null;
   state.supportMesh = null;
   state.interfaceMesh = null;
+  state.cncMesh = null;
+  state.cncQa = null;
+  invalidateModelPayloadCache();
   state.coverage = null;
+  state.splitChunks = [];
+  state.splitPlan = null;
+  state.splitPreviewVisible = false;
   state.coverageVisible = false;
   state.manualSupportMode = false;
   state.supportMarkerObjects.clear();
@@ -559,14 +727,41 @@ function centerGeometryXY(geometry) {
 
 function applyModelTransform() {
   if (!state.modelMesh) return;
-  applyElevation();
+  let changed = false;
+  if (state.workflowMode === "cnc") {
+    changed = applyCncModelPlacement();
+  } else {
+    changed = applyElevation();
+  }
+  if (changed) scheduleModelManifoldPrewarm();
 }
 
 function applyElevation() {
-  if (!state.modelMesh) return;
+  if (!state.modelMesh) return false;
   const box = new THREE.Box3().setFromObject(state.modelMesh);
-  state.modelMesh.position.z += Number(controlsEl.elevation.value) - box.min.z;
+  const deltaZ = Number(controlsEl.elevation.value) - box.min.z;
+  if (Math.abs(deltaZ) <= 1e-7) return false;
+  state.modelMesh.position.z += deltaZ;
   state.modelMesh.updateMatrixWorld(true);
+  invalidateModelPayloadCache();
+  return true;
+}
+
+function applyCncModelPlacement(settings = cncSettings()) {
+  if (!state.modelMesh) return false;
+  state.modelMesh.updateMatrixWorld(true);
+  const referenceZ = estimateCncReferenceZ(settings);
+  if (!Number.isFinite(referenceZ)) return false;
+  const placementOffsetMm = Number.isFinite(settings.modelPlacementOffsetMm)
+    ? settings.modelPlacementOffsetMm
+    : settings.modelLiftMm;
+  const targetReferenceZ = settings.height + placementOffsetMm;
+  const deltaZ = targetReferenceZ - referenceZ;
+  if (Math.abs(deltaZ) <= 1e-7) return false;
+  state.modelMesh.position.z += deltaZ;
+  state.modelMesh.updateMatrixWorld(true);
+  invalidateModelPayloadCache();
+  return true;
 }
 
 function frameObject() {
@@ -639,23 +834,40 @@ async function showWasmPending() {
   await nextFrame();
 
   try {
+    const phaseTimings = [];
+    let phaseStart = performance.now();
+    const markPhase = (label) => {
+      const now = performance.now();
+      phaseTimings.push({ label, ms: now - phaseStart });
+      phaseStart = now;
+    };
+    const resetPhaseTimer = () => {
+      phaseStart = performance.now();
+    };
     setJobProgress(12);
+    resetPhaseTimer();
     const schema = await getSupportOptionSchema();
+    markPhase("schema");
     setJobProgress(22);
     setJobStatus("Packaging model and support settings...", "working");
     await nextFrame();
+    resetPhaseTimer();
     const job = buildSupportJobPayload();
+    markPhase("package");
     const supportConfig = job.support_config;
     const cradleConfig = job.cradle_config;
     const manualCount = realizedManualSupports().length;
     setJobProgress(34);
     setJobStatus("Generating solid cradle in WASM...", "working");
     await nextFrame();
+    resetPhaseTimer();
     const jobResult = await prepareSupportJob(job);
+    markPhase("WASM");
     if (jobResult.tree_layer_disks?.layers?.length) {
       setJobProgress(58);
       setJobStatus("Unioning organic tree support layers...", "working");
       await nextFrame();
+      resetPhaseTimer();
       const core = await loadManifoldCore();
       const treeProgress = async (progress, message) => {
         setJobProgress(58 + progress * 0.16);
@@ -669,21 +881,60 @@ async function showWasmPending() {
         treeProgress
       );
       if (jobResult.support) jobResult.support.tree_layered_solid = true;
+      markPhase("tree union");
     }
-    setJobProgress(76);
-    setJobStatus("Trimming cradle away from object model...", "working");
+    setJobProgress(70);
+    setJobStatus("Checking cradle clearance against object model...", "working");
     await nextFrame();
-    const trimmedMeshes = await trimGeneratedMeshesAgainstModel(jobResult.support_mesh, jobResult.interface_mesh, supportConfig);
+    let modelMeshQa = null;
+    const hasInterfaceMesh = Boolean(jobResult.interface_mesh?.vertices?.length && jobResult.interface_mesh?.triangles?.length);
+    const canConsiderSkippingTrim =
+      !jobResult.qa?.intersects_model &&
+      !Number(jobResult.qa?.clearance_violation_cells ?? 0) &&
+      !hasInterfaceMesh &&
+      Boolean(jobResult.support_mesh?.vertices?.length && jobResult.support_mesh?.triangles?.length);
+    resetPhaseTimer();
+    if (canConsiderSkippingTrim) {
+      modelMeshQa = evaluateGeneratedModelIntersectionQa(jobResult.support_mesh, { phase: "pretrim" });
+      markPhase("pretrim QA");
+    }
+
+    const shouldRunExactTrim = !canConsiderSkippingTrim || Boolean(modelMeshQa?.needs_exact_trim);
+    setJobProgress(76);
+    setJobStatus(shouldRunExactTrim ? "Trimming cradle away from object model..." : "Using generator clearance; exact trim not needed...", "working");
+    await nextFrame();
+    resetPhaseTimer();
+    const trimmedMeshes = await trimGeneratedMeshesAgainstModel(
+      jobResult.support_mesh,
+      jobResult.interface_mesh,
+      supportConfig,
+      {
+        skipExactTrim: !shouldRunExactTrim,
+        skipReason: modelMeshQa?.intersects_model
+          ? "generator clearance was clean and sampled hits were shallow/rare enough to treat as near-surface QA"
+          : "generator clearance and sampled mesh QA found no material object intersection",
+      }
+    );
+    markPhase(shouldRunExactTrim ? "model trim" : "trim decision");
     setJobStatus("Rendering generated cradle...", "working");
     await nextFrame();
+    resetPhaseTimer();
     renderGeneratedMeshes(trimmedMeshes.support_mesh, trimmedMeshes.interface_mesh);
+    markPhase("render");
     setJobProgress(88);
     setJobStatus("Building coverage overlay and QA summary...", "working");
     await nextFrame();
+    resetPhaseTimer();
     renderCoverageOverlay(jobResult.coverage);
-    const meshQa = evaluateCradleMeshSupportQa(trimmedMeshes.support_mesh, jobResult.coverage);
-    const stabilityQa = evaluateCradleStabilityQa(trimmedMeshes.support_mesh, jobResult.coverage);
-    const modelMeshQa = evaluateGeneratedModelIntersectionQa(trimmedMeshes.support_mesh);
+    const meshAndStabilityQaPromise = evaluateCradleMeshAndStabilityQa(trimmedMeshes.support_mesh, jobResult.coverage);
+    if (!modelMeshQa || trimmedMeshes.trimmed) {
+      modelMeshQa = evaluateGeneratedModelIntersectionQa(trimmedMeshes.support_mesh, { phase: "final" });
+    }
+    const meshAndStabilityQa = await meshAndStabilityQaPromise;
+    const meshQa = meshAndStabilityQa.meshQa;
+    const stabilityQa = meshAndStabilityQa.stabilityQa;
+    const qaWorkerTimings = meshAndStabilityQa.worker ? meshAndStabilityQa.timings : [];
+    markPhase("QA");
 
     modelStatus.textContent = "Support job accepted by WASM";
     const supportTriangleCount = trimmedMeshes.support_mesh?.triangle_count ?? 0;
@@ -696,6 +947,9 @@ async function showWasmPending() {
     const closedGapCount = jobResult.support?.closed_gap_cells ?? 0;
     const baseCellCount = jobResult.support?.base_cells ?? 0;
     const bottomJoinCellCount = jobResult.support?.bottom_join_cells ?? 0;
+    const columnMergeCellCount = jobResult.support?.column_merge_cells ?? 0;
+    const columnComponentsBefore = jobResult.support?.column_components_before ?? 0;
+    const columnComponentsAfter = jobResult.support?.column_components_after ?? 0;
     const interfaceCellCount = jobResult.support?.interface_cells ?? 0;
     const interfaceLayers = jobResult.support?.interface_top_layers ?? 0;
     const foamGapZ = jobResult.support?.foam_gap_z_mm ?? 0;
@@ -732,10 +986,14 @@ async function showWasmPending() {
     const modelMeshQaText = formatGeneratedModelIntersectionQaStatus(modelMeshQa);
     const modelTrimText = trimmedMeshes.warning
       ? `Boolean model trim warning: ${trimmedMeshes.warning}`
-      : (trimmedMeshes.trimmed ? `Exact object boolean trim applied after generator clearance (${formatStatusNumber(trimmedMeshes.clearance?.xy_mm ?? 0)} mm XY, ${formatStatusNumber(trimmedMeshes.clearance?.z_mm ?? 0)} mm Z requested).` : "");
+      : (trimmedMeshes.trimmed
+          ? `Exact object boolean trim applied after generator clearance (${formatStatusNumber(trimmedMeshes.clearance?.xy_mm ?? 0)} mm XY, ${formatStatusNumber(trimmedMeshes.clearance?.z_mm ?? 0)} mm Z requested).`
+          : trimmedMeshes.skipped
+            ? `Exact object boolean trim skipped: ${trimmedMeshes.skip_reason}.`
+            : "");
     const stabilityQaText = formatStabilityQaStatus(stabilityQa);
     const orcaTreeText = treeMode && originalOrganicTree
-      ? "Generated original organic tree cradle geometry in Cradlemaker; no Orca source is bundled in this path."
+      ? "Generated original organic tree cradle geometry in CradleMaker; no Orca source is bundled in this path."
       : treeMode && requestedOrcaTreeMode && !realOrcaTreeAvailable
       ? "Generated experimental tree cradle geometry; exact Orca organic tree support is not linked into WASM."
       : requestedOrcaTreeMode && !realOrcaTreeAvailable
@@ -743,6 +1001,17 @@ async function showWasmPending() {
       : "";
     const treeRoutingText = treeMode
       ? `Tree routing: ${treeTipContactCount.toLocaleString()} physical tip contacts, ${treeLocalUprightCount.toLocaleString()} local uprights, ${treeWaypointBranchCount.toLocaleString()} model-avoidance waypoints, ${treeSlopeRerouteCount.toLocaleString()} slope reroutes, and ${treeModelRerouteCount.toLocaleString()} model-clearance reroutes.`
+      : "";
+    const runtime = jobResult._runtime ?? {};
+    const wasmBuildText = runtime.wasmBuild ? `, ${runtime.wasmBuild}` : "";
+    const runtimeText = ` Runtime: support generation ${runtime.worker ? "worker" : "main thread"}${wasmBuildText}${runtime.crossOriginIsolated ? ", pthread-ready page" : ", pthreads unavailable until server restart/headers are active"}.`;
+    const wasmTimingText = formatWasmTimingText(jobResult.support?.timings_ms);
+    const wasmOutputTimingText = formatWasmOutputTimingText(jobResult.top_level_timings_ms);
+    const workerTimingText = formatWorkerTimingText(runtime.workerTimings);
+    const qaWorkerTimingText = formatQaWorkerTimingText(qaWorkerTimings);
+    const trimTimingText = formatTrimTimingText(trimmedMeshes.timings);
+    const timingText = phaseTimings.length
+      ? ` Timings: ${phaseTimings.map((phase) => `${phase.label} ${formatDurationMs(phase.ms)}`).join(", ")}.${wasmTimingText}${wasmOutputTimingText}${trimTimingText}${workerTimingText}${qaWorkerTimingText}`
       : "";
     const totalTriangleCount = supportTriangleCount + interfaceTriangleCount;
     supportStatus.textContent = totalTriangleCount
@@ -763,13 +1032,13 @@ async function showWasmPending() {
     const cradleArticle = cradleLabel.startsWith("original") ? "an" : "a";
     setJobStatus(
       totalTriangleCount
-        ? `Generated ${cradleArticle} ${cradleLabel} from ${contactCellCount.toLocaleString()} contact cells, including ${envelopeCellCount.toLocaleString()} underside-envelope cells, ${prunedSparseCellCount.toLocaleString()} sparse side/contact cells pruned, ${prunedSmallIslandCellCount.toLocaleString()} tiny island cells removed, ${baseCellCount.toLocaleString()} footprint base cells, ${bottomJoinCellCount.toLocaleString()} bottom-join cells, ${closedGapCount.toLocaleString()} closed gaps, ${unsupportedCellCount.toLocaleString()} unsupported coverage cells, ${overhangFacetCount.toLocaleString()} overhang facets, ${nativeManualCount.toLocaleString()} manual enforcers, ${treeMode ? `${treeBranchCount.toLocaleString()} organic branches, ` : ""}${interfaceCellCount.toLocaleString()} soft-interface cells from ${interfaceLayers.toLocaleString()} interface layers, ${edgeRemovedCells.toLocaleString()} cells removed for a ${edgeClearance.toLocaleString()} mm support-free edge, and ${foamRemovedCells.toLocaleString()} cells removed for a ${foamGapZ.toLocaleString()} mm Z / ${foamGapXY.toLocaleString()} mm XY foam gap. ${orcaTreeText} ${treeRoutingText} ${qaIntersectionText} ${qaCoverageText} ${meshQaText} ${modelTrimText} ${modelMeshQaText} ${stabilityQaText} ${qaClearanceText} Prepared ${Object.keys(supportConfig).length}/${schema.length} Orca support settings and ${Object.keys(cradleConfig).length} cradle settings.`
+        ? `Generated ${cradleArticle} ${cradleLabel} from ${contactCellCount.toLocaleString()} contact cells, including ${envelopeCellCount.toLocaleString()} underside-envelope cells, ${prunedSparseCellCount.toLocaleString()} sparse side/contact cells pruned, ${prunedSmallIslandCellCount.toLocaleString()} tiny island cells removed, ${baseCellCount.toLocaleString()} footprint base cells, ${bottomJoinCellCount.toLocaleString()} bottom-join cells, ${columnMergeCellCount.toLocaleString()} safe column-merge cells, column components ${columnComponentsBefore.toLocaleString()} -> ${columnComponentsAfter.toLocaleString()}, ${closedGapCount.toLocaleString()} closed gaps, ${unsupportedCellCount.toLocaleString()} unsupported coverage cells, ${overhangFacetCount.toLocaleString()} overhang facets, ${nativeManualCount.toLocaleString()} manual enforcers, ${treeMode ? `${treeBranchCount.toLocaleString()} organic branches, ` : ""}${interfaceCellCount.toLocaleString()} soft-interface cells from ${interfaceLayers.toLocaleString()} interface layers, ${edgeRemovedCells.toLocaleString()} cells removed for a ${edgeClearance.toLocaleString()} mm support-free edge, and ${foamRemovedCells.toLocaleString()} cells removed for a ${foamGapZ.toLocaleString()} mm Z / ${foamGapXY.toLocaleString()} mm XY foam gap. ${orcaTreeText} ${treeRoutingText} ${qaIntersectionText} ${qaCoverageText} ${meshQaText} ${modelTrimText} ${modelMeshQaText} ${stabilityQaText} ${qaClearanceText} Prepared ${Object.keys(supportConfig).length}/${schema.length} Orca support settings and ${Object.keys(cradleConfig).length} cradle settings.${runtimeText}${timingText}`
         : `No support regions found. Prepared ${Object.keys(supportConfig).length}/${schema.length} Orca support settings and ${Object.keys(cradleConfig).length} cradle settings.`,
-      qa.intersects_model || meshQa.unsupported_cells || modelMeshQa.intersects_model || stabilityQa.severity === "error" ? "error" : "pending"
+      qa.intersects_model || meshQa.unsupported_cells || modelMeshQa.needs_exact_trim || stabilityQa.severity === "error" ? "error" : "pending"
     );
     setJobProgress(100);
   } catch (error) {
-    modelStatus.textContent = "Cradlemaker WASM core not loaded";
+    modelStatus.textContent = "CradleMaker WASM core not loaded";
     supportStatus.textContent = "Core load failed";
     setJobStatus(`WASM load failed: ${error.message}`, "error");
     setJobProgress(100);
@@ -781,40 +1050,61 @@ async function showWasmPending() {
 
 function renderGeneratedMeshes(supportMesh, interfaceMesh) {
   supportGroup.clear();
+  cncGroup.clear();
   clearSplitPreview();
   state.supportMesh = null;
   state.interfaceMesh = null;
+  state.cncMesh = null;
+  state.cncQa = null;
 
   state.supportMesh = renderMeshPart(supportMesh, materialSupport, "Generated cradle solid");
   state.interfaceMesh = renderMeshPart(interfaceMesh, materialInterface, "Generated interface solid");
   updateButtons();
 }
 
-async function trimGeneratedMeshesAgainstModel(supportMesh, interfaceMesh, supportConfig = {}) {
+async function trimGeneratedMeshesAgainstModel(supportMesh, interfaceMesh, supportConfig = {}, options = {}) {
   const clearance = modelBooleanClearanceSettings(supportConfig);
   const result = {
     support_mesh: supportMesh,
     interface_mesh: interfaceMesh,
     trimmed: false,
+    skipped: false,
+    skip_reason: "",
     warning: "",
     clearance,
+    timings: [],
   };
   if (!state.modelMesh || !supportMesh?.vertices?.length || !supportMesh?.triangles?.length) return result;
+  if (options.skipExactTrim) {
+    result.skipped = true;
+    result.skip_reason = options.skipReason || "generator clearance was accepted";
+    return result;
+  }
 
   let core = null;
   let clearanceSolid = null;
+  let trimPhaseStart = performance.now();
+  const markTrimPhase = (label) => {
+    const now = performance.now();
+    result.timings.push({ label, ms: now - trimPhaseStart });
+    trimPhaseStart = now;
+  };
   try {
     core = await loadManifoldCore();
+    markTrimPhase("load manifold");
     clearanceSolid = modelMeshToManifold(core);
-    result.support_mesh = trimSupportMeshAgainstModelSolid(core, supportMesh, clearanceSolid, "generated cradle");
+    markTrimPhase("model solid");
+    result.support_mesh = trimSupportMeshAgainstModelSolid(core, supportMesh, clearanceSolid, "generated cradle", result.timings);
     if (interfaceMesh?.vertices?.length && interfaceMesh?.triangles?.length) {
-      result.interface_mesh = trimSupportMeshAgainstModelSolid(core, interfaceMesh, clearanceSolid, "generated interface");
+      result.interface_mesh = trimSupportMeshAgainstModelSolid(core, interfaceMesh, clearanceSolid, "generated interface", result.timings);
     }
     result.trimmed = true;
   } catch (error) {
     result.warning = error?.message || String(error);
   } finally {
-    clearanceSolid?.delete?.();
+    if (clearanceSolid && clearanceSolid !== state.modelManifoldCache?.solid) {
+      clearanceSolid.delete?.();
+    }
   }
 
   return result;
@@ -838,11 +1128,22 @@ function modelBooleanClearanceSettings(supportConfig) {
   };
 }
 
-function trimSupportMeshAgainstModelSolid(core, mesh, modelSolid, label) {
-  const sourceSolid = mesh?._sourceSolid ?? supportMeshToManifold(core, mesh, `${label} source`);
+function trimSupportMeshAgainstModelSolid(core, mesh, modelSolid, label, timings = null) {
+  let phaseStart = performance.now();
+  const mark = (phase) => {
+    if (!timings) return;
+    const now = performance.now();
+    timings.push({ label: `${label} ${phase}`, ms: now - phaseStart });
+    phaseStart = now;
+  };
+
+  const sourceSolid = mesh?._sourceSolid ?? supportMeshToManifold(core, mesh, `${label} source`, { fast: true });
   delete mesh?._sourceSolid;
+  mark("source solid");
   const trimmedSolid = assertManifoldOk(core.Manifold.difference([sourceSolid, modelSolid]), `${label} object difference`);
+  mark("difference");
   const trimmedMesh = manifoldToSupportMesh(trimmedSolid, mesh.cell_size_mm);
+  mark("extract mesh");
   sourceSolid.delete?.();
   trimmedSolid.delete?.();
   return trimmedMesh;
@@ -853,9 +1154,10 @@ function renderMeshPart(supportMesh, material, name) {
     return null;
   }
 
+  normalizeSupportMeshArrays(supportMesh);
   const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(supportMesh.vertices), 3));
-  geometry.setIndex(new THREE.BufferAttribute(new Uint32Array(supportMesh.triangles), 1));
+  geometry.setAttribute("position", new THREE.BufferAttribute(supportMesh.vertices, 3));
+  geometry.setIndex(new THREE.BufferAttribute(supportMesh.triangles, 1));
   const displayGeometry = material.flatShading ? geometry.toNonIndexed() : geometry;
   displayGeometry.computeVertexNormals();
   displayGeometry.computeBoundingBox();
@@ -866,6 +1168,25 @@ function renderMeshPart(supportMesh, material, name) {
   supportGroup.add(mesh);
 
   return supportMesh;
+}
+
+function normalizeSupportMeshArrays(mesh) {
+  if (!mesh) return mesh;
+  mesh.vertices = toFloat32Array(mesh.vertices);
+  mesh.triangles = toUint32Array(mesh.triangles);
+  mesh.vertex_count = Math.floor((mesh.vertices?.length ?? 0) / 3);
+  mesh.triangle_count = Math.floor((mesh.triangles?.length ?? 0) / 3);
+  return mesh;
+}
+
+function toFloat32Array(values) {
+  if (values instanceof Float32Array) return values;
+  return new Float32Array(values ?? []);
+}
+
+function toUint32Array(values) {
+  if (values instanceof Uint32Array) return values;
+  return new Uint32Array(values ?? []);
 }
 
 function renderCoverageOverlay(coverage) {
@@ -1186,7 +1507,9 @@ async function buildManifoldSplitPlan(mesh, settings, progress = null) {
     qa = splitChunkModelQa(chunks);
     modelTrimWarning = " QA-flagged chunks were selectively trimmed against the object mesh and rechecked.";
   }
-  modelClearanceSolid?.delete?.();
+  if (modelClearanceSolid && modelClearanceSolid !== state.modelManifoldCache?.solid) {
+    modelClearanceSolid.delete?.();
+  }
 
   return {
     createdAt: new Date().toISOString(),
@@ -1706,7 +2029,7 @@ function supportTopAtXY(mesh, x, y, sampler = null) {
   return top;
 }
 
-function buildSupportTopSampler(mesh, binSize) {
+function buildSupportTopSampler(mesh, binSize, sampleCells = []) {
   const vertices = mesh?.vertices ?? [];
   const triangles = mesh?.triangles ?? [];
   const size = Math.max(0.25, Number(binSize) || 1);
@@ -1714,7 +2037,24 @@ function buildSupportTopSampler(mesh, binSize) {
   const binCoord = (value) => Math.floor(value / size);
   const binKeyFromCoord = (ix, iy) => `${ix}:${iy}`;
   const binKey = (x, y) => binKeyFromCoord(binCoord(x), binCoord(y));
+  const targetBins = new Set();
+  const targetBinCoords = [];
+  for (const cell of sampleCells) {
+    const ix = binCoord(cell?.[0]);
+    const iy = binCoord(cell?.[1]);
+    const key = binKeyFromCoord(ix, iy);
+    if (targetBins.has(key)) continue;
+    targetBins.add(key);
+    targetBinCoords.push({ ix, iy, key });
+  }
+  const targetOnly = targetBins.size > 0;
   const pad = 0.00001;
+
+  const addToBin = (key, index) => {
+    const bucket = bins.get(key);
+    if (bucket) bucket.push(index);
+    else bins.set(key, [index]);
+  };
 
   for (let index = 0; index + 2 < triangles.length; index += 3) {
     const a = readSupportVertex(vertices, triangles[index]);
@@ -1727,13 +2067,20 @@ function buildSupportTopSampler(mesh, binSize) {
     const maxIx = binCoord(Math.max(a.x, b.x, c.x) + pad);
     const minIy = binCoord(Math.min(a.y, b.y, c.y) - pad);
     const maxIy = binCoord(Math.max(a.y, b.y, c.y) + pad);
+    const binCount = (maxIx - minIx + 1) * (maxIy - minIy + 1);
 
-    for (let iy = minIy; iy <= maxIy; iy += 1) {
-      for (let ix = minIx; ix <= maxIx; ix += 1) {
-        const key = binKeyFromCoord(ix, iy);
-        const bucket = bins.get(key);
-        if (bucket) bucket.push(index);
-        else bins.set(key, [index]);
+    if (targetOnly && targetBinCoords.length < binCount) {
+      for (const target of targetBinCoords) {
+        if (target.ix >= minIx && target.ix <= maxIx && target.iy >= minIy && target.iy <= maxIy) {
+          addToBin(target.key, index);
+        }
+      }
+    } else {
+      for (let iy = minIy; iy <= maxIy; iy += 1) {
+        for (let ix = minIx; ix <= maxIx; ix += 1) {
+          const key = binKeyFromCoord(ix, iy);
+          if (!targetOnly || targetBins.has(key)) addToBin(key, index);
+        }
       }
     }
   }
@@ -1745,16 +2092,22 @@ function evaluateCradleMeshSupportQa(mesh, coverage) {
   const cells = coverage?.cells ?? [];
   const cellSize = Number(mesh?.cell_size_mm) || Number(controlsEl.supportBasePatternSpacing?.value) || 0.8;
   const tolerance = Math.max(0.12, cellSize * 0.35);
-  const sampler = buildSupportTopSampler(mesh, Math.max(0.75, cellSize));
+  const expectedCells = cells.filter((cell) => cell?.[3]);
+  const maxSamples = meshQaSampleLimit(mesh, expectedCells.length);
+  const sampleStep = expectedCells.length > maxSamples ? expectedCells.length / maxSamples : 1;
+  const sampledCells = [];
+  for (let sampleIndex = 0; sampleIndex < expectedCells.length; sampleIndex += sampleStep) {
+    sampledCells.push(expectedCells[Math.floor(sampleIndex)]);
+  }
+  const sampler = buildSupportTopSampler(mesh, Math.max(0.75, cellSize), sampledCells);
   let sampled = 0;
   let supported = 0;
   let unsupported = 0;
   let maxGap = 0;
   let maxOverreach = 0;
 
-  for (const cell of cells) {
-    const [x, y, targetZ, expectedSupported] = cell;
-    if (!expectedSupported) continue;
+  for (const cell of sampledCells) {
+    const [x, y, targetZ] = cell;
     const meshTop = supportTopAtXY(mesh, x, y, sampler);
     if (!Number.isFinite(meshTop)) {
       sampled += 1;
@@ -1783,15 +2136,124 @@ function evaluateCradleMeshSupportQa(mesh, coverage) {
   };
 }
 
-function evaluateGeneratedModelIntersectionQa(mesh) {
+function meshQaSampleLimit(mesh, targetCount) {
+  const triangleCount = Math.floor((mesh?.triangles?.length ?? 0) / 3);
+  if (triangleCount > 750000) return Math.min(targetCount, 6000);
+  if (triangleCount > 250000) return Math.min(targetCount, 9000);
+  return targetCount;
+}
+
+function evaluateCradleMeshAndStabilityQaSync(mesh, coverage, centerOfMass = estimateModelCenterOfMass()) {
+  return {
+    meshQa: evaluateCradleMeshSupportQa(mesh, coverage),
+    stabilityQa: evaluateCradleStabilityQa(mesh, coverage, centerOfMass),
+    timings: [],
+    worker: false,
+  };
+}
+
+async function evaluateCradleMeshAndStabilityQa(mesh, coverage) {
+  const centerOfMass = estimateModelCenterOfMass();
+  if (typeof Worker !== "function" || !mesh?.vertices?.length || !mesh?.triangles?.length) {
+    return evaluateCradleMeshAndStabilityQaSync(mesh, coverage, centerOfMass);
+  }
+
+  try {
+    return await requestQaWorker("meshAndStabilityQa", {
+      mesh: {
+        vertices: new Float32Array(mesh.vertices),
+        triangles: new Uint32Array(mesh.triangles),
+        cell_size_mm: mesh.cell_size_mm,
+      },
+      coverage,
+      centerOfMass,
+      cellSize: Number(mesh?.cell_size_mm) || Number(controlsEl.supportBasePatternSpacing?.value) || 0.8,
+    });
+  } catch (error) {
+    console.warn("QA worker failed; falling back to main-thread QA.", error);
+    return evaluateCradleMeshAndStabilityQaSync(mesh, coverage, centerOfMass);
+  }
+}
+
+function ensureQaWorker() {
+  if (qaWorker) return qaWorker;
+
+  qaWorker = new Worker(new URL("./qaWorker.js?v=targeted-mesh-qa-1", import.meta.url), { type: "module" });
+  qaWorker.onmessage = (event) => {
+    const message = event.data ?? {};
+    const request = qaWorkerRequests.get(message.id);
+    if (!request) return;
+    qaWorkerRequests.delete(message.id);
+
+    if (message.type === "meshAndStabilityQaResult") {
+      request.resolve({
+        meshQa: message.meshQa,
+        stabilityQa: message.stabilityQa,
+        timings: message.timings ?? [],
+        worker: true,
+      });
+    } else {
+      request.reject(new Error(message.error || "QA worker failed"));
+    }
+  };
+  qaWorker.onerror = (event) => {
+    const error = new Error(event.message || "QA worker error");
+    for (const request of qaWorkerRequests.values()) request.reject(error);
+    qaWorkerRequests.clear();
+    qaWorker?.terminate();
+    qaWorker = null;
+  };
+
+  return qaWorker;
+}
+
+function requestQaWorker(type, payload = {}) {
+  const worker = ensureQaWorker();
+  const id = nextQaWorkerRequestId;
+  nextQaWorkerRequestId += 1;
+  const transfer = [];
+  if (payload.mesh?.vertices?.buffer) transfer.push(payload.mesh.vertices.buffer);
+  if (payload.mesh?.triangles?.buffer) transfer.push(payload.mesh.triangles.buffer);
+
+  return new Promise((resolve, reject) => {
+    qaWorkerRequests.set(id, { resolve, reject });
+    try {
+      worker.postMessage({ id, type, ...payload }, transfer);
+    } catch (error) {
+      qaWorkerRequests.delete(id);
+      reject(error);
+    }
+  });
+}
+
+function evaluateGeneratedModelIntersectionQa(mesh, options = {}) {
   const cellSize = Number(mesh?.cell_size_mm) || Number(controlsEl.supportBasePatternSpacing?.value) || 0.8;
-  return meshModelIntersectionQa(
+  const phase = options.phase || "final";
+  const qa = meshModelIntersectionQa(
     [{ id: "cradle", mesh }],
     {
-      maxSamples: 10000,
+      maxSamples: modelIntersectionQaSampleLimit(mesh, phase),
       surfaceTolerance: Math.max(0.08, cellSize * 0.28),
     }
   );
+  qa.needs_exact_trim = materialIntersectionNeedsExactTrim(qa, cellSize);
+  return qa;
+}
+
+function modelIntersectionQaSampleLimit(mesh, phase = "final") {
+  const triangleCount = Math.floor((mesh?.triangles?.length ?? 0) / 3);
+  if (triangleCount > 750000) return phase === "pretrim" ? 3500 : 5000;
+  if (triangleCount > 250000) return phase === "pretrim" ? 5000 : 7000;
+  return 10000;
+}
+
+function materialIntersectionNeedsExactTrim(qa, cellSize) {
+  if (!qa?.intersects_model || !qa.sampled_points) return false;
+  const ratio = qa.intersection_samples / qa.sampled_points;
+  const penetration = Number(qa.max_penetration_mm) || 0;
+  const shallowLimit = Math.max(0.6, cellSize * 0.9);
+  const countLimit = Math.max(8, Math.ceil(qa.sampled_points * 0.0025));
+  return penetration > shallowLimit || qa.intersection_samples >= countLimit || ratio > 0.004;
 }
 
 function formatGeneratedModelIntersectionQaStatus(qa) {
@@ -1804,15 +2266,13 @@ function formatGeneratedModelIntersectionQaStatus(qa) {
   return `Model mesh QA: no sampled cradle points are materially inside the model across ${qa.sampled_points.toLocaleString()} samples.`;
 }
 
-function evaluateCradleStabilityQa(mesh, coverage) {
+function evaluateCradleStabilityQa(mesh, coverage, centerOfMass = estimateModelCenterOfMass()) {
   const cells = coverage?.cells ?? [];
   const cellSize = Number(mesh?.cell_size_mm) || Number(controlsEl.supportBasePatternSpacing?.value) || 0.8;
   const supportedCells = cells
     .filter((cell) => cell?.[3])
     .map((cell) => ({ x: Number(cell[0]), y: Number(cell[1]), z: Number(cell[2]) }))
     .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y) && Number.isFinite(point.z));
-  const centerOfMass = estimateModelCenterOfMass();
-
   if (!centerOfMass || supportedCells.length < 3) {
     return {
       available: false,
@@ -1821,12 +2281,13 @@ function evaluateCradleStabilityQa(mesh, coverage) {
     };
   }
 
-  const hull = convexHull2d(supportedCells);
+  const groundFootprint = cradleGroundFootprintSamples(mesh, cellSize);
+  const hull = convexHull2d(groundFootprint.length >= 3 ? groundFootprint : supportedCells);
   if (hull.length < 3) {
     return {
       available: false,
       severity: "idle",
-      reason: "supported contact footprint is too narrow for a stability polygon",
+      reason: "cradle ground footprint is too narrow for a stability polygon",
       center_of_mass: centerOfMass.center,
       center_method: centerOfMass.method,
     };
@@ -1865,6 +2326,7 @@ function evaluateCradleStabilityQa(mesh, coverage) {
     confidence: centerOfMass.confidence,
     projection,
     supported_contact_samples: supportedCells.length,
+    ground_contact_samples: groundFootprint.length,
     hull_points: hull.length,
     inside,
     signed_margin_mm: roundedCoordinate(signedMargin),
@@ -1874,6 +2336,41 @@ function evaluateCradleStabilityQa(mesh, coverage) {
     tip_angle_deg: roundedCoordinate(tipAngleDeg),
     margin_ratio: roundedCoordinate(marginRatio),
   };
+}
+
+function cradleGroundFootprintSamples(mesh, cellSize) {
+  const vertices = mesh?.vertices ?? [];
+  if (vertices.length < 3) return [];
+
+  let minZ = Infinity;
+  for (let index = 2; index < vertices.length; index += 3) {
+    minZ = Math.min(minZ, vertices[index]);
+  }
+  if (!Number.isFinite(minZ)) return [];
+
+  const band = Math.max(1.5, cellSize * 1.75);
+  const quant = Math.max(0.75, cellSize);
+  const maxSamples = 24000;
+  const samples = [];
+  const seen = new Set();
+  const add = (x, y) => {
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+    const qx = Math.round(x / quant) * quant;
+    const qy = Math.round(y / quant) * quant;
+    const key = `${qx}:${qy}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    samples.push({ x: roundedCoordinate(qx), y: roundedCoordinate(qy) });
+  };
+
+  const vertexCount = Math.floor(vertices.length / 3);
+  const stride = Math.max(1, Math.floor(vertexCount / maxSamples));
+  for (let vertexIndex = 0; vertexIndex < vertexCount; vertexIndex += stride) {
+    const offset = vertexIndex * 3;
+    if (vertices[offset + 2] <= minZ + band) add(vertices[offset], vertices[offset + 1]);
+  }
+
+  return samples;
 }
 
 function formatStabilityQaStatus(qa) {
@@ -1886,21 +2383,28 @@ function formatStabilityQaStatus(qa) {
     : "surface-area fallback";
   const centerText = `COM ${methodText} projects to (${formatStatusNumber(qa.projection.x)}, ${formatStatusNumber(qa.projection.y)}) mm`;
   const sampleText = `${qa.supported_contact_samples.toLocaleString()} supported contact samples`;
+  const footprintText = qa.ground_contact_samples
+    ? ` and ${qa.ground_contact_samples.toLocaleString()} ground-footprint samples`
+    : "";
 
   if (!qa.inside) {
-    return `Stability QA warning: ${centerText}, outside the supported contact footprint by about ${formatStatusNumber(Math.abs(qa.signed_margin_mm))} mm using ${sampleText}. Cradle/object stability is questionable without more support under the load.`;
+    return `Stability QA warning: ${centerText}, outside the cradle ground footprint by about ${formatStatusNumber(Math.abs(qa.signed_margin_mm))} mm using ${sampleText}${footprintText}. Cradle/object stability is questionable without a wider base or more support under the load.`;
   }
 
   const marginText = `${formatStatusNumber(qa.signed_margin_mm)} mm inside the support polygon`;
   const tipText = `estimated tip margin ${formatStatusNumber(qa.tip_angle_deg)} deg`;
   if (qa.risk === "stable") {
-    return `Stability QA: ${centerText}, ${marginText}; ${tipText} using ${sampleText}.`;
+    return `Stability QA: ${centerText}, ${marginText}; ${tipText} using ${sampleText}${footprintText}.`;
   }
-  return `Stability QA caution: ${centerText}, only ${marginText}; ${tipText} using ${sampleText}.`;
+  return `Stability QA caution: ${centerText}, only ${marginText}; ${tipText} using ${sampleText}${footprintText}.`;
 }
 
 function estimateModelCenterOfMass() {
   const payload = buildMeshPayload();
+  if (state.modelCenterOfMassCache?.payload === payload) {
+    return state.modelCenterOfMassCache.centerOfMass;
+  }
+
   const vertices = payload.vertices ?? [];
   const triangleCount = Math.floor(vertices.length / 9);
   if (!triangleCount) return null;
@@ -1960,26 +2464,32 @@ function estimateModelCenterOfMass() {
     const surfaceDisagreement = surfaceCenter ? Math.sqrt(pointDistanceSquared(volumeCenter, surfaceCenter)) : 0;
     const disagreementLimit = Math.max(10, span * 0.18);
     if (surfaceCenter && surfaceDisagreement > disagreementLimit && pointInsideExpandedBounds(surfaceCenter, bounds, 0.02)) {
-      return {
+      const centerOfMass = {
         center: roundedPoint(surfaceCenter),
         method: "surface",
         confidence: `fallback because closed-volume and surface-area estimates disagreed by ${formatStatusNumber(surfaceDisagreement)} mm`,
       };
+      state.modelCenterOfMassCache = { payload, centerOfMass };
+      return centerOfMass;
     }
 
-    return {
+    const centerOfMass = {
       center: roundedPoint(volumeCenter),
       method: "volume",
       confidence: "higher when the STL is watertight and consistently oriented",
     };
+    state.modelCenterOfMassCache = { payload, centerOfMass };
+    return centerOfMass;
   }
 
   if (!surfaceCenter) return null;
-  return {
+  const centerOfMass = {
     center: roundedPoint(surfaceCenter),
     method: "surface",
     confidence: "fallback for open, non-watertight, or inconsistently oriented STLs",
   };
+  state.modelCenterOfMassCache = { payload, centerOfMass };
+  return centerOfMass;
 }
 
 function pointInsideExpandedBounds(point, bounds, fraction) {
@@ -2272,34 +2782,121 @@ async function unionManifoldsBatched(core, manifolds, batchSize = 28, label = "s
   return current[0];
 }
 
-function supportMeshToManifold(core, mesh, label = "mesh") {
+function supportMeshToManifold(core, mesh, label = "mesh", options = {}) {
+  if (options.fast) {
+    try {
+      return supportMeshToManifoldFast(core, mesh, label);
+    } catch (fastError) {
+      console.warn(`${label} fast Manifold path failed; retrying with cleanup.`, fastError);
+    }
+  }
+
   const prepared = prepareSupportMeshForManifold(mesh);
-  const manifoldMesh = new core.Mesh({
-    numProp: 3,
-    vertProperties: new Float32Array(prepared.vertices ?? []),
-    triVerts: new Uint32Array(prepared.triangles ?? []),
-    tolerance: 0,
-  });
-  manifoldMesh.merge();
   try {
-    return assertManifoldOk(core.Manifold.ofMesh(manifoldMesh), label);
+    return supportMeshPreparedToManifold(core, prepared, label, true);
   } catch (error) {
     const diagnostics = manifoldEdgeDiagnostics(prepared);
     throw new Error(`${label} is not a valid manifold: ${error?.message || error}; ${diagnostics}`);
   }
 }
 
+function supportMeshToManifoldFast(core, mesh, label = "mesh") {
+  const prepared = directSupportMeshForManifold(mesh);
+  try {
+    return supportMeshPreparedToManifold(core, prepared, label, false);
+  } catch (error) {
+    console.warn(`${label} direct indexed Manifold path failed; retrying with merge.`, error);
+    return supportMeshPreparedToManifold(core, prepared, label, true);
+  }
+}
+
+function supportMeshPreparedToManifold(core, prepared, label, mergeVertices = true) {
+  const manifoldMesh = new core.Mesh({
+    numProp: 3,
+    vertProperties: toFloat32Array(prepared.vertices),
+    triVerts: toUint32Array(prepared.triangles),
+    tolerance: 0,
+  });
+  if (mergeVertices) manifoldMesh.merge();
+  return assertManifoldOk(core.Manifold.ofMesh(manifoldMesh), label);
+}
+
+function directSupportMeshForManifold(mesh) {
+  const vertices = toFloat32Array(mesh?.vertices ?? []);
+  let triangles = mesh?.triangles;
+  if (!triangles?.length) {
+    const vertexCount = Math.floor(vertices.length / 3);
+    triangles = new Uint32Array(vertexCount);
+    for (let index = 0; index < vertexCount; index += 1) triangles[index] = index;
+  } else {
+    triangles = toUint32Array(triangles);
+  }
+
+  return { vertices, triangles };
+}
+
 function modelMeshToManifold(core) {
   const payload = buildMeshPayload();
-  const vertices = payload.vertices ?? [];
-  const triangles = [];
-  const vertexCount = Math.floor(vertices.length / 3);
-  for (let index = 0; index < vertexCount; index += 1) triangles.push(index);
-  return supportMeshToManifold(core, {
-    vertices,
-    triangles,
-    triangle_count: Math.floor(triangles.length / 3),
-  }, "object model clearance solid");
+  if (state.modelManifoldCache?.core === core && state.modelManifoldCache?.payload === payload) {
+    return state.modelManifoldCache.solid;
+  }
+
+  state.modelManifoldCache?.solid?.delete?.();
+  const indexed = payload.indexed_mesh;
+  let solid = null;
+  if (indexed?.vertices?.length && indexed?.triangles?.length) {
+    try {
+      solid = supportMeshPreparedToManifold(core, {
+        vertices: indexed.vertices,
+        triangles: indexed.triangles,
+      }, "object model clearance solid", false);
+    } catch (error) {
+      console.warn("Indexed object model Manifold path failed; retrying with merge.", error);
+    }
+  }
+  if (!solid) {
+    const vertices = payload.vertices ?? [];
+    solid = supportMeshToManifold(core, {
+      vertices,
+      triangle_count: Math.floor(vertices.length / 9),
+    }, "object model clearance solid", { fast: true });
+  }
+  state.modelManifoldCache = { core, payload, solid };
+  return solid;
+}
+
+function scheduleModelManifoldPrewarm() {
+  if (!ENABLE_MODEL_MANIFOLD_PREWARM) return;
+  if (!state.modelMesh) return;
+  state.modelManifoldPrewarmToken += 1;
+  const token = state.modelManifoldPrewarmToken;
+  if (state.modelManifoldPrewarmTimer !== null) {
+    if (typeof window.cancelIdleCallback === "function") {
+      window.cancelIdleCallback(state.modelManifoldPrewarmTimer);
+    } else {
+      window.clearTimeout(state.modelManifoldPrewarmTimer);
+    }
+    state.modelManifoldPrewarmTimer = null;
+  }
+
+  const run = () => {
+    state.modelManifoldPrewarmTimer = null;
+    if (!state.modelMesh || token !== state.modelManifoldPrewarmToken) return;
+    const payload = buildMeshPayload();
+    loadManifoldCore()
+      .then((core) => {
+        if (!state.modelMesh || token !== state.modelManifoldPrewarmToken) return;
+        if (state.modelPayloadCache !== payload) return;
+        modelMeshToManifold(core);
+      })
+      .catch((error) => {
+        console.warn("Model boolean prewarm failed.", error);
+      });
+  };
+
+  state.modelManifoldPrewarmTimer = typeof window.requestIdleCallback === "function"
+    ? window.requestIdleCallback(run, { timeout: 5000 })
+    : window.setTimeout(run, 1500);
 }
 
 function assertManifoldOk(manifold, label) {
@@ -3110,9 +3707,10 @@ function normalizePolygonCcw(points) {
 function renderSplitChunks(plan) {
   splitGroup.clear();
   for (const [index, chunk] of plan.chunks.entries()) {
+    normalizeSupportMeshArrays(chunk.mesh);
     const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(chunk.mesh.vertices), 3));
-    geometry.setIndex(new THREE.BufferAttribute(new Uint32Array(chunk.mesh.triangles), 1));
+    geometry.setAttribute("position", new THREE.BufferAttribute(chunk.mesh.vertices, 3));
+    geometry.setIndex(new THREE.BufferAttribute(chunk.mesh.triangles, 1));
     const material = new THREE.MeshStandardMaterial({
       color: splitPalette[index % splitPalette.length],
       roughness: 0.76,
@@ -3447,7 +4045,7 @@ function meshModelIntersectionQa(chunks, options = {}) {
     };
   }
 
-  const modelTriangles = modelTrianglesForQa();
+  const modelIndex = modelQaIndex(options);
   const samples = splitChunkQaSamples(chunks, options.maxSamples ?? 7000);
   const affected = new Set();
   let intersectionSamples = 0;
@@ -3455,8 +4053,8 @@ function meshModelIntersectionQa(chunks, options = {}) {
   const surfaceTolerance = Number(options.surfaceTolerance ?? 0.12);
 
   for (const sample of samples) {
-    if (!pointInsideModel(sample, modelTriangles)) continue;
-    const distance = closestModelDistance(sample, modelTriangles);
+    if (!pointInsideModel(sample, modelIndex)) continue;
+    const distance = closestModelDistance(sample, modelIndex, surfaceTolerance);
     if (distance <= surfaceTolerance) continue;
     intersectionSamples += 1;
     maxPenetration = Math.max(maxPenetration, distance);
@@ -3472,8 +4070,102 @@ function meshModelIntersectionQa(chunks, options = {}) {
   };
 }
 
+function modelQaIndex(options = {}) {
+  const triangles = modelTrianglesForQa();
+  const cache = state.modelQaCache;
+  const surfaceTolerance = Number(options.surfaceTolerance ?? 0.12);
+  const key = `${roundedCoordinate(surfaceTolerance)}`;
+  if (cache?.indexes?.has(key)) {
+    return cache.indexes.get(key);
+  }
+  const index = buildModelQaIndex(triangles, options);
+  if (cache?.indexes) {
+    cache.indexes.set(key, index);
+  }
+  return index;
+}
+
+function buildModelQaIndex(triangles, options = {}) {
+  const bounds = {
+    min: { y: Infinity, z: Infinity },
+    max: { y: -Infinity, z: -Infinity },
+  };
+  const indexed = [];
+  for (const triangle of triangles) {
+    const minY = Math.min(triangle.a.y, triangle.b.y, triangle.c.y);
+    const maxY = Math.max(triangle.a.y, triangle.b.y, triangle.c.y);
+    const minZ = Math.min(triangle.a.z, triangle.b.z, triangle.c.z);
+    const maxZ = Math.max(triangle.a.z, triangle.b.z, triangle.c.z);
+    bounds.min.y = Math.min(bounds.min.y, minY);
+    bounds.min.z = Math.min(bounds.min.z, minZ);
+    bounds.max.y = Math.max(bounds.max.y, maxY);
+    bounds.max.z = Math.max(bounds.max.z, maxZ);
+    indexed.push({ ...triangle, minY, maxY, minZ, maxZ });
+  }
+
+  const spanY = Math.max(1, bounds.max.y - bounds.min.y);
+  const spanZ = Math.max(1, bounds.max.z - bounds.min.z);
+  const surfaceTolerance = Number(options.surfaceTolerance ?? 0.12);
+  const binSize = Math.max(1.5, surfaceTolerance * 8, Math.min(spanY, spanZ) / 96);
+  const binCoordY = (value) => Math.floor((value - bounds.min.y) / binSize);
+  const binCoordZ = (value) => Math.floor((value - bounds.min.z) / binSize);
+  const binKey = (iy, iz) => `${iy}:${iz}`;
+  const bins = new Map();
+  const largeTriangles = [];
+
+  for (const triangle of indexed) {
+    const minIy = binCoordY(triangle.minY);
+    const maxIy = binCoordY(triangle.maxY);
+    const minIz = binCoordZ(triangle.minZ);
+    const maxIz = binCoordZ(triangle.maxZ);
+    const binCount = (maxIy - minIy + 1) * (maxIz - minIz + 1);
+    if (binCount > 96) {
+      largeTriangles.push(triangle);
+      continue;
+    }
+    for (let iz = minIz; iz <= maxIz; iz += 1) {
+      for (let iy = minIy; iy <= maxIy; iy += 1) {
+        const key = binKey(iy, iz);
+        const bucket = bins.get(key);
+        if (bucket) bucket.push(triangle);
+        else bins.set(key, [triangle]);
+      }
+    }
+  }
+
+  return { triangles: indexed, bins, largeTriangles, bounds, binSize, binCoordY, binCoordZ, binKey };
+}
+
+function modelQaCandidatesAtYZ(point, modelIndex, radiusBins = 0) {
+  const iy = modelIndex.binCoordY(point.y);
+  const iz = modelIndex.binCoordZ(point.z);
+  const seen = new Set();
+  const candidates = [];
+  for (let dz = -radiusBins; dz <= radiusBins; dz += 1) {
+    for (let dy = -radiusBins; dy <= radiusBins; dy += 1) {
+      const bucket = modelIndex.bins.get(modelIndex.binKey(iy + dy, iz + dz));
+      if (!bucket) continue;
+      for (const triangle of bucket) {
+        if (seen.has(triangle)) continue;
+        seen.add(triangle);
+        candidates.push(triangle);
+      }
+    }
+  }
+  for (const triangle of modelIndex.largeTriangles) {
+    if (seen.has(triangle)) continue;
+    seen.add(triangle);
+    candidates.push(triangle);
+  }
+  return candidates;
+}
+
 function modelTrianglesForQa() {
   const payload = buildMeshPayload();
+  if (state.modelQaCache?.payload === payload) {
+    return state.modelQaCache.triangles;
+  }
+
   const vertices = payload.vertices ?? [];
   const triangles = [];
   for (let index = 0; index + 8 < vertices.length; index += 9) {
@@ -3482,42 +4174,74 @@ function modelTrianglesForQa() {
     const c = { x: vertices[index + 6], y: vertices[index + 7], z: vertices[index + 8] };
     triangles.push({ a, b, c });
   }
+  state.modelQaCache = { payload, triangles, indexes: new Map() };
   return triangles;
 }
 
 function splitChunkQaSamples(chunks, maxSamples) {
-  const raw = [];
+  const triangleCounts = (chunks ?? []).map((chunk) => Math.floor((chunk.mesh?.triangles?.length ?? 0) / 3));
+  const totalCandidates = triangleCounts.reduce((sum, triangleCount) => sum + triangleCount * 4, 0);
+  if (!totalCandidates || maxSamples <= 0) return [];
+
+  const collectAll = totalCandidates <= maxSamples;
+  const selectedCandidateIndexes = collectAll ? null : new Set();
+  if (!collectAll) {
+    const step = totalCandidates / maxSamples;
+    for (let index = 0; index < maxSamples; index += 1) {
+      selectedCandidateIndexes.add(Math.floor(index * step));
+    }
+  }
+
+  const samples = [];
+  let candidateIndex = 0;
   for (const chunk of chunks) {
     const vertices = chunk.mesh?.vertices ?? [];
     const triangles = chunk.mesh?.triangles ?? [];
     for (let index = 0; index + 2 < triangles.length; index += 3) {
+      const baseCandidateIndex = candidateIndex;
+      candidateIndex += 4;
+      if (!collectAll &&
+        !selectedCandidateIndexes.has(baseCandidateIndex) &&
+        !selectedCandidateIndexes.has(baseCandidateIndex + 1) &&
+        !selectedCandidateIndexes.has(baseCandidateIndex + 2) &&
+        !selectedCandidateIndexes.has(baseCandidateIndex + 3)) {
+        continue;
+      }
+
       const a = readSupportVertex(vertices, triangles[index]);
       const b = readSupportVertex(vertices, triangles[index + 1]);
       const c = readSupportVertex(vertices, triangles[index + 2]);
-      raw.push({ ...a, chunkId: chunk.id });
-      raw.push({ ...b, chunkId: chunk.id });
-      raw.push({ ...c, chunkId: chunk.id });
-      raw.push({
-        x: (a.x + b.x + c.x) / 3,
-        y: (a.y + b.y + c.y) / 3,
-        z: (a.z + b.z + c.z) / 3,
-        chunkId: chunk.id,
-      });
+      if (collectAll || selectedCandidateIndexes.has(baseCandidateIndex)) {
+        samples.push({ ...a, chunkId: chunk.id });
+      }
+      if (collectAll || selectedCandidateIndexes.has(baseCandidateIndex + 1)) {
+        samples.push({ ...b, chunkId: chunk.id });
+      }
+      if (collectAll || selectedCandidateIndexes.has(baseCandidateIndex + 2)) {
+        samples.push({ ...c, chunkId: chunk.id });
+      }
+      if (collectAll || selectedCandidateIndexes.has(baseCandidateIndex + 3)) {
+        samples.push({
+          x: (a.x + b.x + c.x) / 3,
+          y: (a.y + b.y + c.y) / 3,
+          z: (a.z + b.z + c.z) / 3,
+          chunkId: chunk.id,
+        });
+      }
     }
   }
 
-  if (raw.length <= maxSamples) return raw;
-  const samples = [];
-  const step = raw.length / maxSamples;
-  for (let index = 0; index < maxSamples; index += 1) {
-    samples.push(raw[Math.floor(index * step)]);
-  }
   return samples;
 }
 
-function pointInsideModel(point, triangles) {
+function pointInsideModel(point, modelIndex) {
   const hits = [];
-  for (const triangle of triangles) {
+  const candidates = modelQaCandidatesAtYZ(point, modelIndex, 0);
+  for (const triangle of candidates) {
+    if (point.y < triangle.minY - 1e-7 || point.y > triangle.maxY + 1e-7 ||
+      point.z < triangle.minZ - 1e-7 || point.z > triangle.maxZ + 1e-7) {
+      continue;
+    }
     const t = rayTriangleIntersectionX(point, triangle.a, triangle.b, triangle.c);
     if (Number.isFinite(t) && t > 0.000001) hits.push(roundedCoordinate(t));
   }
@@ -3549,12 +4273,19 @@ function rayTriangleIntersectionX(origin, a, b, c) {
   return t > 0.000001 ? t : NaN;
 }
 
-function closestModelDistance(point, triangles) {
+function closestModelDistance(point, modelIndex, surfaceTolerance = 0.12) {
   let minSquared = Infinity;
-  for (const triangle of triangles) {
-    minSquared = Math.min(minSquared, pointTriangleDistanceSquared(point, triangle.a, triangle.b, triangle.c));
+  const toleranceSquared = surfaceTolerance * surfaceTolerance;
+  const maxRadiusBins = Math.max(1, Math.min(8, Math.ceil((surfaceTolerance * 6) / modelIndex.binSize)));
+  for (let radiusBins = 0; radiusBins <= maxRadiusBins; radiusBins += 1) {
+    const candidates = modelQaCandidatesAtYZ(point, modelIndex, radiusBins);
+    for (const triangle of candidates) {
+      minSquared = Math.min(minSquared, pointTriangleDistanceSquared(point, triangle.a, triangle.b, triangle.c));
+    }
+    if (minSquared <= toleranceSquared) break;
+    if (candidates.length && radiusBins >= 2) break;
   }
-  return Number.isFinite(minSquared) ? Math.sqrt(minSquared) : 0;
+  return Number.isFinite(minSquared) ? Math.sqrt(minSquared) : surfaceTolerance * 2;
 }
 
 function pointTriangleDistanceSquared(point, a, b, c) {
@@ -3635,6 +4366,688 @@ function pointDistanceSquared(a, b) {
   return dx * dx + dy * dy + dz * dz;
 }
 
+async function generateCncFoamPreview() {
+  if (!state.modelMesh) return;
+
+  setCncStatus("Sampling model for CNC foam relief...", "working");
+  clearGeneratedSupport();
+  clearCncPreview({ keepStatus: true });
+  setCncQaDashboard([
+    { label: "CNC", value: "Sampling", detail: "Reading model envelope", state: "working" },
+    { label: "Reach", value: "--", detail: "Waiting", state: "idle" },
+    { label: "Block", value: "--", detail: "Waiting", state: "idle" },
+    { label: "Export", value: "--", detail: "Waiting", state: "idle" },
+  ]);
+  await nextFrame();
+
+  const settings = cncSettings();
+  const result = await buildCncFoamRelief(settings, async (message) => {
+    setCncStatus(message, "working");
+    await nextFrame();
+  });
+  renderCncFoamPreview(result);
+  updateCncQaDashboard(result.qa);
+  const qa = result.qa;
+  const stateName = !qa.block_fits
+    ? "error"
+    : qa.unreachable_cells || qa.selected_tool_miss_cells
+      ? "caution"
+      : "ok";
+  setCncStatus(
+    `CNC foam relief ready: ${result.mesh.triangle_count.toLocaleString()} export triangles, ${formatStatusNumber(qa.reached_percent)}% selected-tool clearance, ${qa.unreachable_cells.toLocaleString()} cells too deep for stickout, ${qa.selected_tool_miss_cells.toLocaleString()} cells likely need a smaller finishing tool. Export remains the desired VCarve relief target.`,
+    stateName
+  );
+  updateButtons();
+}
+
+function cncSettings() {
+  const width = positiveNumber(controlsEl.cncBlockWidth?.value, 300);
+  const depth = positiveNumber(controlsEl.cncBlockDepth?.value, 300);
+  const height = positiveNumber(controlsEl.cncBlockHeight?.value, 76.2);
+  const requestedResolution = Math.max(0.2, positiveNumber(controlsEl.cncResolution?.value, 0.5));
+  const maxResolutionByCells = Math.sqrt((width * depth) / CNC_MAX_GRID_CELLS);
+  const resolution = Math.max(requestedResolution, maxResolutionByCells);
+  const toolStickoutMm = inchesToMm(controlsEl.cncToolStickoutIn?.value || 1);
+  const bitDiameterMm = Math.max(0.5, inchesToMm(controlsEl.cncBitDiameterIn?.value || 0.25));
+  const toolEnd = controlsEl.cncToolEnd?.value === "ball" ? "ball" : "flat";
+  const clearanceMm = Math.max(0, positiveNumber(controlsEl.cncClearance?.value, 1));
+  const autoLiftEnabled = controlsEl.cncAutoLift?.checked !== false;
+  const modelLiftMm = Math.max(0, positiveNumber(controlsEl.cncModelLift?.value, 0));
+  const allowedDepthMm = Math.max(0, Math.min(toolStickoutMm - CNC_TOOL_SAFETY_MARGIN_MM, height - CNC_MIN_FLOOR_THICKNESS_MM));
+
+  return {
+    width,
+    depth,
+    height,
+    resolution,
+    requestedResolution,
+    toolStickoutMm,
+    bitDiameterMm,
+    bitRadiusMm: bitDiameterMm / 2,
+    toolEnd,
+    clearanceMm,
+    autoLiftEnabled,
+    modelLiftMm,
+    modelPlacementOffsetMm: modelLiftMm,
+    allowedDepthMm,
+    minFloorMm: CNC_MIN_FLOOR_THICKNESS_MM,
+  };
+}
+
+function estimateCncReferenceZ(settings) {
+  const meshPayload = buildMeshPayload();
+  const resolution = Math.max(settings.resolution, 3);
+  const nx = Math.max(2, Math.ceil(settings.width / resolution));
+  const ny = Math.max(2, Math.ceil(settings.depth / resolution));
+  const dx = settings.width / nx;
+  const dy = settings.depth / ny;
+  const xMin = -settings.width / 2;
+  const yMin = -settings.depth / 2;
+  const undersideZ = new Float64Array(nx * ny);
+  undersideZ.fill(Infinity);
+  const vertices = meshPayload.vertices;
+  const triangleCount = Math.floor(vertices.length / 9);
+
+  for (let triangleIndex = 0; triangleIndex < triangleCount; triangleIndex += 1) {
+    const offset = triangleIndex * 9;
+    const a = { x: vertices[offset], y: vertices[offset + 1], z: vertices[offset + 2] };
+    const b = { x: vertices[offset + 3], y: vertices[offset + 4], z: vertices[offset + 5] };
+    const c = { x: vertices[offset + 6], y: vertices[offset + 7], z: vertices[offset + 8] };
+    rasterizeTriangleUnderside(a, b, c, undersideZ, nx, ny, xMin, yMin, dx, dy);
+  }
+
+  let referenceZ = -Infinity;
+  for (const z of undersideZ) {
+    if (Number.isFinite(z)) referenceZ = Math.max(referenceZ, z);
+  }
+  if (Number.isFinite(referenceZ)) return referenceZ;
+  const box = new THREE.Box3().setFromObject(state.modelMesh);
+  return box.min.z;
+}
+
+async function buildCncFoamRelief(settings, report = null) {
+  applyCncModelPlacement(settings);
+  const meshPayload = buildMeshPayload();
+  const nx = Math.max(2, Math.ceil(settings.width / settings.resolution));
+  const ny = Math.max(2, Math.ceil(settings.depth / settings.resolution));
+  const dx = settings.width / nx;
+  const dy = settings.depth / ny;
+  const xMin = -settings.width / 2;
+  const yMin = -settings.depth / 2;
+  const cellCount = nx * ny;
+  const undersideZ = new Float64Array(cellCount);
+  undersideZ.fill(Infinity);
+
+  const vertices = meshPayload.vertices;
+  const triangleCount = Math.floor(vertices.length / 9);
+  const progressStride = Math.max(1, Math.floor(triangleCount / 24));
+  for (let triangleIndex = 0; triangleIndex < triangleCount; triangleIndex += 1) {
+    const offset = triangleIndex * 9;
+    const a = { x: vertices[offset], y: vertices[offset + 1], z: vertices[offset + 2] };
+    const b = { x: vertices[offset + 3], y: vertices[offset + 4], z: vertices[offset + 5] };
+    const c = { x: vertices[offset + 6], y: vertices[offset + 7], z: vertices[offset + 8] };
+    rasterizeTriangleUnderside(a, b, c, undersideZ, nx, ny, xMin, yMin, dx, dy);
+    if (report && triangleIndex % progressStride === 0) {
+      await report(`Sampling CNC relief triangle ${triangleIndex.toLocaleString()} of ${triangleCount.toLocaleString()}...`);
+    }
+  }
+
+  const enclosedVoidCells = fillEnclosedCncFootprintVoids(undersideZ, nx, ny);
+
+  let referenceZ = -Infinity;
+  let footprintCells = 0;
+  for (const z of undersideZ) {
+    if (!Number.isFinite(z)) continue;
+    referenceZ = Math.max(referenceZ, z);
+    footprintCells += 1;
+  }
+  if (!footprintCells) throw new Error("No model footprint intersects the foam block. Increase block size or recenter the model.");
+
+  const rawDepth = new Float64Array(cellCount);
+  const reachableDepth = new Float64Array(cellCount);
+  let maxRequiredDepth = 0;
+  for (let index = 0; index < cellCount; index += 1) {
+    if (!Number.isFinite(undersideZ[index])) continue;
+    const required = Math.max(0, referenceZ - undersideZ[index] + settings.clearanceMm);
+    rawDepth[index] = required;
+    maxRequiredDepth = Math.max(maxRequiredDepth, required);
+  }
+
+  const effectivePlacementOffsetMm = settings.autoLiftEnabled
+    ? maxRequiredDepth - settings.allowedDepthMm
+    : settings.modelLiftMm;
+  settings.modelPlacementOffsetMm = Math.round(effectivePlacementOffsetMm * 2) / 2;
+  settings.modelLiftMm = Math.max(0, settings.modelPlacementOffsetMm);
+  if (settings.autoLiftEnabled && controlsEl.cncModelLift) {
+    controlsEl.cncModelLift.value = String(settings.modelLiftMm);
+    updateOutputs();
+    if (outputs.cncModelLift) {
+      outputs.cncModelLift.textContent = `${formatStatusNumber(settings.modelPlacementOffsetMm)} mm auto offset`;
+    }
+  }
+  applyCncModelPlacement(settings);
+
+  let depthReachableCells = 0;
+  let unreachableCells = 0;
+  let liftedOutCells = 0;
+  for (let index = 0; index < cellCount; index += 1) {
+    if (!Number.isFinite(undersideZ[index])) continue;
+    const adjusted = rawDepth[index] - settings.modelPlacementOffsetMm;
+    if (adjusted > settings.allowedDepthMm) {
+      unreachableCells += 1;
+      continue;
+    }
+    if (adjusted <= 0) {
+      liftedOutCells += 1;
+      continue;
+    }
+    reachableDepth[index] = adjusted;
+    depthReachableCells += 1;
+  }
+
+  if (report) await report("Preparing CNC relief surface...");
+  const reliefPrep = prepareCncReliefDepth(reachableDepth, nx, ny, dx, dy, settings);
+  const finalDepth = reliefPrep.depth;
+  if (report) await report("Simulating selected CNC cutter against relief...");
+  const toolSimulation = simulateSelectedCncTool(finalDepth, nx, ny, dx, dy, settings);
+  let maxCarvedDepth = 0;
+  let selectedToolMissCells = 0;
+  let toolReachedCells = 0;
+  let intersectionCells = 0;
+  let maxIntersectionMm = 0;
+  let maxSelectedToolMissMm = 0;
+  const intersection = new Uint8Array(cellCount);
+  const intersectionToleranceMm = Math.max(0.05, Math.min(dx, dy) * 0.5);
+  for (let index = 0; index < cellCount; index += 1) {
+    const carvedDepth = finalDepth[index];
+    maxCarvedDepth = Math.max(maxCarvedDepth, carvedDepth);
+    if (carvedDepth <= 0.001) continue;
+    const selectedToolShortfall = carvedDepth - toolSimulation.depth[index];
+    if (selectedToolShortfall > intersectionToleranceMm) {
+      intersection[index] = 1;
+      intersectionCells += 1;
+      selectedToolMissCells += 1;
+      maxIntersectionMm = Math.max(maxIntersectionMm, selectedToolShortfall);
+      maxSelectedToolMissMm = Math.max(maxSelectedToolMissMm, selectedToolShortfall);
+    } else {
+      toolReachedCells += 1;
+    }
+  }
+
+  if (report) await report("Building watertight CNC foam STL mesh...");
+  const unreachable = new Uint8Array(cellCount);
+  for (let index = 0; index < cellCount; index += 1) {
+    if (!Number.isFinite(undersideZ[index])) continue;
+    if (rawDepth[index] - settings.modelPlacementOffsetMm > settings.allowedDepthMm) unreachable[index] = 1;
+  }
+
+  const foamMesh = buildCncFoamBlockMesh(finalDepth, nx, ny, xMin, yMin, dx, dy, settings.height);
+  const unreachableMesh = buildCncUnreachableOverlay(unreachable, nx, ny, xMin, yMin, dx, dy, settings.height + 0.35);
+  const intersectionMesh = buildCncSurfaceOverlay(intersection, finalDepth, nx, ny, xMin, yMin, dx, dy, settings.height, 0.35, 3);
+  const modelBounds = new THREE.Box3().setFromObject(state.modelMesh);
+  const modelSize = modelBounds.getSize(new THREE.Vector3());
+  const blockFits = modelSize.x + settings.clearanceMm * 2 <= settings.width && modelSize.y + settings.clearanceMm * 2 <= settings.depth;
+  const qa = {
+    footprint_cells: footprintCells,
+    reached_cells: toolReachedCells,
+    depth_reachable_cells: depthReachableCells,
+    unreachable_cells: unreachableCells,
+    lifted_out_cells: liftedOutCells,
+    reached_percent: depthReachableCells ? (toolReachedCells / depthReachableCells) * 100 : 0,
+    max_required_depth_mm: maxRequiredDepth,
+    max_carved_depth_mm: maxCarvedDepth,
+    reference_z_mm: referenceZ,
+    model_lift_mm: settings.modelLiftMm,
+    model_placement_offset_mm: settings.modelPlacementOffsetMm,
+    auto_lift_enabled: settings.autoLiftEnabled,
+    allowed_depth_mm: settings.allowedDepthMm,
+    min_floor_mm: settings.height - maxCarvedDepth,
+    block_fits: blockFits,
+    tool_limited_cells: selectedToolMissCells,
+    bit_limited_cells: selectedToolMissCells,
+    detail_softened_cells: 0,
+    selected_tool_miss_cells: selectedToolMissCells,
+    max_selected_tool_miss_mm: maxSelectedToolMissMm,
+    max_tool_overcut_mm: 0,
+    max_detail_extra_clearance_mm: 0,
+    relief_smoothing_passes: reliefPrep.smoothingPasses,
+    tool_simulation_stride: toolSimulation.stride,
+    tool_simulation_resolution_mm: toolSimulation.resolution,
+    intersection_cells: intersectionCells,
+    max_intersection_mm: maxIntersectionMm,
+    intersection_tolerance_mm: intersectionToleranceMm,
+    enclosed_void_cells: enclosedVoidCells,
+    tool_end: settings.toolEnd,
+    grid: { nx, ny, dx, dy, resolution: settings.resolution },
+    settings,
+  };
+
+  return { mesh: foamMesh, unreachableMesh, intersectionMesh, qa };
+}
+
+function fillEnclosedCncFootprintVoids(undersideZ, nx, ny) {
+  const visited = new Uint8Array(undersideZ.length);
+  const queue = [];
+  let filledCells = 0;
+  const neighborOffsets = [
+    { x: 1, y: 0 },
+    { x: -1, y: 0 },
+    { x: 0, y: 1 },
+    { x: 0, y: -1 },
+  ];
+
+  for (let start = 0; start < undersideZ.length; start += 1) {
+    if (visited[start] || Number.isFinite(undersideZ[start])) continue;
+    visited[start] = 1;
+    queue.length = 0;
+    queue.push(start);
+    const component = [start];
+    const boundaryDepths = [];
+    let touchesExterior = false;
+
+    for (let head = 0; head < queue.length; head += 1) {
+      const index = queue[head];
+      const ix = index % nx;
+      const iy = Math.floor(index / nx);
+      if (ix === 0 || iy === 0 || ix === nx - 1 || iy === ny - 1) touchesExterior = true;
+
+      for (const offset of neighborOffsets) {
+        const sx = ix + offset.x;
+        const sy = iy + offset.y;
+        if (sx < 0 || sx >= nx || sy < 0 || sy >= ny) {
+          touchesExterior = true;
+          continue;
+        }
+        const neighborIndex = sy * nx + sx;
+        if (Number.isFinite(undersideZ[neighborIndex])) {
+          boundaryDepths.push(undersideZ[neighborIndex]);
+          continue;
+        }
+        if (visited[neighborIndex]) continue;
+        visited[neighborIndex] = 1;
+        queue.push(neighborIndex);
+        component.push(neighborIndex);
+      }
+    }
+
+    if (touchesExterior || !boundaryDepths.length) continue;
+    const fillZ = Math.min(...boundaryDepths);
+    for (const index of component) {
+      undersideZ[index] = fillZ;
+    }
+    filledCells += component.length;
+  }
+
+  return filledCells;
+}
+
+function rasterizeTriangleUnderside(a, b, c, undersideZ, nx, ny, xMin, yMin, dx, dy) {
+  const minX = Math.min(a.x, b.x, c.x);
+  const maxX = Math.max(a.x, b.x, c.x);
+  const minY = Math.min(a.y, b.y, c.y);
+  const maxY = Math.max(a.y, b.y, c.y);
+  const ix0 = clampIndex(Math.floor((minX - xMin) / dx), nx);
+  const ix1 = clampIndex(Math.floor((maxX - xMin) / dx), nx);
+  const iy0 = clampIndex(Math.floor((minY - yMin) / dy), ny);
+  const iy1 = clampIndex(Math.floor((maxY - yMin) / dy), ny);
+  const denominator = (b.y - c.y) * (a.x - c.x) + (c.x - b.x) * (a.y - c.y);
+  if (Math.abs(denominator) < 1e-9) return;
+
+  for (let iy = iy0; iy <= iy1; iy += 1) {
+    const y = yMin + (iy + 0.5) * dy;
+    for (let ix = ix0; ix <= ix1; ix += 1) {
+      const x = xMin + (ix + 0.5) * dx;
+      const wA = ((b.y - c.y) * (x - c.x) + (c.x - b.x) * (y - c.y)) / denominator;
+      const wB = ((c.y - a.y) * (x - c.x) + (a.x - c.x) * (y - c.y)) / denominator;
+      const wC = 1 - wA - wB;
+      if (wA < -0.000001 || wB < -0.000001 || wC < -0.000001) continue;
+      const z = a.z * wA + b.z * wB + c.z * wC;
+      const index = iy * nx + ix;
+      if (z < undersideZ[index]) undersideZ[index] = z;
+    }
+  }
+}
+
+function prepareCncReliefDepth(targetDepth, nx, ny, dx, dy, settings) {
+  return { depth: new Float64Array(targetDepth), smoothingPasses: 0 };
+}
+
+function simulateSelectedCncTool(desiredDepth, nx, ny, dx, dy, settings) {
+  const baseCellSize = Math.min(dx, dy);
+  const targetSimResolution = Math.max(baseCellSize, settings.bitRadiusMm / 8);
+  const stride = Math.max(1, Math.min(10, Math.round(targetSimResolution / baseCellSize)));
+  const sxCount = Math.ceil(nx / stride);
+  const syCount = Math.ceil(ny / stride);
+  const sxSize = dx * stride;
+  const sySize = dy * stride;
+  const simDesired = new Float64Array(sxCount * syCount);
+
+  for (let iy = 0; iy < ny; iy += 1) {
+    const sy = Math.floor(iy / stride);
+    for (let ix = 0; ix < nx; ix += 1) {
+      const depth = desiredDepth[iy * nx + ix];
+      if (depth <= 0) continue;
+      const sx = Math.floor(ix / stride);
+      const simIndex = sy * sxCount + sx;
+      if (depth > simDesired[simIndex]) simDesired[simIndex] = depth;
+    }
+  }
+
+  const simMachined = simulateToolOnDepthMap(simDesired, sxCount, syCount, sxSize, sySize, settings);
+  const output = new Float64Array(desiredDepth.length);
+  for (let iy = 0; iy < ny; iy += 1) {
+    const sy = Math.min(syCount - 1, Math.floor(iy / stride));
+    for (let ix = 0; ix < nx; ix += 1) {
+      const sx = Math.min(sxCount - 1, Math.floor(ix / stride));
+      output[iy * nx + ix] = simMachined[sy * sxCount + sx];
+    }
+  }
+
+  return { depth: output, stride, resolution: Math.max(sxSize, sySize) };
+}
+
+function simulateToolOnDepthMap(desiredDepth, nx, ny, dx, dy, settings) {
+  const output = new Float64Array(desiredDepth.length);
+  const kernel = buildCncToolKernel(settings.bitRadiusMm, dx, dy, settings.toolEnd);
+
+  for (let cy = 0; cy < ny; cy += 1) {
+    for (let cx = 0; cx < nx; cx += 1) {
+      let tipDepth = settings.allowedDepthMm;
+      for (const sample of kernel) {
+        const sx = cx + sample.ox;
+        const sy = cy + sample.oy;
+        const desired = sx < 0 || sx >= nx || sy < 0 || sy >= ny
+          ? 0
+          : desiredDepth[sy * nx + sx];
+        tipDepth = Math.min(tipDepth, desired + sample.sag);
+      }
+      if (tipDepth <= 0) continue;
+      for (const sample of kernel) {
+        const sx = cx + sample.ox;
+        const sy = cy + sample.oy;
+        if (sx < 0 || sx >= nx || sy < 0 || sy >= ny) continue;
+        const sampleIndex = sy * nx + sx;
+        const carvedDepth = Math.max(0, Math.min(desiredDepth[sampleIndex], tipDepth - sample.sag));
+        if (carvedDepth > output[sampleIndex]) output[sampleIndex] = carvedDepth;
+      }
+    }
+  }
+
+  return output;
+}
+
+function buildCncToolKernel(radiusMm, dx, dy, toolEnd) {
+  const effectiveRadius = Math.max(0.001, radiusMm);
+  const rx = Math.max(0, Math.ceil(effectiveRadius / dx));
+  const ry = Math.max(0, Math.ceil(effectiveRadius / dy));
+  const radiusSquared = effectiveRadius * effectiveRadius;
+  const kernel = [];
+  for (let oy = -ry; oy <= ry; oy += 1) {
+    for (let ox = -rx; ox <= rx; ox += 1) {
+      const distSquared = (ox * dx) * (ox * dx) + (oy * dy) * (oy * dy);
+      if (distSquared > radiusSquared + 1e-9) continue;
+      const sag = toolEnd === "ball"
+        ? effectiveRadius - Math.sqrt(Math.max(0, radiusSquared - distSquared))
+        : 0;
+      kernel.push({ ox, oy, sag });
+    }
+  }
+  if (!kernel.some((sample) => sample.ox === 0 && sample.oy === 0)) {
+    kernel.push({ ox: 0, oy: 0, sag: 0 });
+  }
+  return kernel;
+}
+
+function buildCncFoamBlockMesh(depths, nx, ny, xMin, yMin, dx, dy, blockHeight) {
+  const mesh = { vertices: [], triangles: [], triangle_count: 0 };
+  const topIndex = [];
+  const bottomIndex = [];
+  const vertexDepth = (ix, iy) => {
+    let depth = 0;
+    for (let oy = -1; oy <= 0; oy += 1) {
+      const cy = iy + oy;
+      if (cy < 0 || cy >= ny) continue;
+      for (let ox = -1; ox <= 0; ox += 1) {
+        const cx = ix + ox;
+        if (cx < 0 || cx >= nx) continue;
+        depth = Math.max(depth, depths[cy * nx + cx]);
+      }
+    }
+    return depth;
+  };
+
+  for (let iy = 0; iy <= ny; iy += 1) {
+    for (let ix = 0; ix <= nx; ix += 1) {
+      const x = xMin + ix * dx;
+      const y = yMin + iy * dy;
+      topIndex.push(pushMeshVertex(mesh, x, y, blockHeight - vertexDepth(ix, iy)));
+      bottomIndex.push(pushMeshVertex(mesh, x, y, 0));
+    }
+  }
+
+  const row = nx + 1;
+  for (let iy = 0; iy < ny; iy += 1) {
+    for (let ix = 0; ix < nx; ix += 1) {
+      const a = topIndex[iy * row + ix];
+      const b = topIndex[iy * row + ix + 1];
+      const c = topIndex[(iy + 1) * row + ix + 1];
+      const d = topIndex[(iy + 1) * row + ix];
+      pushMeshTriangle(mesh, a, b, c);
+      pushMeshTriangle(mesh, a, c, d);
+      const ba = bottomIndex[iy * row + ix];
+      const bb = bottomIndex[iy * row + ix + 1];
+      const bc = bottomIndex[(iy + 1) * row + ix + 1];
+      const bd = bottomIndex[(iy + 1) * row + ix];
+      pushMeshTriangle(mesh, ba, bc, bb);
+      pushMeshTriangle(mesh, ba, bd, bc);
+    }
+  }
+
+  for (let ix = 0; ix < nx; ix += 1) {
+    appendSideQuad(mesh, topIndex[ix], topIndex[ix + 1], bottomIndex[ix + 1], bottomIndex[ix]);
+    const topOffset = ny * row + ix;
+    appendSideQuad(mesh, topIndex[topOffset + 1], topIndex[topOffset], bottomIndex[topOffset], bottomIndex[topOffset + 1]);
+  }
+  for (let iy = 0; iy < ny; iy += 1) {
+    const left = iy * row;
+    appendSideQuad(mesh, topIndex[left + row], topIndex[left], bottomIndex[left], bottomIndex[left + row]);
+    const right = iy * row + nx;
+    appendSideQuad(mesh, topIndex[right], topIndex[right + row], bottomIndex[right + row], bottomIndex[right]);
+  }
+
+  mesh.triangle_count = Math.floor(mesh.triangles.length / 3);
+  return mesh;
+}
+
+function buildCncUnreachableOverlay(unreachable, nx, ny, xMin, yMin, dx, dy, z) {
+  const mesh = { vertices: [], triangles: [], triangle_count: 0 };
+  for (let iy = 0; iy < ny; iy += 1) {
+    for (let ix = 0; ix < nx; ix += 1) {
+      if (!unreachable[iy * nx + ix]) continue;
+      const x0 = xMin + ix * dx;
+      const x1 = x0 + dx;
+      const y0 = yMin + iy * dy;
+      const y1 = y0 + dy;
+      const a = pushMeshVertex(mesh, x0, y0, z);
+      const b = pushMeshVertex(mesh, x1, y0, z);
+      const c = pushMeshVertex(mesh, x1, y1, z);
+      const d = pushMeshVertex(mesh, x0, y1, z);
+      pushMeshTriangle(mesh, a, b, c);
+      pushMeshTriangle(mesh, a, c, d);
+    }
+  }
+  mesh.triangle_count = Math.floor(mesh.triangles.length / 3);
+  return mesh;
+}
+
+function buildCncSurfaceOverlay(mask, depths, nx, ny, xMin, yMin, dx, dy, blockHeight, zOffset = 0.25, stipple = 1) {
+  const mesh = { vertices: [], triangles: [], triangle_count: 0 };
+  const stride = Math.max(1, Math.floor(stipple));
+  for (let iy = 0; iy < ny; iy += 1) {
+    for (let ix = 0; ix < nx; ix += 1) {
+      if (!mask[iy * nx + ix]) continue;
+      if (stride > 1 && (ix + iy) % stride !== 0) continue;
+      const depth = Math.max(0, depths[iy * nx + ix] || 0);
+      const z = blockHeight - depth + zOffset;
+      const x0 = xMin + ix * dx;
+      const x1 = x0 + dx;
+      const y0 = yMin + iy * dy;
+      const y1 = y0 + dy;
+      const a = pushMeshVertex(mesh, x0, y0, z);
+      const b = pushMeshVertex(mesh, x1, y0, z);
+      const c = pushMeshVertex(mesh, x1, y1, z);
+      const d = pushMeshVertex(mesh, x0, y1, z);
+      pushMeshTriangle(mesh, a, b, c);
+      pushMeshTriangle(mesh, a, c, d);
+    }
+  }
+  mesh.triangle_count = Math.floor(mesh.triangles.length / 3);
+  return mesh;
+}
+
+function pushMeshVertex(mesh, x, y, z) {
+  const index = Math.floor(mesh.vertices.length / 3);
+  mesh.vertices.push(roundedCoordinate(x), roundedCoordinate(y), roundedCoordinate(z));
+  return index;
+}
+
+function pushMeshTriangle(mesh, a, b, c) {
+  mesh.triangles.push(a, b, c);
+}
+
+function appendSideQuad(mesh, a, b, c, d) {
+  pushMeshTriangle(mesh, a, b, c);
+  pushMeshTriangle(mesh, a, c, d);
+}
+
+function renderCncFoamPreview(result) {
+  cncGroup.clear();
+  splitGroup.clear();
+  supportGroup.clear();
+  coverageGroup.clear();
+  state.supportMesh = null;
+  state.interfaceMesh = null;
+  state.coverage = null;
+  state.coverageVisible = false;
+  state.splitChunks = [];
+  state.splitPlan = null;
+  state.splitPreviewVisible = false;
+  state.cncMesh = result.mesh;
+  state.cncQa = result.qa;
+  renderMeshIntoGroup(cncGroup, result.mesh, materialCncFoam, "CNC VCarve relief target");
+  renderMeshIntoGroup(cncGroup, result.unreachableMesh, materialCncUnreachable, "CNC unreachable overlay");
+  renderMeshIntoGroup(cncGroup, result.intersectionMesh, materialCncIntersection, "CNC clearance risk overlay");
+  cncGroup.visible = true;
+  supportGroup.visible = false;
+}
+
+function renderMeshIntoGroup(group, supportMesh, material, name) {
+  if (!supportMesh?.vertices?.length || !supportMesh?.triangles?.length) return null;
+  normalizeSupportMeshArrays(supportMesh);
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(supportMesh.vertices, 3));
+  geometry.setIndex(new THREE.BufferAttribute(supportMesh.triangles, 1));
+  const displayGeometry = material.flatShading ? geometry.toNonIndexed() : geometry;
+  displayGeometry.computeVertexNormals();
+  displayGeometry.computeBoundingBox();
+  displayGeometry.computeBoundingSphere();
+  const mesh = new THREE.Mesh(displayGeometry, material);
+  mesh.name = name;
+  group.add(mesh);
+  return mesh;
+}
+
+function clearCncPreview(options = {}) {
+  cncGroup.clear();
+  state.cncMesh = null;
+  state.cncQa = null;
+  if (!options.keepStatus) setCncStatus("Load a model to preview a foam relief.", "idle");
+  if (state.workflowMode === "cnc") resetQaDashboard();
+  updateButtons();
+}
+
+async function autoFitCncLift() {
+  if (!state.modelMesh) return;
+  if (controlsEl.cncAutoLift) controlsEl.cncAutoLift.checked = true;
+  syncCncLiftControls();
+  const settings = cncSettings();
+  const existingMaxDepth = state.cncQa?.max_required_depth_mm;
+  let maxRequiredDepth = existingMaxDepth;
+  if (!Number.isFinite(maxRequiredDepth)) {
+    setCncStatus("Sampling model to auto-fit CNC lift...", "working");
+    const probe = await buildCncFoamRelief({ ...settings, modelLiftMm: 0 }, async (message) => {
+      setCncStatus(message, "working");
+      await nextFrame();
+    });
+    maxRequiredDepth = probe.qa.max_required_depth_mm;
+  }
+  const placementOffset = Math.round((maxRequiredDepth - settings.allowedDepthMm) * 2) / 2;
+  const displayLift = Math.max(0, placementOffset);
+  controlsEl.cncModelLift.value = String(Math.min(Number(controlsEl.cncModelLift.max) || 120, displayLift));
+  clearCncPreview();
+  settings.modelPlacementOffsetMm = placementOffset;
+  settings.modelLiftMm = displayLift;
+  updateOutputs();
+  if (outputs.cncModelLift) {
+    outputs.cncModelLift.textContent = `${formatStatusNumber(placementOffset)} mm auto offset`;
+  }
+  applyCncModelPlacement(settings);
+  setCncStatus(`Auto-fit offset set to ${formatStatusNumber(placementOffset)} mm. Preview again to inspect contact.`, "pending");
+}
+
+function setCncStatus(message, stateName = "idle") {
+  if (!controlsEl.cncStatus) return;
+  controlsEl.cncStatus.textContent = message;
+  controlsEl.cncStatus.dataset.state = stateName;
+}
+
+function setCncQaDashboard(items) {
+  setQaDashboard(items);
+}
+
+function updateCncQaDashboard(qa) {
+  setCncQaDashboard([
+    {
+      label: "Reach",
+      value: `${formatStatusNumber(qa.reached_percent)}%`,
+      detail: `${qa.reached_cells.toLocaleString()} / ${qa.depth_reachable_cells.toLocaleString()} clearance cells`,
+      state: qa.reached_percent >= 95 ? "ok" : qa.reached_percent >= 70 ? "caution" : "error",
+    },
+    {
+      label: "Depth",
+      value: `${formatStatusNumber(qa.max_carved_depth_mm)} mm`,
+      detail: `${formatStatusNumber(qa.allowed_depth_mm)} mm allowed, ${formatStatusNumber(qa.model_placement_offset_mm)} mm ${qa.auto_lift_enabled ? "auto" : "manual"} offset`,
+      state: qa.unreachable_cells ? "caution" : "ok",
+    },
+    {
+      label: "Unreachable",
+      value: qa.unreachable_cells ? qa.unreachable_cells.toLocaleString() : "None",
+      detail: `${qa.lifted_out_cells.toLocaleString()} lifted clear, ${qa.enclosed_void_cells.toLocaleString()} footprint voids filled`,
+      state: qa.unreachable_cells ? "caution" : "ok",
+    },
+    {
+      label: "Tool fit risk",
+      value: qa.selected_tool_miss_cells ? qa.selected_tool_miss_cells.toLocaleString() : "None",
+      detail: qa.selected_tool_miss_cells
+        ? `${formatStatusNumber(qa.max_selected_tool_miss_mm)} mm max foam left high`
+        : `${formatStatusNumber(qa.intersection_tolerance_mm)} mm tolerance`,
+      state: qa.selected_tool_miss_cells ? "caution" : "ok",
+    },
+    {
+      label: "Block",
+      value: qa.block_fits ? "Fits" : "Too small",
+      detail: `${formatStatusNumber(qa.settings.width)} x ${formatStatusNumber(qa.settings.depth)} mm`,
+      state: qa.block_fits ? "ok" : "error",
+    },
+    {
+      label: "Tool",
+      value: qa.tool_end === "ball" ? "Ball nose" : "Flat end",
+      detail: `${formatStatusNumber(qa.settings.bitRadiusMm)} mm radius, ${formatStatusNumber(qa.tool_simulation_resolution_mm)} mm sim grid`,
+      state: "ok",
+    },
+  ]);
+}
+
 function buildSupportJobPayload() {
   const bbox = new THREE.Box3().setFromObject(state.modelMesh);
   const size = bbox.getSize(new THREE.Vector3());
@@ -3668,37 +5081,87 @@ function buildSupportJobPayload() {
 
 function buildMeshPayload() {
   state.modelMesh.updateMatrixWorld(true);
+  if (state.modelPayloadCache) {
+    return state.modelPayloadCache;
+  }
+
   const geometry = state.sourceGeometry ?? state.modelMesh.geometry;
   const positionAttribute = geometry.getAttribute("position");
-  const vertices = [];
+  const vertices = positionAttribute ? new Float32Array(positionAttribute.count * 3) : new Float32Array(0);
+  const indexedVertices = [];
+  const indexedTriangles = positionAttribute ? new Uint32Array(positionAttribute.count) : new Uint32Array(0);
+  const indexedVertexMap = new Map();
   const vertex = new THREE.Vector3();
 
   if (!positionAttribute) {
-    return {
+    state.modelPayloadCache = {
       coordinate_space: "world_mm",
       triangle_encoding: "nonindexed_triplets",
       vertex_count: 0,
       triangle_count: 0,
       vertices,
+      indexed_mesh: {
+        vertices: new Float32Array(0),
+        triangles: new Uint32Array(0),
+      },
     };
+    return state.modelPayloadCache;
   }
 
   for (let index = 0; index < positionAttribute.count; index += 1) {
     vertex.fromBufferAttribute(positionAttribute, index).applyMatrix4(state.modelMesh.matrixWorld);
-    vertices.push(
-      roundedCoordinate(vertex.x),
-      roundedCoordinate(vertex.y),
-      roundedCoordinate(vertex.z)
-    );
+    const offset = index * 3;
+    const ix = Math.round(vertex.x * MESH_COORDINATE_PRECISION);
+    const iy = Math.round(vertex.y * MESH_COORDINATE_PRECISION);
+    const iz = Math.round(vertex.z * MESH_COORDINATE_PRECISION);
+    const x = ix / MESH_COORDINATE_PRECISION;
+    const y = iy / MESH_COORDINATE_PRECISION;
+    const z = iz / MESH_COORDINATE_PRECISION;
+    vertices[offset] = x;
+    vertices[offset + 1] = y;
+    vertices[offset + 2] = z;
+
+    const key = `${ix}:${iy}:${iz}`;
+    let indexedVertex = indexedVertexMap.get(key);
+    if (indexedVertex === undefined) {
+      indexedVertex = indexedVertices.length / 3;
+      indexedVertices.push(x, y, z);
+      indexedVertexMap.set(key, indexedVertex);
+    }
+    indexedTriangles[index] = indexedVertex;
   }
 
-  return {
+  state.modelPayloadCache = {
     coordinate_space: "world_mm",
     triangle_encoding: "nonindexed_triplets",
     vertex_count: positionAttribute.count,
     triangle_count: Math.floor(positionAttribute.count / 3),
     vertices,
+    indexed_mesh: {
+      vertices: new Float32Array(indexedVertices),
+      triangles: indexedTriangles,
+      vertex_count: Math.floor(indexedVertices.length / 3),
+      triangle_count: Math.floor(indexedTriangles.length / 3),
+    },
   };
+  return state.modelPayloadCache;
+}
+
+function invalidateModelPayloadCache() {
+  state.modelManifoldPrewarmToken += 1;
+  if (state.modelManifoldPrewarmTimer !== null) {
+    if (typeof window.cancelIdleCallback === "function") {
+      window.cancelIdleCallback(state.modelManifoldPrewarmTimer);
+    } else {
+      window.clearTimeout(state.modelManifoldPrewarmTimer);
+    }
+    state.modelManifoldPrewarmTimer = null;
+  }
+  state.modelPayloadCache = null;
+  state.modelManifoldCache?.solid?.delete?.();
+  state.modelManifoldCache = null;
+  state.modelQaCache = null;
+  state.modelCenterOfMassCache = null;
 }
 
 function roundedCoordinate(value) {
@@ -3709,6 +5172,92 @@ function formatStatusNumber(value) {
   const number = Number(value);
   if (!Number.isFinite(number)) return "0";
   return number.toLocaleString(undefined, { maximumFractionDigits: 2 });
+}
+
+function formatDurationMs(ms) {
+  const number = Number(ms);
+  if (!Number.isFinite(number) || number < 0) return "0 ms";
+  if (number < 1000) return `${Math.round(number)} ms`;
+  return `${(number / 1000).toLocaleString(undefined, { maximumFractionDigits: 1 })} s`;
+}
+
+function formatWasmTimingText(timings) {
+  if (!timings || typeof timings !== "object") return "";
+  const labels = [
+    ["input_parse", "input parse"],
+    ["settings_parse", "settings"],
+    ["generation_total", "generate total"],
+    ["grid", "grid"],
+    ["model_ceiling", "ceiling"],
+    ["overhang_scan", "overhangs"],
+    ["lower_envelope", "envelope"],
+    ["prune", "prune"],
+    ["gap_clearance", "clearance"],
+    ["native_qa", "native QA"],
+    ["base_join", "base"],
+    ["mesh", "mesh"],
+    ["binary_pack", "binary pack"],
+  ];
+  const parts = labels
+    .map(([key, label]) => [label, Number(timings[key])])
+    .filter(([, value]) => Number.isFinite(value) && value > 0.05)
+    .map(([label, value]) => `${label} ${formatDurationMs(value)}`);
+  return parts.length ? ` WASM phases: ${parts.join(", ")}.` : "";
+}
+
+function formatWasmOutputTimingText(timings) {
+  if (!timings || typeof timings !== "object") return "";
+  const labels = [
+    ["mesh_json", "mesh metadata"],
+    ["tree_json", "tree JSON"],
+    ["coverage_json", "coverage JSON"],
+    ["qa_json", "QA JSON"],
+  ];
+  const parts = labels
+    .map(([key, label]) => [label, Number(timings[key])])
+    .filter(([, value]) => Number.isFinite(value) && value > 0.05)
+    .map(([label, value]) => `${label} ${formatDurationMs(value)}`);
+  return parts.length ? ` WASM output: ${parts.join(", ")}.` : "";
+}
+
+function formatWorkerTimingText(timings) {
+  if (!Array.isArray(timings) || !timings.length) return "";
+  const parts = timings
+    .map((phase) => ({
+      label: String(phase?.label ?? ""),
+      ms: Number(phase?.ms),
+    }))
+    .filter((phase) => phase.label && Number.isFinite(phase.ms) && phase.ms >= 0)
+    .map((phase) => `${phase.label} ${formatDurationMs(phase.ms)}`);
+  return parts.length ? ` Worker phases: ${parts.join(", ")}.` : "";
+}
+
+function formatQaWorkerTimingText(timings) {
+  if (!Array.isArray(timings) || !timings.length) return "";
+  const parts = timings
+    .map((phase) => ({
+      label: String(phase?.label ?? ""),
+      ms: Number(phase?.ms),
+    }))
+    .filter((phase) => phase.label && Number.isFinite(phase.ms) && phase.ms >= 0)
+    .map((phase) => `${phase.label} ${formatDurationMs(phase.ms)}`);
+  return parts.length ? ` QA worker phases: ${parts.join(", ")}.` : "";
+}
+
+function formatTrimTimingText(timings) {
+  if (!Array.isArray(timings) || !timings.length) return "";
+  const parts = timings
+    .map((phase) => ({
+      label: String(phase?.label ?? ""),
+      ms: Number(phase?.ms),
+    }))
+    .filter((phase) => phase.label && Number.isFinite(phase.ms) && phase.ms >= 0.05)
+    .map((phase) => `${phase.label} ${formatDurationMs(phase.ms)}`);
+  return parts.length ? ` Trim phases: ${parts.join(", ")}.` : "";
+}
+
+function inchesToMm(value) {
+  return Math.max(0, Number(value) || 0) * INCH_TO_MM;
 }
 
 function collectSupportConfig() {
@@ -3823,6 +5372,21 @@ function updateOutputs() {
   outputs.splitBuildMargin.textContent = `${controlsEl.splitBuildMargin.value} mm`;
   outputs.splitConnectorClearance.textContent = `${controlsEl.splitConnectorClearance.value} mm`;
   outputs.splitConnectorSize.textContent = `${controlsEl.splitConnectorSize.value} mm`;
+  if (outputs.cncStickout && controlsEl.cncToolStickoutIn) {
+    outputs.cncStickout.textContent = `${formatStatusNumber(inchesToMm(controlsEl.cncToolStickoutIn.value))} mm`;
+  }
+  if (outputs.cncResolution && controlsEl.cncResolution) {
+    const settings = cncSettings();
+    outputs.cncResolution.textContent = settings.resolution > settings.requestedResolution + 0.001
+      ? `${formatStatusNumber(settings.resolution)} mm effective grid`
+      : `${formatStatusNumber(settings.resolution)} mm grid`;
+  }
+  if (outputs.cncBitDiameter && controlsEl.cncBitDiameterIn) {
+    outputs.cncBitDiameter.textContent = `${formatStatusNumber(inchesToMm(controlsEl.cncBitDiameterIn.value))} mm`;
+  }
+  if (outputs.cncModelLift && controlsEl.cncModelLift) {
+    outputs.cncModelLift.textContent = `${formatStatusNumber(controlsEl.cncModelLift.value)} mm`;
+  }
 }
 
 function updateButtons() {
@@ -3830,6 +5394,7 @@ function updateButtons() {
   const supportCount = state.manualSupports.length;
   const generatedSupportTriangles = state.supportMesh?.triangle_count ?? 0;
   const generatedInterfaceTriangles = state.interfaceMesh?.triangle_count ?? 0;
+  const generatedCncTriangles = state.cncMesh?.triangle_count ?? 0;
   if (controlsEl.toggleModelVisibility) {
     controlsEl.toggleModelVisibility.disabled = !hasModel;
     controlsEl.toggleModelVisibility.textContent = state.modelVisible ? "Hide model" : "Show model";
@@ -3855,6 +5420,9 @@ function updateButtons() {
     controlsEl.toggleManualSupport.dataset.active = state.manualSupportMode ? "true" : "false";
   }
   controlsEl.generateSupports.disabled = !hasModel;
+  if (controlsEl.cncGenerate) controlsEl.cncGenerate.disabled = !hasModel;
+  if (controlsEl.cncAutoFit) controlsEl.cncAutoFit.disabled = !hasModel;
+  if (controlsEl.cncClear) controlsEl.cncClear.disabled = generatedCncTriangles === 0;
   if (controlsEl.toggleCoverage) {
     controlsEl.toggleCoverage.disabled = !state.coverage?.cells?.length;
     controlsEl.toggleCoverage.textContent = state.coverageVisible ? "Hide coverage" : "Show coverage";
@@ -3864,14 +5432,21 @@ function updateButtons() {
   if (controlsEl.exportPly) controlsEl.exportPly.disabled = generatedSupportTriangles === 0;
   if (controlsEl.exportInterfaceStl) controlsEl.exportInterfaceStl.disabled = generatedInterfaceTriangles === 0;
   if (controlsEl.exportInterfacePly) controlsEl.exportInterfacePly.disabled = generatedInterfaceTriangles === 0;
+  if (controlsEl.exportCncStl) controlsEl.exportCncStl.disabled = generatedCncTriangles === 0;
   if (controlsEl.previewSplit) controlsEl.previewSplit.disabled = generatedSupportTriangles === 0;
   if (controlsEl.clearSplit) controlsEl.clearSplit.disabled = !state.splitPreviewVisible;
   if (controlsEl.exportSplitStls) controlsEl.exportSplitStls.disabled = !state.splitChunks.length;
   if (controlsEl.exportSplitManifest) controlsEl.exportSplitManifest.disabled = !state.splitChunks.length;
   const totalGeneratedTriangles = generatedSupportTriangles + generatedInterfaceTriangles;
-  supportStatus.textContent = totalGeneratedTriangles
-    ? `${generatedSupportTriangles.toLocaleString()} cradle + ${generatedInterfaceTriangles.toLocaleString()} interface triangles`
-    : `${supportCount} manual marks`;
+  if (state.workflowMode === "cnc") {
+    supportStatus.textContent = generatedCncTriangles
+      ? `${generatedCncTriangles.toLocaleString()} CNC foam relief triangles`
+      : "CNC foam relief not generated";
+  } else {
+    supportStatus.textContent = totalGeneratedTriangles
+      ? `${generatedSupportTriangles.toLocaleString()} cradle + ${generatedInterfaceTriangles.toLocaleString()} interface triangles`
+      : `${supportCount} manual marks`;
+  }
 }
 
 function setJobStatus(message, stateName = "idle") {
@@ -4167,6 +5742,13 @@ function exportInterfacePly() {
 
   const ply = supportMeshToAsciiPly(state.interfaceMesh);
   downloadTextFile(ply, supportExportName("interface", "ply"), "model/ply");
+}
+
+function exportCncFoamStl() {
+  if (!state.cncMesh) return;
+
+  const stl = supportMeshToAsciiStl(state.cncMesh, "cradlemaker_cnc_foam_relief");
+  downloadTextFile(stl, supportExportName("cnc-foam-relief", "stl"), "model/stl");
 }
 
 function exportSplitStls() {
