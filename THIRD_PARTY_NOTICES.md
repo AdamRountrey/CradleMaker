@@ -1,8 +1,8 @@
 # Third-Party Notices
 
-CradleMaker's own source code is licensed under the repository-level PolyForm
-Noncommercial License 1.0.0. Third-party components retain their original
-licenses. The CradleMaker license does not relicense third-party code.
+CradleMaker's own source code and project materials are provided under the
+repository-level CradleMaker Terms of Use. Third-party components retain their
+original licenses. The CradleMaker terms do not relicense third-party code.
 
 ## Three.js
 

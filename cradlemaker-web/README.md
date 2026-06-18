@@ -52,9 +52,9 @@ The app is static and can be published directly from `cradlemaker-web/`. The rep
 
 The bundled sample model lives in `cradlemaker-web/samples/` so the sample loader works both locally and on Pages.
 
-## License
+## Terms of Use
 
-CradleMaker is source-available under the repository-level PolyForm Noncommercial License 1.0.0. Noncommercial use is permitted; commercial use requires separate permission from the copyright holder. Third-party components retain their own license terms.
+CradleMaker is source-available under the repository-level CradleMaker Terms of Use. Personal and non-commercial use is permitted; commercial use is prohibited without prior written permission from copyright holder Adam Rountrey. Third-party components retain their own license terms.
 
 ## Current Limits
 

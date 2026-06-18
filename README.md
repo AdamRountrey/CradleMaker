@@ -38,11 +38,11 @@ http://127.0.0.1:5177/cradlemaker-web/
 - CNC foam workflow for ShopBot/VCarve-style top-side relief carving from foam blocks.
 - GitHub Pages deployment from the static `cradlemaker-web/` folder.
 
-## License
+## Terms of Use
 
-CradleMaker is source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE). Noncommercial use is permitted; commercial use is not permitted without separate permission from the copyright holder.
+CradleMaker is source-available under the [CradleMaker Terms of Use](TERMS_OF_USE.md). Personal and non-commercial use is permitted; commercial use is prohibited without prior written permission from copyright holder Adam Rountrey.
 
-Because the license restricts commercial use, this project should not be described as OSI-approved open source. Third-party components retain their own license terms; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Because the terms restrict commercial use and derivative redistribution, this project should not be described as OSI-approved open source. Third-party components retain their own license terms; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Project Layout
 
