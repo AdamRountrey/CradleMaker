@@ -1,6 +1,8 @@
 # CradleMaker Web
 
-CradleMaker is a standalone Three.js app for building independently printable support cradles for physical objects. It can import an STL, orient/elevate the object, create automatic or manual cradle supports, preview the result, and export the generated support mesh.
+CradleMaker is a standalone Three.js app for building independently printable support cradles for physical objects. It can import an STL, orient/elevate the object, create automatic cradle supports, paint support enforcer/blocker regions on the model surface, preview the result, and export the generated support mesh.
+
+Large models use a browser-side mesh BVH for faster picking, painting, model-intersection QA, and CNC foam relief sampling.
 
 The split-for-printing controls can preview a chunk layout against a selected build volume and export per-chunk STL files plus a JSON manifest. Split chunks are produced with Manifold WASM booleans so cut faces are planar, printable solids instead of cell-by-cell walls. The current connector pass adds split-face Z-slide dovetail hardware with boolean-cut trapezoid sockets, sloped pocket/key roofs for support-free printing, adjustable clearance, and adjustable size.
 
@@ -61,4 +63,4 @@ CradleMaker is source-available under the repository-level PolyForm Noncommercia
 - CNC foam export creates an STL relief/component for VCarve; it applies a flat-end or ball-nose tool envelope to the preview/export, but does not generate ShopBot toolpaths.
 - Real Orca organic tree support is being isolated as an optional WASM probe. The clean web checkout does not include upstream Orca sources; fetch them locally with `cradlemaker-web\wasm\fetch-orca-support-sources.ps1` before working on the probe.
 - Tree/organic support experiments are kept in the codebase, but the UI currently exposes only the stable `Normal auto` / `Default (Grid/Organic)` cradle workflow.
-- Manual support clicks are point marks; painted enforcer/blocker regions are still future work.
+- Painted support enforcer/blocker regions are available in print mode. Coverage paint is a surface mask; regenerate supports after painting to apply it.

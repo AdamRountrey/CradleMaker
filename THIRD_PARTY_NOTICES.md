@@ -49,6 +49,20 @@ The vendored Manifold package includes its full license at:
 
 - `cradlemaker-web/vendor/manifold/LICENSE`
 
+## three-mesh-bvh
+
+Files:
+
+- `cradlemaker-web/vendor/three-mesh-bvh/`
+
+License: MIT
+
+Copyright 2018 Garrett Johnson
+
+The vendored three-mesh-bvh package includes its full license at:
+
+- `cradlemaker-web/vendor/three-mesh-bvh/LICENSE`
+
 ## Sample Models
 
 Files:

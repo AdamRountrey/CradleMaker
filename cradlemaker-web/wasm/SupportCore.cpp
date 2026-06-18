@@ -52,6 +52,12 @@ struct Vec3 {
     double z = 0.0;
 };
 
+struct ManualSupportPoint {
+    Vec3 point;
+    double radius = 0.0;
+    bool blocker = false;
+};
+
 struct MeshStats {
     std::size_t vertex_values = 0;
     std::size_t vertex_count = 0;
@@ -96,6 +102,7 @@ struct SupportSettings {
     bool interface_enabled = false;
     bool foam_gap_enabled = false;
     bool join_uprights_bottom_enabled = true;
+    bool support_blocker_cuts_base = false;
     bool merge_nearby_columns_enabled = true;
     bool remove_small_overhangs = true;
     bool tree_mode = false;
@@ -177,6 +184,8 @@ struct SupportGenerationStats {
     std::size_t edge_clearance_removed_cells = 0;
     std::size_t foam_gap_removed_cells = 0;
     std::size_t manual_points = 0;
+    std::size_t manual_blocker_points = 0;
+    std::size_t manual_blocker_removed_cells = 0;
     std::size_t tree_branches = 0;
     std::size_t tree_tip_contacts = 0;
     std::size_t tree_local_uprights = 0;
@@ -464,9 +473,9 @@ bool read_vec3_array_at(const std::string& json, const std::size_t array_pos, Ve
     return true;
 }
 
-std::vector<Vec3> read_manual_support_points(const std::string& json)
+std::vector<ManualSupportPoint> read_manual_support_points(const std::string& json)
 {
-    std::vector<Vec3> points;
+    std::vector<ManualSupportPoint> points;
     const std::string point_key = "\"point\"";
     std::size_t search_pos = 0;
 
@@ -477,8 +486,19 @@ std::vector<Vec3> read_manual_support_points(const std::string& json)
 
         const std::size_t array_pos = json.find('[', key_pos + point_key.size());
         Vec3 point;
-        if (read_vec3_array_at(json, array_pos, point))
-            points.push_back(point);
+        if (read_vec3_array_at(json, array_pos, point)) {
+            const std::size_t object_start = json.rfind('{', key_pos);
+            const std::size_t object_end = json.find('}', key_pos);
+            const std::string object_json = object_start != std::string::npos && object_end != std::string::npos && object_end > object_start
+                ? json.substr(object_start, object_end - object_start + 1)
+                : std::string {};
+            const std::string source = read_string_field(object_json, "source");
+            ManualSupportPoint support;
+            support.point = point;
+            support.radius = read_number_field(object_json, "radius", 0.0);
+            support.blocker = source.find("block") != std::string::npos || source.find("erase") != std::string::npos;
+            points.push_back(support);
+        }
 
         search_pos = key_pos + point_key.size();
     }
@@ -497,6 +517,7 @@ SupportSettings read_support_settings(const std::string& json)
     settings.enable_support = read_bool_field(json, "enable_support", settings.enable_support);
     settings.base_enabled = read_bool_field(json, "base_enabled", settings.base_enabled);
     settings.join_uprights_bottom_enabled = read_bool_field(json, "join_uprights_bottom_enabled", settings.join_uprights_bottom_enabled);
+    settings.support_blocker_cuts_base = read_bool_field(json, "support_blocker_cuts_base", settings.support_blocker_cuts_base);
     settings.merge_nearby_columns_enabled = read_bool_field(json, "merge_nearby_columns_enabled", settings.merge_nearby_columns_enabled);
     settings.interface_enabled = read_bool_field(json, "support_interface_enabled", settings.interface_enabled);
     settings.foam_gap_enabled = read_bool_field(json, "foam_gap_enabled", settings.foam_gap_enabled);
@@ -530,7 +551,7 @@ SupportSettings read_support_settings(const std::string& json)
     settings.xy_distance_mm = std::max(0.0, settings.xy_distance_mm);
     settings.edge_clearance_mm = std::clamp(settings.edge_clearance_mm, 0.0, 25.0);
     settings.contact_cell_size_mm = std::clamp(settings.contact_cell_size_mm, 0.6, 8.0);
-    settings.manual_contact_radius_mm = std::clamp(settings.manual_contact_radius_mm, settings.contact_cell_size_mm, 25.0);
+    settings.manual_contact_radius_mm = std::clamp(settings.manual_contact_radius_mm, settings.contact_cell_size_mm, 50.0);
     settings.tree_branch_distance_mm = std::clamp(settings.tree_branch_distance_mm, settings.contact_cell_size_mm * 2.0, 40.0);
     settings.tree_tip_diameter_mm = std::clamp(settings.tree_tip_diameter_mm, 0.4, 12.0);
     settings.tree_branch_diameter_mm = std::clamp(settings.tree_branch_diameter_mm, settings.tree_tip_diameter_mm, 30.0);
@@ -1709,9 +1730,10 @@ std::size_t prune_small_contact_islands(ContactGrid& grid, const SupportSettings
     return removed;
 }
 
-std::size_t mark_manual_support(ContactGrid& grid, const Vec3& point, const SupportSettings& settings)
+std::size_t mark_manual_support(ContactGrid& grid, const ManualSupportPoint& support, const SupportSettings& settings)
 {
-    const double radius = settings.manual_contact_radius_mm;
+    const Vec3& point = support.point;
+    const double radius = std::clamp(support.radius > 0.0 ? support.radius : settings.manual_contact_radius_mm, grid.cell_size, 50.0);
     const double top_z = std::max(grid.bottom_z, point.z - settings.effective_top_z_distance_mm());
     const int min_ix = int(std::floor((point.x - radius - grid.origin_x) / grid.cell_size));
     const int max_ix = int(std::floor((point.x + radius - grid.origin_x) / grid.cell_size));
@@ -1734,6 +1756,106 @@ std::size_t mark_manual_support(ContactGrid& grid, const Vec3& point, const Supp
     }
 
     return valid_cells;
+}
+
+std::size_t remove_manual_support(ContactGrid& grid, const ManualSupportPoint& support, const SupportSettings& settings)
+{
+    const Vec3& point = support.point;
+    const double radius = std::clamp(support.radius > 0.0 ? support.radius : settings.manual_contact_radius_mm, grid.cell_size, 50.0);
+    const int min_ix = int(std::floor((point.x - radius - grid.origin_x) / grid.cell_size));
+    const int max_ix = int(std::floor((point.x + radius - grid.origin_x) / grid.cell_size));
+    const int min_iy = int(std::floor((point.y - radius - grid.origin_y) / grid.cell_size));
+    const int max_iy = int(std::floor((point.y + radius - grid.origin_y) / grid.cell_size));
+    std::size_t removed_cells = 0;
+
+    for (int iy = min_iy; iy <= max_iy; ++iy) {
+        for (int ix = min_ix; ix <= max_ix; ++ix) {
+            if (!grid.inside(ix, iy))
+                continue;
+            const double cx = grid.origin_x + (double(ix) + 0.5) * grid.cell_size;
+            const double cy = grid.origin_y + (double(iy) + 0.5) * grid.cell_size;
+            if (std::hypot(cx - point.x, cy - point.y) > radius)
+                continue;
+
+            const int cell_index = grid.index(ix, iy);
+            if (grid.top_z[cell_index] > grid.bottom_z + 0.05)
+                ++removed_cells;
+            grid.top_z[cell_index] = grid.bottom_z;
+            grid.lower_envelope_z[cell_index] = std::numeric_limits<double>::max();
+        }
+    }
+
+    return removed_cells;
+}
+
+std::vector<unsigned char> build_manual_blocker_mask(
+    const ContactGrid& grid,
+    const std::vector<ManualSupportPoint>& manual_points,
+    const SupportSettings& settings,
+    std::size_t* active_blockers = nullptr)
+{
+    std::vector<unsigned char> mask(grid.top_z.size(), 0);
+    std::size_t blockers = 0;
+
+    for (const ManualSupportPoint& support : manual_points) {
+        if (!support.blocker)
+            continue;
+
+        const Vec3& point = support.point;
+        const double radius = std::clamp(
+            (support.radius > 0.0 ? support.radius : settings.manual_contact_radius_mm) + grid.cell_size * 0.75,
+            grid.cell_size,
+            60.0
+        );
+        const int min_ix = int(std::floor((point.x - radius - grid.origin_x) / grid.cell_size));
+        const int max_ix = int(std::floor((point.x + radius - grid.origin_x) / grid.cell_size));
+        const int min_iy = int(std::floor((point.y - radius - grid.origin_y) / grid.cell_size));
+        const int max_iy = int(std::floor((point.y + radius - grid.origin_y) / grid.cell_size));
+        bool touched_grid = false;
+
+        for (int iy = min_iy; iy <= max_iy; ++iy) {
+            for (int ix = min_ix; ix <= max_ix; ++ix) {
+                if (!grid.inside(ix, iy))
+                    continue;
+
+                const double cx = grid.origin_x + (double(ix) + 0.5) * grid.cell_size;
+                const double cy = grid.origin_y + (double(iy) + 0.5) * grid.cell_size;
+                if (std::hypot(cx - point.x, cy - point.y) > radius)
+                    continue;
+
+                mask[grid.index(ix, iy)] = 1;
+                touched_grid = true;
+            }
+        }
+
+        if (touched_grid)
+            ++blockers;
+    }
+
+    if (active_blockers)
+        *active_blockers = blockers;
+    return mask;
+}
+
+std::size_t apply_manual_blocker_mask(ContactGrid& grid, const std::vector<unsigned char>& mask, const double allowed_top_z)
+{
+    if (mask.empty())
+        return 0;
+
+    const double clamped_allowed_top = std::max(grid.bottom_z, allowed_top_z);
+    std::size_t removed_cells = 0;
+    const std::size_t count = std::min(mask.size(), grid.top_z.size());
+    for (std::size_t index = 0; index < count; ++index) {
+        if (!mask[index])
+            continue;
+
+        if (grid.top_z[index] > clamped_allowed_top + 0.05)
+            ++removed_cells;
+        grid.top_z[index] = std::min(grid.top_z[index], clamped_allowed_top);
+        grid.lower_envelope_z[index] = std::numeric_limits<double>::max();
+    }
+
+    return removed_cells;
 }
 
 std::size_t count_contact_cells(const ContactGrid& grid)
@@ -3354,7 +3476,7 @@ std::size_t mesh_contact_grid(
 SupportGenerationStats generate_orca_contact_proxy(
     const MeshStats& mesh_stats,
     const SupportSettings& settings,
-    const std::vector<Vec3>& manual_points,
+    const std::vector<ManualSupportPoint>& manual_points,
     CoverageSamples& coverage,
     QaStats& qa,
     SupportMesh& support_out,
@@ -3403,8 +3525,10 @@ SupportGenerationStats generate_orca_contact_proxy(
     stats.pruned_small_island_cells = prune_small_contact_islands(grid, settings);
     stats.timing_prune_ms = mark_ms();
 
-    for (const Vec3& point : manual_points) {
-        if (mark_manual_support(grid, point, settings) > 0)
+    for (const ManualSupportPoint& support : manual_points) {
+        if (support.blocker)
+            continue;
+        if (mark_manual_support(grid, support, settings) > 0)
             ++stats.manual_points;
     }
     stats.timing_manual_ms = mark_ms();
@@ -3413,6 +3537,10 @@ SupportGenerationStats generate_orca_contact_proxy(
     clamp_grid_to_model_ceiling(grid);
     stats.edge_clearance_removed_cells = apply_xy_edge_clearance(grid, settings.edge_clearance_mm);
     stats.foam_gap_removed_cells = apply_xy_edge_clearance(grid, settings.effective_foam_gap_xy_mm());
+    std::size_t active_blocker_points = 0;
+    const std::vector<unsigned char> blocker_mask = build_manual_blocker_mask(grid, manual_points, settings, &active_blocker_points);
+    stats.manual_blocker_points = active_blocker_points;
+    stats.manual_blocker_removed_cells += apply_manual_blocker_mask(grid, blocker_mask, grid.bottom_z);
     clamp_grid_to_model_ceiling(grid);
     stats.contact_cells = count_contact_cells(grid);
     stats.timing_gap_and_clearance_ms = mark_ms();
@@ -3425,12 +3553,22 @@ SupportGenerationStats generate_orca_contact_proxy(
     const std::vector<unsigned char> interface_eligible = snapshot_occupied_cells(grid);
 
     if (settings.base_enabled) {
+        const double blocker_foundation_top = !settings.support_blocker_cuts_base && (settings.base_enabled || settings.join_uprights_bottom_enabled)
+            ? settings.base_thickness_mm
+            : grid.bottom_z;
         stats.base_cells = grow_base_footprint(grid, settings.base_margin_mm, settings.base_thickness_mm);
+        stats.manual_blocker_removed_cells += apply_manual_blocker_mask(grid, blocker_mask, blocker_foundation_top);
         if (settings.join_uprights_bottom_enabled)
             stats.bottom_join_cells = join_bottom_uprights(grid, settings.base_thickness_mm);
+        stats.manual_blocker_removed_cells += apply_manual_blocker_mask(grid, blocker_mask, blocker_foundation_top);
     }
     stats.column_components_before = count_column_components(grid, settings);
     stats.column_merge_cells = merge_nearby_columns(grid, settings);
+    stats.manual_blocker_removed_cells += apply_manual_blocker_mask(
+        grid,
+        blocker_mask,
+        !settings.support_blocker_cuts_base && (settings.base_enabled || settings.join_uprights_bottom_enabled) ? settings.base_thickness_mm : grid.bottom_z
+    );
     stats.column_components_after = count_column_components(grid, settings);
     stats.timing_base_ms = mark_ms();
 
@@ -3681,7 +3819,7 @@ std::string prepare_support_job_json_impl(const std::string& job_json, const boo
     const bool mesh_ready = parsed_vertices && mesh_stats.vertex_values > 0 && mesh_stats.vertex_values % 9 == 0 && nonindexed_triplets;
     const double input_parse_ms = mark_ms();
     const SupportSettings settings = read_support_settings(job_json);
-    const std::vector<Vec3> manual_points = read_manual_support_points(job_json);
+    const std::vector<ManualSupportPoint> manual_points = read_manual_support_points(job_json);
     const double settings_parse_ms = mark_ms();
     SupportMesh support_mesh;
     SupportMesh interface_mesh;
@@ -3795,6 +3933,10 @@ std::string prepare_support_job_json_impl(const std::string& job_json, const boo
         << support_stats.foam_gap_removed_cells
         << R"json(,"manual_points":)json"
         << support_stats.manual_points
+        << R"json(,"manual_blocker_points":)json"
+        << support_stats.manual_blocker_points
+        << R"json(,"manual_blocker_removed_cells":)json"
+        << support_stats.manual_blocker_removed_cells
         << R"json(,"requested_orca_tree_mode":)json"
         << (settings.requested_orca_tree_mode ? "true" : "false")
         << R"json(,"real_orca_tree_available":)json"

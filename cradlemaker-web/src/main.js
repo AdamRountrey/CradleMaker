@@ -2,9 +2,14 @@ import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { STLLoader } from "three/addons/loaders/STLLoader.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
+import { CENTER, acceleratedRaycast, computeBoundsTree, disposeBoundsTree } from "three-mesh-bvh";
 import createManifoldModule from "../vendor/manifold/manifold.js";
-import { getSupportOptionSchema, prepareSupportJob, prewarmSupportCore } from "./wasmCore.js?v=column-bridge-1";
+import { getSupportOptionSchema, prepareSupportJob, prewarmSupportCore } from "./wasmCore.js?v=paint-speed-1";
 import { defaultOrcaSupportConfig } from "./orcaSupportOptions.js?v=organic-voxel-1";
+
+THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
+THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
+THREE.Mesh.prototype.raycast = acceleratedRaycast;
 
 const DEFAULT_SAMPLE_MODELS = [
   "TruckAntennaMount1.stl",
@@ -60,7 +65,6 @@ const controlsEl = {
   supportType: document.querySelector("#support-type"),
   supportStyle: document.querySelector("#support-style"),
   supportThresholdAngle: document.querySelector("#support-threshold-angle"),
-  supportCriticalRegionsOnly: document.querySelector("#support-critical-regions-only"),
   supportRemoveSmallOverhang: document.querySelector("#support-remove-small-overhang"),
   supportTopZDistance: document.querySelector("#support-top-z-distance"),
   supportObjectXYDistance: document.querySelector("#support-object-xy-distance"),
@@ -83,9 +87,14 @@ const controlsEl = {
   baseMargin: document.querySelector("#base-margin"),
   baseThickness: document.querySelector("#base-thickness"),
   generateSupports: document.querySelector("#generate-supports"),
-  toggleManualSupport: document.querySelector("#toggle-manual-support"),
   toggleCoverage: document.querySelector("#toggle-coverage"),
   clearManual: document.querySelector("#clear-manual"),
+  supportDisplayMode: document.querySelector("#support-display-mode"),
+  supportOpacity: document.querySelector("#support-opacity"),
+  supportPaintMode: document.querySelector("#support-paint-mode"),
+  supportBrushRadius: document.querySelector("#support-brush-radius"),
+  supportBlockCutsBase: document.querySelector("#support-block-cuts-base"),
+  clearPaint: document.querySelector("#clear-paint"),
   exportStl: document.querySelector("#export-stl"),
   exportPly: document.querySelector("#export-ply"),
   exportInterfaceStl: document.querySelector("#export-interface-stl"),
@@ -136,6 +145,8 @@ const outputs = {
   splitBuildMargin: document.querySelector("#split-build-margin-value"),
   splitConnectorClearance: document.querySelector("#split-connector-clearance-value"),
   splitConnectorSize: document.querySelector("#split-connector-size-value"),
+  supportOpacity: document.querySelector("#support-opacity-value"),
+  supportBrushRadius: document.querySelector("#support-brush-radius-value"),
   cncStickout: document.querySelector("#cnc-stickout-value"),
   cncResolution: document.querySelector("#cnc-resolution-value"),
   cncBitDiameter: document.querySelector("#cnc-bit-diameter-value"),
@@ -150,6 +161,8 @@ const state = {
   sourceGeometry: null,
   supportMesh: null,
   interfaceMesh: null,
+  supportDisplayMode: "solid",
+  supportOpacity: 1,
   coverage: null,
   coverageVisible: false,
   splitChunks: [],
@@ -159,6 +172,12 @@ const state = {
   manualSupports: [],
   supportMarkerObjects: new Map(),
   nextManualId: 1,
+  supportPaintMode: "off",
+  paintStrokeActive: false,
+  paintStrokePointerId: null,
+  paintMoveFrame: null,
+  pendingPaintEvent: null,
+  lastPaintWorldPoint: null,
   workflowMode: "print",
   cncMesh: null,
   cncQa: null,
@@ -224,6 +243,7 @@ const markerGroup = new THREE.Group();
 scene.add(modelGroup, supportGroup, cncGroup, splitGroup, coverageGroup, markerGroup);
 
 const raycaster = new THREE.Raycaster();
+raycaster.firstHitOnly = true;
 const pointer = new THREE.Vector2();
 const loader = new STLLoader();
 
@@ -281,6 +301,20 @@ const materialCncIntersection = new THREE.MeshBasicMaterial({
 });
 
 const materialMarkerManual = new THREE.MeshStandardMaterial({ color: 0xf1c453, roughness: 0.58 });
+const materialMarkerEnforce = new THREE.MeshBasicMaterial({
+  color: 0x35d56f,
+  transparent: true,
+  opacity: 0.72,
+  side: THREE.DoubleSide,
+  depthWrite: false,
+});
+const materialMarkerBlock = new THREE.MeshBasicMaterial({
+  color: 0xff4f4a,
+  transparent: true,
+  opacity: 0.72,
+  side: THREE.DoubleSide,
+  depthWrite: false,
+});
 const materialCoverageSupported = new THREE.MeshBasicMaterial({
   color: 0x52d273,
   transparent: true,
@@ -360,16 +394,40 @@ function bindControls() {
   controlsEl.toggleModelVisibility?.addEventListener("click", () => toggleModelVisibility());
   controlsEl.toggleGridVisibility?.addEventListener("click", () => toggleGridVisibility());
   controlsEl.modelDisplayMode?.addEventListener("change", () => applyModelDisplayMode(controlsEl.modelDisplayMode.value));
+  controlsEl.supportDisplayMode?.addEventListener("change", () => {
+    applySupportDisplayMode(controlsEl.supportDisplayMode.value);
+    updateButtons();
+  });
+  controlsEl.supportOpacity?.addEventListener("input", () => {
+    applySupportOpacity(Number(controlsEl.supportOpacity.value) / 100);
+    updateOutputs();
+  });
+  controlsEl.supportPaintMode?.addEventListener("change", () => {
+    state.supportPaintMode = controlsEl.supportPaintMode.value || "off";
+    if (state.supportPaintMode !== "off") {
+      state.manualSupportMode = false;
+    }
+    updateManualMarkers();
+    updateButtons();
+  });
+  controlsEl.supportBrushRadius?.addEventListener("input", () => updateOutputs());
+  controlsEl.clearPaint?.addEventListener("click", () => clearPaintedCoverageMarks());
   controlsEl.orientModel.addEventListener("click", () => toggleOrientationHelper());
   controlsEl.resetOrientation.addEventListener("click", () => resetOrientation());
   controlsEl.applyRotationPreset?.addEventListener("click", () => applyRotationPreset());
   controlsEl.generateSupports.addEventListener("click", () => {
+    state.supportPaintMode = "off";
+    if (controlsEl.supportPaintMode) controlsEl.supportPaintMode.value = "off";
+    state.paintStrokeActive = false;
+    state.paintStrokePointerId = null;
+    state.pendingPaintEvent = null;
+    state.lastPaintWorldPoint = null;
+    updateManualMarkers();
     void showWasmPending();
   });
-  controlsEl.toggleManualSupport?.addEventListener("click", () => toggleManualSupportMode());
   controlsEl.toggleCoverage?.addEventListener("click", () => toggleCoverageOverlay());
-  controlsEl.clearManual.addEventListener("click", () => {
-    state.manualSupports = [];
+  controlsEl.clearManual?.addEventListener("click", () => {
+    state.manualSupports = state.manualSupports.filter((support) => support.source === "paint_enforce" || support.source === "paint_block");
     clearGeneratedSupport();
     updateManualMarkers();
   });
@@ -507,7 +565,6 @@ function bindControls() {
   for (const input of [
     controlsEl.supportType,
     controlsEl.supportStyle,
-    controlsEl.supportCriticalRegionsOnly,
     controlsEl.supportRemoveSmallOverhang,
     controlsEl.baseEnabled,
     controlsEl.baseJoinUprights,
@@ -520,6 +577,9 @@ function bindControls() {
   syncOptionPanels();
   syncWorkflowPanels();
   renderer.domElement.addEventListener("pointerdown", onPointerDown);
+  renderer.domElement.addEventListener("pointermove", onPointerMove);
+  renderer.domElement.addEventListener("pointerup", onPointerUp);
+  renderer.domElement.addEventListener("pointerleave", onPointerUp);
   window.addEventListener("resize", resize);
 }
 
@@ -668,8 +728,9 @@ function loadStlGeometry(geometry, label) {
   invalidateModelPayloadCache();
   state.modelMesh = new THREE.Mesh(geometry, materialModel);
   state.modelMesh.name = label;
+  buildModelBoundsTree(state.modelMesh);
   modelGroup.add(state.modelMesh);
-  applyModelDisplayMode(controlsEl.modelDisplayMode?.value || state.modelDisplayMode);
+  applyModelDisplayMode("solid");
 
   const size = new THREE.Vector3();
   geometry.boundingBox.getSize(size);
@@ -690,6 +751,7 @@ function loadStlGeometry(geometry, label) {
 }
 
 function clearSceneModel() {
+  disposeModelBoundsTree();
   modelGroup.clear();
   supportGroup.clear();
   cncGroup.clear();
@@ -698,7 +760,7 @@ function clearSceneModel() {
   markerGroup.clear();
   state.modelMesh = null;
   state.modelVisible = true;
-  state.modelDisplayMode = controlsEl.modelDisplayMode?.value || "solid";
+  state.modelDisplayMode = "solid";
   state.sourceGeometry = null;
   state.supportMesh = null;
   state.interfaceMesh = null;
@@ -711,9 +773,34 @@ function clearSceneModel() {
   state.splitPreviewVisible = false;
   state.coverageVisible = false;
   state.manualSupportMode = false;
+  state.supportPaintMode = "off";
   state.supportMarkerObjects.clear();
   setOrientationHelper(false);
   resetQaDashboard();
+}
+
+function buildModelBoundsTree(mesh) {
+  if (!mesh?.geometry?.computeBoundsTree) return;
+  const startedAt = performance.now();
+  try {
+    mesh.geometry.computeBoundsTree({
+      strategy: CENTER,
+      maxLeafSize: 24,
+      verbose: false,
+    });
+    mesh.userData.bvhBuildMs = performance.now() - startedAt;
+  } catch (error) {
+    console.warn("Model BVH build failed; falling back to standard raycasting.", error);
+    mesh.userData.bvhBuildMs = null;
+  }
+}
+
+function disposeModelBoundsTree() {
+  try {
+    state.modelMesh?.geometry?.disposeBoundsTree?.();
+  } catch (error) {
+    console.warn("Model BVH disposal failed.", error);
+  }
 }
 
 function centerGeometryXY(geometry) {
@@ -781,17 +868,34 @@ function frameObject() {
 function onPointerDown(event) {
   if (!state.modelMesh || event.button !== 0) return;
   if (transformControls.enabled) return;
-  if (!state.manualSupportMode) return;
+  if (!state.manualSupportMode && state.supportPaintMode === "off") return;
+
+  if (state.supportPaintMode === "enforce" || state.supportPaintMode === "block" || state.supportPaintMode === "erase") {
+    event.preventDefault();
+    state.paintStrokeActive = true;
+    state.paintStrokePointerId = event.pointerId;
+    state.pendingPaintEvent = null;
+    state.lastPaintWorldPoint = null;
+    orbit.enabled = false;
+    renderer.domElement.setPointerCapture?.(event.pointerId);
+    if (state.supportPaintMode === "erase") {
+      erasePaintMarksFromEvent(event);
+    } else {
+      addSurfacePaintMarkFromEvent(event, false);
+    }
+    return;
+  }
 
   setPointerFromEvent(event);
   raycaster.setFromCamera(pointer, camera);
 
-  if (event.altKey) {
+  if (event.altKey || state.supportPaintMode === "erase") {
     const markerHits = raycaster.intersectObjects([...state.supportMarkerObjects.values()], false);
     if (markerHits.length) {
       const supportId = markerHits[0].object.userData.supportId;
       state.manualSupports = state.manualSupports.filter((support) => support.id !== supportId);
       updateManualMarkers();
+      clearGeneratedSupport();
     }
     return;
   }
@@ -802,19 +906,139 @@ function onPointerDown(event) {
   const hit = hits[0];
   const localPoint = state.modelMesh.worldToLocal(hit.point.clone());
   const localNormal = hit.face.normal.clone().normalize();
-  state.manualSupports.push({
+  const support = {
     id: `manual-${state.nextManualId++}`,
     source: "manual",
     localPoint,
     localNormal,
+    radiusMm: supportBrushRadiusMm(),
+  };
+  state.manualSupports.push(support);
+  clearGeneratedSupport();
+  addManualMarker(support);
+  updateButtons();
+}
+
+function onPointerMove(event) {
+  if (!state.paintStrokeActive || event.pointerId !== state.paintStrokePointerId) return;
+  event.preventDefault();
+  schedulePaintMove(event);
+}
+
+function onPointerUp(event) {
+  if (!state.paintStrokeActive) return;
+  if (state.paintStrokePointerId !== null && event.pointerId !== state.paintStrokePointerId) return;
+  flushPendingPaintMove();
+  state.paintStrokeActive = false;
+  state.paintStrokePointerId = null;
+  state.pendingPaintEvent = null;
+  state.lastPaintWorldPoint = null;
+  renderer.domElement.releasePointerCapture?.(event.pointerId);
+  orbit.enabled = !transformControls.enabled;
+}
+
+function snapshotPaintEvent(event) {
+  return {
+    clientX: event.clientX,
+    clientY: event.clientY,
+    pointerId: event.pointerId,
+  };
+}
+
+function schedulePaintMove(event) {
+  state.pendingPaintEvent = snapshotPaintEvent(event);
+  if (state.paintMoveFrame !== null) return;
+  state.paintMoveFrame = window.requestAnimationFrame(() => {
+    state.paintMoveFrame = null;
+    flushPendingPaintMove();
   });
-  updateManualMarkers();
+}
+
+function flushPendingPaintMove() {
+  const event = state.pendingPaintEvent;
+  state.pendingPaintEvent = null;
+  if (!event || !state.paintStrokeActive || event.pointerId !== state.paintStrokePointerId) return;
+
+  if (state.supportPaintMode === "erase") {
+    erasePaintMarksFromEvent(event);
+  } else {
+    addSurfacePaintMarkFromEvent(event, true);
+  }
+}
+
+function addSurfacePaintMarkFromEvent(event, skipCloseMarks = true) {
+  if (!state.modelMesh || (state.supportPaintMode !== "enforce" && state.supportPaintMode !== "block")) return false;
+  setPointerFromEvent(event);
+  raycaster.setFromCamera(pointer, camera);
+  const hits = raycaster.intersectObject(state.modelMesh, false);
+  if (!hits.length) return false;
+
+  const hit = hits[0];
+  const radiusMm = supportBrushRadiusMm();
+  const spacingMm = Math.max(0.75, radiusMm * 0.35);
+  if (skipCloseMarks && state.lastPaintWorldPoint && hit.point.distanceTo(state.lastPaintWorldPoint) < spacingMm) {
+    return false;
+  }
+
+  state.lastPaintWorldPoint = hit.point.clone();
+  const localPoint = state.modelMesh.worldToLocal(hit.point.clone());
+  const localNormal = hit.face.normal.clone().normalize();
+  const support = {
+    id: `paint-${state.nextManualId++}`,
+    source: state.supportPaintMode === "block" ? "paint_block" : "paint_enforce",
+    localPoint,
+    localNormal,
+    radiusMm,
+  };
+  state.manualSupports.push(support);
+  clearGeneratedSupport();
+  addManualMarker(support);
+  updateButtons();
+  return true;
+}
+
+function erasePaintMarksFromEvent(event) {
+  if (!state.modelMesh) return false;
+  setPointerFromEvent(event);
+  raycaster.setFromCamera(pointer, camera);
+  const hits = raycaster.intersectObject(state.modelMesh, false);
+  if (!hits.length) return false;
+
+  const brushRadiusMm = supportBrushRadiusMm();
+  const center = hits[0].point;
+  const before = state.manualSupports.length;
+  const realized = realizedManualSupports();
+  const removeIds = new Set(
+    realized
+      .filter((support) =>
+        (support.source === "paint_enforce" || support.source === "paint_block") &&
+        support.worldPoint.distanceTo(center) <= Math.max(brushRadiusMm, support.radiusMm || brushRadiusMm)
+      )
+      .map((support) => support.id)
+  );
+  if (!removeIds.size) return false;
+
+  state.manualSupports = state.manualSupports.filter((support) => !removeIds.has(support.id));
+  if (state.manualSupports.length !== before) {
+    clearGeneratedSupport();
+    updateManualMarkers();
+    return true;
+  }
+  return false;
 }
 
 function setPointerFromEvent(event) {
   const rect = renderer.domElement.getBoundingClientRect();
   pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
   pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+}
+
+function supportBrushDiameterMm() {
+  return Math.max(1, Math.min(100, Number(controlsEl.supportBrushRadius?.value) || 4));
+}
+
+function supportBrushRadiusMm() {
+  return supportBrushDiameterMm() * 0.5;
 }
 
 async function showWasmPending() {
@@ -958,6 +1182,8 @@ async function showWasmPending() {
     const edgeClearance = jobResult.support?.edge_clearance_mm ?? 0;
     const edgeRemovedCells = jobResult.support?.edge_clearance_removed_cells ?? 0;
     const nativeManualCount = jobResult.support?.manual_points ?? 0;
+    const nativeBlockerCount = jobResult.support?.manual_blocker_points ?? 0;
+    const nativeBlockerRemovedCells = jobResult.support?.manual_blocker_removed_cells ?? 0;
     const treeMode = Boolean(jobResult.support?.tree_mode);
     const treeBranchCount = jobResult.support?.tree_branches ?? 0;
     const treeTipContactCount = jobResult.support?.tree_tip_contacts ?? 0;
@@ -1016,7 +1242,7 @@ async function showWasmPending() {
     const totalTriangleCount = supportTriangleCount + interfaceTriangleCount;
     supportStatus.textContent = totalTriangleCount
       ? `${supportTriangleCount.toLocaleString()} cradle + ${interfaceTriangleCount.toLocaleString()} interface triangles`
-      : `${manualCount} manual marks`;
+      : `${manualCount} coverage marks`;
     updateGeneratedQaDashboard({
       supportTriangleCount,
       interfaceTriangleCount,
@@ -1032,7 +1258,7 @@ async function showWasmPending() {
     const cradleArticle = cradleLabel.startsWith("original") ? "an" : "a";
     setJobStatus(
       totalTriangleCount
-        ? `Generated ${cradleArticle} ${cradleLabel} from ${contactCellCount.toLocaleString()} contact cells, including ${envelopeCellCount.toLocaleString()} underside-envelope cells, ${prunedSparseCellCount.toLocaleString()} sparse side/contact cells pruned, ${prunedSmallIslandCellCount.toLocaleString()} tiny island cells removed, ${baseCellCount.toLocaleString()} footprint base cells, ${bottomJoinCellCount.toLocaleString()} bottom-join cells, ${columnMergeCellCount.toLocaleString()} safe column-merge cells, column components ${columnComponentsBefore.toLocaleString()} -> ${columnComponentsAfter.toLocaleString()}, ${closedGapCount.toLocaleString()} closed gaps, ${unsupportedCellCount.toLocaleString()} unsupported coverage cells, ${overhangFacetCount.toLocaleString()} overhang facets, ${nativeManualCount.toLocaleString()} manual enforcers, ${treeMode ? `${treeBranchCount.toLocaleString()} organic branches, ` : ""}${interfaceCellCount.toLocaleString()} soft-interface cells from ${interfaceLayers.toLocaleString()} interface layers, ${edgeRemovedCells.toLocaleString()} cells removed for a ${edgeClearance.toLocaleString()} mm support-free edge, and ${foamRemovedCells.toLocaleString()} cells removed for a ${foamGapZ.toLocaleString()} mm Z / ${foamGapXY.toLocaleString()} mm XY foam gap. ${orcaTreeText} ${treeRoutingText} ${qaIntersectionText} ${qaCoverageText} ${meshQaText} ${modelTrimText} ${modelMeshQaText} ${stabilityQaText} ${qaClearanceText} Prepared ${Object.keys(supportConfig).length}/${schema.length} Orca support settings and ${Object.keys(cradleConfig).length} cradle settings.${runtimeText}${timingText}`
+        ? `Generated ${cradleArticle} ${cradleLabel} from ${contactCellCount.toLocaleString()} contact cells, including ${envelopeCellCount.toLocaleString()} underside-envelope cells, ${prunedSparseCellCount.toLocaleString()} sparse side/contact cells pruned, ${prunedSmallIslandCellCount.toLocaleString()} tiny island cells removed, ${baseCellCount.toLocaleString()} footprint base cells, ${bottomJoinCellCount.toLocaleString()} bottom-join cells, ${columnMergeCellCount.toLocaleString()} safe column-merge cells, column components ${columnComponentsBefore.toLocaleString()} -> ${columnComponentsAfter.toLocaleString()}, ${closedGapCount.toLocaleString()} closed gaps, ${unsupportedCellCount.toLocaleString()} unsupported coverage cells, ${overhangFacetCount.toLocaleString()} overhang facets, ${nativeManualCount.toLocaleString()} manual/enforce marks, ${nativeBlockerCount.toLocaleString()} no-support marks removing ${nativeBlockerRemovedCells.toLocaleString()} cells, ${treeMode ? `${treeBranchCount.toLocaleString()} organic branches, ` : ""}${interfaceCellCount.toLocaleString()} soft-interface cells from ${interfaceLayers.toLocaleString()} interface layers, ${edgeRemovedCells.toLocaleString()} cells removed for a ${edgeClearance.toLocaleString()} mm support-free edge, and ${foamRemovedCells.toLocaleString()} cells removed for a ${foamGapZ.toLocaleString()} mm Z / ${foamGapXY.toLocaleString()} mm XY foam gap. ${orcaTreeText} ${treeRoutingText} ${qaIntersectionText} ${qaCoverageText} ${meshQaText} ${modelTrimText} ${modelMeshQaText} ${stabilityQaText} ${qaClearanceText} Prepared ${Object.keys(supportConfig).length}/${schema.length} Orca support settings and ${Object.keys(cradleConfig).length} cradle settings.${runtimeText}${timingText}`
         : `No support regions found. Prepared ${Object.keys(supportConfig).length}/${schema.length} Orca support settings and ${Object.keys(cradleConfig).length} cradle settings.`,
       qa.intersects_model || meshQa.unsupported_cells || modelMeshQa.needs_exact_trim || stabilityQa.severity === "error" ? "error" : "pending"
     );
@@ -1057,8 +1283,10 @@ function renderGeneratedMeshes(supportMesh, interfaceMesh) {
   state.cncMesh = null;
   state.cncQa = null;
 
+  applySupportMaterialOpacity();
   state.supportMesh = renderMeshPart(supportMesh, materialSupport, "Generated cradle solid");
   state.interfaceMesh = renderMeshPart(interfaceMesh, materialInterface, "Generated interface solid");
+  supportGroup.visible = state.supportDisplayMode !== "hidden";
   updateButtons();
 }
 
@@ -1230,6 +1458,7 @@ function renderCoverageOverlay(coverage) {
     coverageGroup.add(new THREE.Mesh(unsupportedGeometry, materialCoverageUnsupported));
   }
 
+  state.coverageVisible = true;
   coverageGroup.visible = state.coverageVisible;
   updateButtons();
 }
@@ -4071,6 +4300,35 @@ function meshModelIntersectionQa(chunks, options = {}) {
 }
 
 function modelQaIndex(options = {}) {
+  if (state.modelMesh?.geometry?.boundsTree) {
+    state.modelMesh.updateMatrixWorld(true);
+    const bounds = new THREE.Box3().setFromObject(state.modelMesh);
+    const raycaster = new THREE.Raycaster();
+    raycaster.firstHitOnly = false;
+    raycaster.near = 0;
+    return {
+      type: "bvh",
+      mesh: state.modelMesh,
+      bounds,
+      raycaster,
+      rayOrigin: new THREE.Vector3(),
+      rayDirection: new THREE.Vector3(1, 0, 0),
+      localRay: new THREE.Ray(),
+      localRayDirection: new THREE.Vector3(),
+      localPoint: new THREE.Vector3(),
+      closestTarget: { point: new THREE.Vector3() },
+      closestWorldPoint: new THREE.Vector3(),
+      inverseMatrix: state.modelMesh.matrixWorld.clone().invert(),
+      matrixWorld: state.modelMesh.matrixWorld.clone(),
+      legacyIndex: null,
+      legacyOptions: options,
+    };
+  }
+
+  return legacyModelQaIndex(options);
+}
+
+function legacyModelQaIndex(options = {}) {
   const triangles = modelTrianglesForQa();
   const cache = state.modelQaCache;
   const surfaceTolerance = Number(options.surfaceTolerance ?? 0.12);
@@ -4235,6 +4493,14 @@ function splitChunkQaSamples(chunks, maxSamples) {
 }
 
 function pointInsideModel(point, modelIndex) {
+  if (modelIndex?.type === "bvh") {
+    return pointInsideModelBvh(point, modelIndex);
+  }
+
+  return pointInsideModelLegacy(point, modelIndex);
+}
+
+function pointInsideModelLegacy(point, modelIndex) {
   const hits = [];
   const candidates = modelQaCandidatesAtYZ(point, modelIndex, 0);
   for (const triangle of candidates) {
@@ -4256,6 +4522,44 @@ function pointInsideModel(point, modelIndex) {
   return uniqueHits % 2 === 1;
 }
 
+function pointInsideModelBvh(point, modelIndex) {
+  if (point.x > modelIndex.bounds.max.x + 0.0001 ||
+    point.y < modelIndex.bounds.min.y - 0.0001 ||
+    point.y > modelIndex.bounds.max.y + 0.0001 ||
+    point.z < modelIndex.bounds.min.z - 0.0001 ||
+    point.z > modelIndex.bounds.max.z + 0.0001) {
+    return false;
+  }
+
+  const far = modelIndex.bounds.max.x - point.x + 1;
+  if (far <= 0.0001) return false;
+  modelIndex.rayOrigin.set(point.x + 0.000001, point.y, point.z);
+  modelIndex.localPoint
+    .copy(modelIndex.rayOrigin)
+    .applyMatrix4(modelIndex.inverseMatrix);
+  modelIndex.localRayDirection
+    .copy(modelIndex.rayDirection)
+    .transformDirection(modelIndex.inverseMatrix);
+  modelIndex.localRay.origin.copy(modelIndex.localPoint);
+  modelIndex.localRay.direction.copy(modelIndex.localRayDirection);
+
+  const hits = modelIndex.mesh.geometry.boundsTree
+    .raycast(modelIndex.localRay, THREE.DoubleSide, 0, far)
+    .map((hit) => roundedCoordinate(hit.distance))
+    .sort((a, b) => a - b);
+  let uniqueHits = 0;
+  let prior = -Infinity;
+  for (const hit of hits) {
+    if (Math.abs(hit - prior) <= 0.0001) continue;
+    uniqueHits += 1;
+    prior = hit;
+  }
+  if (uniqueHits % 2 !== 1) return false;
+
+  modelIndex.legacyIndex ??= legacyModelQaIndex(modelIndex.legacyOptions);
+  return pointInsideModelLegacy(point, modelIndex.legacyIndex);
+}
+
 function rayTriangleIntersectionX(origin, a, b, c) {
   const edge1 = subtractPoint(b, a);
   const edge2 = subtractPoint(c, a);
@@ -4274,6 +4578,10 @@ function rayTriangleIntersectionX(origin, a, b, c) {
 }
 
 function closestModelDistance(point, modelIndex, surfaceTolerance = 0.12) {
+  if (modelIndex?.type === "bvh") {
+    return closestModelDistanceBvh(point, modelIndex, surfaceTolerance);
+  }
+
   let minSquared = Infinity;
   const toleranceSquared = surfaceTolerance * surfaceTolerance;
   const maxRadiusBins = Math.max(1, Math.min(8, Math.ceil((surfaceTolerance * 6) / modelIndex.binSize)));
@@ -4286,6 +4594,21 @@ function closestModelDistance(point, modelIndex, surfaceTolerance = 0.12) {
     if (candidates.length && radiusBins >= 2) break;
   }
   return Number.isFinite(minSquared) ? Math.sqrt(minSquared) : surfaceTolerance * 2;
+}
+
+function closestModelDistanceBvh(point, modelIndex, surfaceTolerance = 0.12) {
+  modelIndex.localPoint
+    .set(point.x, point.y, point.z)
+    .applyMatrix4(modelIndex.inverseMatrix);
+  const closest = modelIndex.mesh.geometry.boundsTree.closestPointToPoint(
+    modelIndex.localPoint,
+    modelIndex.closestTarget
+  );
+  if (!closest?.point) return surfaceTolerance * 2;
+  modelIndex.closestWorldPoint
+    .copy(closest.point)
+    .applyMatrix4(modelIndex.matrixWorld);
+  return modelIndex.closestWorldPoint.distanceTo(modelIndex.rayOrigin.set(point.x, point.y, point.z));
 }
 
 function pointTriangleDistanceSquared(point, a, b, c) {
@@ -4435,7 +4758,6 @@ function cncSettings() {
 }
 
 function estimateCncReferenceZ(settings) {
-  const meshPayload = buildMeshPayload();
   const resolution = Math.max(settings.resolution, 3);
   const nx = Math.max(2, Math.ceil(settings.width / resolution));
   const ny = Math.max(2, Math.ceil(settings.depth / resolution));
@@ -4445,15 +4767,19 @@ function estimateCncReferenceZ(settings) {
   const yMin = -settings.depth / 2;
   const undersideZ = new Float64Array(nx * ny);
   undersideZ.fill(Infinity);
-  const vertices = meshPayload.vertices;
-  const triangleCount = Math.floor(vertices.length / 9);
 
-  for (let triangleIndex = 0; triangleIndex < triangleCount; triangleIndex += 1) {
-    const offset = triangleIndex * 9;
-    const a = { x: vertices[offset], y: vertices[offset + 1], z: vertices[offset + 2] };
-    const b = { x: vertices[offset + 3], y: vertices[offset + 4], z: vertices[offset + 5] };
-    const c = { x: vertices[offset + 6], y: vertices[offset + 7], z: vertices[offset + 8] };
-    rasterizeTriangleUnderside(a, b, c, undersideZ, nx, ny, xMin, yMin, dx, dy);
+  if (!fillCncUndersideWithBvh(undersideZ, nx, ny, xMin, yMin, dx, dy)) {
+    const meshPayload = buildMeshPayload();
+    const vertices = meshPayload.vertices;
+    const triangleCount = Math.floor(vertices.length / 9);
+
+    for (let triangleIndex = 0; triangleIndex < triangleCount; triangleIndex += 1) {
+      const offset = triangleIndex * 9;
+      const a = { x: vertices[offset], y: vertices[offset + 1], z: vertices[offset + 2] };
+      const b = { x: vertices[offset + 3], y: vertices[offset + 4], z: vertices[offset + 5] };
+      const c = { x: vertices[offset + 6], y: vertices[offset + 7], z: vertices[offset + 8] };
+      rasterizeTriangleUnderside(a, b, c, undersideZ, nx, ny, xMin, yMin, dx, dy);
+    }
   }
 
   let referenceZ = -Infinity;
@@ -4467,7 +4793,6 @@ function estimateCncReferenceZ(settings) {
 
 async function buildCncFoamRelief(settings, report = null) {
   applyCncModelPlacement(settings);
-  const meshPayload = buildMeshPayload();
   const nx = Math.max(2, Math.ceil(settings.width / settings.resolution));
   const ny = Math.max(2, Math.ceil(settings.depth / settings.resolution));
   const dx = settings.width / nx;
@@ -4478,17 +4803,21 @@ async function buildCncFoamRelief(settings, report = null) {
   const undersideZ = new Float64Array(cellCount);
   undersideZ.fill(Infinity);
 
-  const vertices = meshPayload.vertices;
-  const triangleCount = Math.floor(vertices.length / 9);
-  const progressStride = Math.max(1, Math.floor(triangleCount / 24));
-  for (let triangleIndex = 0; triangleIndex < triangleCount; triangleIndex += 1) {
-    const offset = triangleIndex * 9;
-    const a = { x: vertices[offset], y: vertices[offset + 1], z: vertices[offset + 2] };
-    const b = { x: vertices[offset + 3], y: vertices[offset + 4], z: vertices[offset + 5] };
-    const c = { x: vertices[offset + 6], y: vertices[offset + 7], z: vertices[offset + 8] };
-    rasterizeTriangleUnderside(a, b, c, undersideZ, nx, ny, xMin, yMin, dx, dy);
-    if (report && triangleIndex % progressStride === 0) {
-      await report(`Sampling CNC relief triangle ${triangleIndex.toLocaleString()} of ${triangleCount.toLocaleString()}...`);
+  const bvhSampled = await fillCncUndersideWithBvhAsync(undersideZ, nx, ny, xMin, yMin, dx, dy, report);
+  if (!bvhSampled) {
+    const meshPayload = buildMeshPayload();
+    const vertices = meshPayload.vertices;
+    const triangleCount = Math.floor(vertices.length / 9);
+    const progressStride = Math.max(1, Math.floor(triangleCount / 24));
+    for (let triangleIndex = 0; triangleIndex < triangleCount; triangleIndex += 1) {
+      const offset = triangleIndex * 9;
+      const a = { x: vertices[offset], y: vertices[offset + 1], z: vertices[offset + 2] };
+      const b = { x: vertices[offset + 3], y: vertices[offset + 4], z: vertices[offset + 5] };
+      const c = { x: vertices[offset + 6], y: vertices[offset + 7], z: vertices[offset + 8] };
+      rasterizeTriangleUnderside(a, b, c, undersideZ, nx, ny, xMin, yMin, dx, dy);
+      if (report && triangleIndex % progressStride === 0) {
+        await report(`Sampling CNC relief triangle ${triangleIndex.toLocaleString()} of ${triangleCount.toLocaleString()}...`);
+      }
     }
   }
 
@@ -4514,7 +4843,7 @@ async function buildCncFoamRelief(settings, report = null) {
   }
 
   const effectivePlacementOffsetMm = settings.autoLiftEnabled
-    ? maxRequiredDepth - settings.allowedDepthMm
+    ? Math.max(0, maxRequiredDepth - settings.allowedDepthMm)
     : settings.modelLiftMm;
   settings.modelPlacementOffsetMm = Math.round(effectivePlacementOffsetMm * 2) / 2;
   settings.modelLiftMm = Math.max(0, settings.modelPlacementOffsetMm);
@@ -4623,6 +4952,67 @@ async function buildCncFoamRelief(settings, report = null) {
   };
 
   return { mesh: foamMesh, unreachableMesh, intersectionMesh, qa };
+}
+
+async function fillCncUndersideWithBvhAsync(undersideZ, nx, ny, xMin, yMin, dx, dy, report = null) {
+  const sampler = createCncBvhEnvelopeSampler();
+  if (!sampler) return false;
+  const progressStride = Math.max(1, Math.floor(ny / 24));
+  for (let iy = 0; iy < ny; iy += 1) {
+    sampler.sampleRow(undersideZ, nx, iy, xMin, yMin, dx, dy);
+    if (report && iy % progressStride === 0) {
+      await report(`Sampling CNC relief with BVH row ${iy.toLocaleString()} of ${ny.toLocaleString()}...`);
+    }
+  }
+  return true;
+}
+
+function fillCncUndersideWithBvh(undersideZ, nx, ny, xMin, yMin, dx, dy) {
+  const sampler = createCncBvhEnvelopeSampler();
+  if (!sampler) return false;
+  for (let iy = 0; iy < ny; iy += 1) {
+    sampler.sampleRow(undersideZ, nx, iy, xMin, yMin, dx, dy);
+  }
+  return true;
+}
+
+function createCncBvhEnvelopeSampler() {
+  if (!state.modelMesh?.geometry?.boundsTree) return null;
+  state.modelMesh.updateMatrixWorld(true);
+  const bounds = new THREE.Box3().setFromObject(state.modelMesh);
+  if (bounds.isEmpty()) return null;
+  const inverseMatrix = state.modelMesh.matrixWorld.clone().invert();
+  const matrixWorld = state.modelMesh.matrixWorld.clone();
+  const ray = new THREE.Ray();
+  const localOrigin = new THREE.Vector3();
+  const localDirection = new THREE.Vector3(0, 0, -1).transformDirection(inverseMatrix);
+  const worldPoint = new THREE.Vector3();
+  const zStart = bounds.max.z + 5;
+  const far = Math.max(1, bounds.max.z - bounds.min.z + 10);
+  const margin = 0.0001;
+
+  return {
+    sampleRow(undersideZ, nx, iy, xMin, yMin, dx, dy) {
+      const y = yMin + (iy + 0.5) * dy;
+      if (y < bounds.min.y - margin || y > bounds.max.y + margin) return;
+      const ixStart = Math.max(0, Math.floor((bounds.min.x - margin - xMin) / dx));
+      const ixEnd = Math.min(nx - 1, Math.ceil((bounds.max.x + margin - xMin) / dx));
+      for (let ix = ixStart; ix <= ixEnd; ix += 1) {
+        const x = xMin + (ix + 0.5) * dx;
+        if (x < bounds.min.x - margin || x > bounds.max.x + margin) continue;
+        localOrigin.set(x, y, zStart).applyMatrix4(inverseMatrix);
+        ray.origin.copy(localOrigin);
+        ray.direction.copy(localDirection);
+        const hits = state.modelMesh.geometry.boundsTree.raycast(ray, THREE.DoubleSide, 0, far);
+        let minZ = Infinity;
+        for (const hit of hits) {
+          worldPoint.copy(hit.point).applyMatrix4(matrixWorld);
+          if (worldPoint.z < minZ) minZ = worldPoint.z;
+        }
+        if (Number.isFinite(minZ)) undersideZ[iy * nx + ix] = minZ;
+      }
+    },
+  };
 }
 
 function fillEnclosedCncFootprintVoids(undersideZ, nx, ny) {
@@ -4981,8 +5371,8 @@ async function autoFitCncLift() {
     });
     maxRequiredDepth = probe.qa.max_required_depth_mm;
   }
-  const placementOffset = Math.round((maxRequiredDepth - settings.allowedDepthMm) * 2) / 2;
-  const displayLift = Math.max(0, placementOffset);
+  const placementOffset = Math.max(0, Math.round((maxRequiredDepth - settings.allowedDepthMm) * 2) / 2);
+  const displayLift = placementOffset;
   controlsEl.cncModelLift.value = String(Math.min(Number(controlsEl.cncModelLift.max) || 120, displayLift));
   clearCncPreview();
   settings.modelPlacementOffsetMm = placementOffset;
@@ -5075,6 +5465,7 @@ function buildSupportJobPayload() {
       source: support.source,
       point: support.worldPoint.toArray(),
       normal: support.worldNormal.toArray(),
+      radius: support.radiusMm ?? supportBrushRadiusMm(),
     })),
   };
 }
@@ -5276,7 +5667,7 @@ function collectSupportConfig() {
     support_threshold_angle: Number(controlsEl.supportThresholdAngle.value),
     support_threshold_overlap: DEFAULT_SUPPORT_CONFIG.support_threshold_overlap ?? "50%",
     support_on_build_plate_only: false,
-    support_critical_regions_only: controlsEl.supportCriticalRegionsOnly.checked,
+    support_critical_regions_only: false,
     support_remove_small_overhang: controlsEl.supportRemoveSmallOverhang.checked,
     support_top_z_distance: Number(controlsEl.supportTopZDistance.value),
     support_bottom_z_distance: Number(controlsEl.supportTopZDistance.value),
@@ -5301,6 +5692,7 @@ function collectCradleConfig() {
   return {
     base_enabled: controlsEl.baseEnabled.checked,
     join_uprights_bottom_enabled: controlsEl.baseJoinUprights.checked,
+    support_blocker_cuts_base: Boolean(controlsEl.supportBlockCutsBase?.checked),
     base_margin_mm: Number(controlsEl.baseMargin.value),
     base_thickness_mm: Number(controlsEl.baseThickness.value),
   };
@@ -5316,17 +5708,39 @@ function updateManualMarkers() {
   }
 
   for (const support of realizedManualSupports()) {
-    const marker = new THREE.Mesh(
-      new THREE.SphereGeometry(2.8, 16, 8),
-      materialMarkerManual
-    );
-    marker.position.copy(support.worldPoint);
-    marker.userData.supportId = support.id;
-    markerGroup.add(marker);
-    state.supportMarkerObjects.set(support.id, marker);
+    addRealizedManualMarker(support);
   }
 
   updateButtons();
+}
+
+function addManualMarker(support) {
+  if (!state.modelMesh || !support) return;
+  addRealizedManualMarker(realizedManualSupport(support));
+}
+
+function addRealizedManualMarker(support) {
+  const isPaintEnforce = support.source === "paint_enforce";
+  const isPaintBlock = support.source === "paint_block";
+  const markerMaterial = isPaintBlock ? materialMarkerBlock : isPaintEnforce ? materialMarkerEnforce : materialMarkerManual;
+  const markerRadius = isPaintBlock || isPaintEnforce
+    ? Math.max(0.5, support.radiusMm || supportBrushRadiusMm())
+    : 2.8;
+  const markerGeometry = isPaintBlock || isPaintEnforce
+    ? new THREE.CircleGeometry(markerRadius, 32)
+    : new THREE.SphereGeometry(markerRadius, 18, 10);
+  const marker = new THREE.Mesh(markerGeometry, markerMaterial);
+  if (isPaintBlock || isPaintEnforce) {
+    marker.position.copy(support.worldPoint).addScaledVector(support.worldNormal, 0.16);
+    marker.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), support.worldNormal.clone().normalize());
+    marker.renderOrder = 12;
+    marker.visible = state.supportPaintMode !== "off";
+  } else {
+    marker.position.copy(support.worldPoint);
+  }
+  marker.userData.supportId = support.id;
+  markerGroup.add(marker);
+  state.supportMarkerObjects.set(support.id, marker);
 }
 
 function clearGeneratedSupport() {
@@ -5351,12 +5765,14 @@ function clearGeneratedSupport() {
 }
 
 function realizedManualSupports() {
+  return state.manualSupports.map((support) => realizedManualSupport(support));
+}
+
+function realizedManualSupport(support) {
   const normalMatrix = new THREE.Matrix3().getNormalMatrix(state.modelMesh.matrixWorld);
-  return state.manualSupports.map((support) => {
-    const worldPoint = state.modelMesh.localToWorld(support.localPoint.clone());
-    const worldNormal = support.localNormal.clone().applyMatrix3(normalMatrix).normalize();
-    return { ...support, worldPoint, worldNormal };
-  });
+  const worldPoint = state.modelMesh.localToWorld(support.localPoint.clone());
+  const worldNormal = support.localNormal.clone().applyMatrix3(normalMatrix).normalize();
+  return { ...support, worldPoint, worldNormal };
 }
 
 function updateOutputs() {
@@ -5365,6 +5781,12 @@ function updateOutputs() {
   outputs.supportTopZDistance.textContent = `${controlsEl.supportTopZDistance.value} mm`;
   outputs.supportObjectXYDistance.textContent = `${controlsEl.supportObjectXYDistance.value} mm`;
   outputs.supportEdgeClearance.textContent = `${controlsEl.supportEdgeClearance.value} mm`;
+  if (outputs.supportOpacity && controlsEl.supportOpacity) {
+    outputs.supportOpacity.textContent = `${Math.round(Number(controlsEl.supportOpacity.value) || 100)}%`;
+  }
+  if (outputs.supportBrushRadius && controlsEl.supportBrushRadius) {
+    outputs.supportBrushRadius.textContent = `${formatStatusNumber(supportBrushDiameterMm())} mm diameter`;
+  }
   outputs.treeSupportBranchDistance.textContent = `${controlsEl.treeSupportBranchDistance.value} mm`;
   outputs.treeSupportBranchAngle.textContent = `${controlsEl.treeSupportBranchAngle.value} deg`;
   outputs.baseMargin.textContent = `${controlsEl.baseMargin.value} mm`;
@@ -5408,16 +5830,34 @@ function updateButtons() {
       controlsEl.modelDisplayMode.value = state.modelDisplayMode;
     }
   }
+  if (controlsEl.supportDisplayMode) {
+    controlsEl.supportDisplayMode.disabled = generatedSupportTriangles === 0 && generatedInterfaceTriangles === 0;
+    if (controlsEl.supportDisplayMode.value !== state.supportDisplayMode) {
+      controlsEl.supportDisplayMode.value = state.supportDisplayMode;
+    }
+  }
+  if (controlsEl.supportOpacity) {
+    controlsEl.supportOpacity.disabled = generatedSupportTriangles === 0 && generatedInterfaceTriangles === 0;
+  }
+  if (controlsEl.supportPaintMode) {
+    controlsEl.supportPaintMode.disabled = !hasModel;
+    if (controlsEl.supportPaintMode.value !== state.supportPaintMode) {
+      controlsEl.supportPaintMode.value = state.supportPaintMode;
+    }
+  }
+  if (controlsEl.supportBrushRadius) {
+    controlsEl.supportBrushRadius.disabled = !hasModel;
+  }
+  if (controlsEl.supportBlockCutsBase) {
+    controlsEl.supportBlockCutsBase.disabled = !hasModel;
+  }
+  if (controlsEl.clearPaint) {
+    controlsEl.clearPaint.disabled = !state.manualSupports.some((support) => support.source === "paint_enforce" || support.source === "paint_block");
+  }
   controlsEl.orientModel.disabled = !hasModel;
   controlsEl.resetOrientation.disabled = !hasModel;
   if (controlsEl.applyRotationPreset) {
     controlsEl.applyRotationPreset.disabled = !hasModel;
-  }
-  if (controlsEl.toggleManualSupport) {
-    controlsEl.toggleManualSupport.disabled = !hasModel;
-    controlsEl.toggleManualSupport.textContent = state.manualSupportMode ? "Manual marks on" : "Manual marks off";
-    controlsEl.toggleManualSupport.setAttribute("aria-pressed", state.manualSupportMode ? "true" : "false");
-    controlsEl.toggleManualSupport.dataset.active = state.manualSupportMode ? "true" : "false";
   }
   controlsEl.generateSupports.disabled = !hasModel;
   if (controlsEl.cncGenerate) controlsEl.cncGenerate.disabled = !hasModel;
@@ -5427,7 +5867,9 @@ function updateButtons() {
     controlsEl.toggleCoverage.disabled = !state.coverage?.cells?.length;
     controlsEl.toggleCoverage.textContent = state.coverageVisible ? "Hide coverage" : "Show coverage";
   }
-  controlsEl.clearManual.disabled = !state.manualSupports.length;
+  if (controlsEl.clearManual) {
+    controlsEl.clearManual.disabled = !state.manualSupports.some((support) => support.source === "manual");
+  }
   controlsEl.exportStl.disabled = generatedSupportTriangles === 0;
   if (controlsEl.exportPly) controlsEl.exportPly.disabled = generatedSupportTriangles === 0;
   if (controlsEl.exportInterfaceStl) controlsEl.exportInterfaceStl.disabled = generatedInterfaceTriangles === 0;
@@ -5445,7 +5887,7 @@ function updateButtons() {
   } else {
     supportStatus.textContent = totalGeneratedTriangles
       ? `${generatedSupportTriangles.toLocaleString()} cradle + ${generatedInterfaceTriangles.toLocaleString()} interface triangles`
-      : `${supportCount} manual marks`;
+      : `${supportCount} coverage marks`;
   }
 }
 
@@ -5574,6 +6016,9 @@ function setSplitStatus(message, stateName = "idle") {
 
 function setJobProgress(value) {
   setProgress(controlsEl.jobProgressShell, controlsEl.jobProgress, value);
+  if (Number(value) >= 100) {
+    window.setTimeout(() => resetProgress(controlsEl.jobProgressShell, controlsEl.jobProgress), 250);
+  }
 }
 
 function setSplitProgress(value) {
@@ -5644,6 +6089,32 @@ function applyModelDisplayMode(mode) {
   updateButtons();
 }
 
+function applySupportDisplayMode(mode) {
+  const normalized = ["solid", "ghost", "hidden"].includes(mode) ? mode : "solid";
+  state.supportDisplayMode = normalized;
+  if (controlsEl.supportDisplayMode && controlsEl.supportDisplayMode.value !== normalized) {
+    controlsEl.supportDisplayMode.value = normalized;
+  }
+  supportGroup.visible = normalized !== "hidden";
+  applySupportMaterialOpacity();
+}
+
+function applySupportOpacity(opacity) {
+  state.supportOpacity = Math.max(0.1, Math.min(1, Number(opacity) || 1));
+  applySupportMaterialOpacity();
+}
+
+function applySupportMaterialOpacity() {
+  const ghost = state.supportDisplayMode === "ghost";
+  const opacity = ghost ? Math.min(state.supportOpacity, 0.42) : state.supportOpacity;
+  for (const material of [materialSupport, materialInterface]) {
+    material.transparent = opacity < 0.995 || ghost;
+    material.opacity = opacity;
+    material.depthWrite = opacity >= 0.995 && !ghost;
+    material.needsUpdate = true;
+  }
+}
+
 function toggleCoverageOverlay() {
   if (!state.coverage?.cells?.length) return;
   state.coverageVisible = !state.coverageVisible;
@@ -5651,9 +6122,18 @@ function toggleCoverageOverlay() {
   updateButtons();
 }
 
+function clearPaintedCoverageMarks() {
+  state.manualSupports = state.manualSupports.filter((support) => support.source !== "paint_enforce" && support.source !== "paint_block");
+  clearGeneratedSupport();
+  updateManualMarkers();
+}
+
 function toggleManualSupportMode() {
   if (!state.modelMesh) return;
   state.manualSupportMode = !state.manualSupportMode;
+  if (state.manualSupportMode) {
+    state.supportPaintMode = "off";
+  }
   modelStatus.textContent = state.manualSupportMode
     ? "Manual mark mode on; click the object to add marks, Alt-click a mark to remove it"
     : "Manual mark mode off";

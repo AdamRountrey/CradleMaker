@@ -295,6 +295,10 @@ button[data-active="true"] {
   grid-column: 1 / -1;
 }
 
+.button-grid .progress-shell {
+  grid-column: 1 / -1;
+}
+
 .export-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
