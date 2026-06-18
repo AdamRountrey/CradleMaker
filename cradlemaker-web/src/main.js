@@ -22,6 +22,9 @@ const SPLIT_SLIVER_ASPECT_RATIO = 60;
 const SPLIT_SLIVER_MAX_THICKNESS_MM = 0.16;
 const SPLIT_CONNECTOR_SLIVER_MIN_EDGE_MM = 0.18;
 const SPLIT_CONNECTOR_SLIVER_MAX_DISTANCE_MM = 0.9;
+const DOVETAIL_GAP_HAIR_ASPECT_RATIO = 30;
+const DOVETAIL_GAP_HAIR_MAX_THICKNESS_MM = 0.35;
+const DOVETAIL_GAP_HAIR_MIN_EDGE_MM = 2;
 const DEFAULT_SUPPORT_CONFIG = defaultOrcaSupportConfig();
 const MESH_COORDINATE_PRECISION = 100000;
 const STABLE_SUPPORT_TYPE = "normal(auto)";
@@ -472,6 +475,7 @@ function bindControls() {
   controlsEl.previewSplit?.addEventListener("click", () => {
     previewSplitPlan().catch((error) => {
       console.error(error);
+      restoreOriginalCradleAfterSplitFailure();
       setSplitStatus(`Split preview failed: ${error?.message || error}`, "error");
       setSplitProgress(100);
       updateButtons();
@@ -1482,6 +1486,11 @@ async function previewSplitPlan() {
   setSplitStatus("Rendering split preview...", "working");
   await nextFrame();
   renderSplitChunks(plan);
+  const renderedSplitMeshes = splitGroup.children.filter((child) => child?.isMesh && child.visible !== false).length;
+  if (!renderedSplitMeshes) {
+    restoreOriginalCradleAfterSplitFailure();
+    throw new Error("split preview produced no visible chunk meshes");
+  }
   setSplitProgress(98);
   state.splitPlan = plan;
   state.splitChunks = plan.chunks;
@@ -1502,7 +1511,8 @@ async function previewSplitPlan() {
   } else if (oversizedCount > 0) {
     setSplitStatus(`Split made ${chunkText} with ${connectorText}, but ${oversizedCount.toLocaleString()} still exceed the usable build volume. Smaller margins or manual seam placement will be needed.${shallowText}${roofText} ${splitQaText} ${gapQaText}`, "error");
   } else {
-    setSplitStatus(`Split made ${chunkText} with ${connectorText}. Boolean chunk cuts are watertight; sockets and keys use adaptive sloped roofs.${shallowText}${roofText} ${splitQaText} ${gapQaText}`, plan.qa?.intersects_model || lowRoofCount || plan.gapQa?.count ? "error" : "pending");
+    const advisoryText = `${shallowText}${roofText}`;
+    setSplitStatus(`Split made ${chunkText} with ${connectorText}. Boolean chunk cuts are watertight; sockets and keys use adaptive sloped roofs.${advisoryText} ${splitQaText} ${gapQaText}`, plan.qa?.intersects_model ? "error" : "pending");
   }
 
   setSplitProgress(100);
@@ -1518,6 +1528,14 @@ function clearSplitPreview() {
   resetProgress(controlsEl.splitProgressShell, controlsEl.splitProgress);
   setSplitStatus(state.supportMesh ? "Generate a split preview to check build-plate fit." : "Generate a cradle to check build-plate fit.", "idle");
   updateButtons();
+}
+
+function restoreOriginalCradleAfterSplitFailure() {
+  splitGroup.clear();
+  state.splitChunks = [];
+  state.splitPlan = null;
+  state.splitPreviewVisible = false;
+  supportGroup.visible = state.supportDisplayMode !== "hidden";
 }
 
 function applySplitPlatePreset() {
@@ -1887,16 +1905,19 @@ function addZSlideDovetails(chunks, sourceBounds, settings, sourceMesh) {
   const byGrid = new Map(chunks.map((chunk) => [`${chunk.grid.x}:${chunk.grid.y}:${chunk.grid.z}`, chunk]));
   const connectors = [];
   const modelTriangles = state.modelMesh ? modelTrianglesForQa() : [];
+  const sourceTopSampler = sourceMesh
+    ? buildSupportTopSampler(sourceMesh, Math.max(0.75, sourceMesh.cell_size_mm ?? 1))
+    : null;
 
   for (const chunk of chunks) {
     const right = byGrid.get(`${chunk.grid.x + 1}:${chunk.grid.y}:${chunk.grid.z}`);
     if (right) {
-      const connector = addZSlideDovetailPair(chunk, right, "x", sourceBounds, settings, sourceMesh, modelTriangles, connectors.length + 1);
+      const connector = addZSlideDovetailPair(chunk, right, "x", sourceBounds, settings, sourceMesh, modelTriangles, connectors.length + 1, sourceTopSampler);
       if (connector) connectors.push(connector);
     }
     const back = byGrid.get(`${chunk.grid.x}:${chunk.grid.y + 1}:${chunk.grid.z}`);
     if (back) {
-      const connector = addZSlideDovetailPair(chunk, back, "y", sourceBounds, settings, sourceMesh, modelTriangles, connectors.length + 1);
+      const connector = addZSlideDovetailPair(chunk, back, "y", sourceBounds, settings, sourceMesh, modelTriangles, connectors.length + 1, sourceTopSampler);
       if (connector) connectors.push(connector);
     }
   }
@@ -1910,7 +1931,7 @@ function addZSlideDovetails(chunks, sourceBounds, settings, sourceMesh) {
   return connectors;
 }
 
-function addZSlideDovetailPair(maleChunk, femaleChunk, axis, sourceBounds, settings, sourceMesh, modelTriangles, index) {
+function addZSlideDovetailPair(maleChunk, femaleChunk, axis, sourceBounds, settings, sourceMesh, modelTriangles, index, sourceTopSampler = null) {
   const size = settings.connectorSize;
   const clearance = settings.connectorClearance;
   const label = `D${String(index).padStart(2, "0")}`;
@@ -1926,11 +1947,11 @@ function addZSlideDovetailPair(maleChunk, femaleChunk, axis, sourceBounds, setti
     const yCenter = overlapCenter(maleChunk.bounds.min.y, maleChunk.bounds.max.y, femaleChunk.bounds.min.y, femaleChunk.bounds.max.y);
     dimensions = connectorDimensionsForZRange({ min: sourceBounds.min.z, max: sourceBounds.min.z + size }, settings);
     ({ maleFootprint, socketFootprint, side } = buildDovetailFootprints(axis, seam, yCenter, dimensions, clearance));
-    zRange = connectorZRange(sourceMesh, sourceBounds, settings, [maleFootprint, socketFootprint], modelTriangles);
+    zRange = connectorZRange(sourceMesh, sourceBounds, settings, [maleFootprint, socketFootprint], modelTriangles, sourceTopSampler);
     if (!zRange) return null;
     dimensions = connectorDimensionsForZRange(zRange, settings);
     ({ maleFootprint, maleRoofFootprint, socketFootprint, side } = buildDovetailFootprints(axis, seam, yCenter, dimensions, clearance));
-    zRange = connectorZRange(sourceMesh, sourceBounds, settings, [maleFootprint, socketFootprint], modelTriangles);
+    zRange = connectorZRange(sourceMesh, sourceBounds, settings, [maleFootprint, socketFootprint], modelTriangles, sourceTopSampler);
     if (!zRange) return null;
     dimensions = connectorDimensionsForZRange(zRange, settings);
     ({ maleFootprint, maleRoofFootprint, socketFootprint, side } = buildDovetailFootprints(axis, seam, yCenter, dimensions, clearance));
@@ -1954,11 +1975,11 @@ function addZSlideDovetailPair(maleChunk, femaleChunk, axis, sourceBounds, setti
     const xCenter = overlapCenter(maleChunk.bounds.min.x, maleChunk.bounds.max.x, femaleChunk.bounds.min.x, femaleChunk.bounds.max.x);
     dimensions = connectorDimensionsForZRange({ min: sourceBounds.min.z, max: sourceBounds.min.z + size }, settings);
     ({ maleFootprint, socketFootprint, side } = buildDovetailFootprints(axis, seam, xCenter, dimensions, clearance));
-    zRange = connectorZRange(sourceMesh, sourceBounds, settings, [maleFootprint, socketFootprint], modelTriangles);
+    zRange = connectorZRange(sourceMesh, sourceBounds, settings, [maleFootprint, socketFootprint], modelTriangles, sourceTopSampler);
     if (!zRange) return null;
     dimensions = connectorDimensionsForZRange(zRange, settings);
     ({ maleFootprint, maleRoofFootprint, socketFootprint, side } = buildDovetailFootprints(axis, seam, xCenter, dimensions, clearance));
-    zRange = connectorZRange(sourceMesh, sourceBounds, settings, [maleFootprint, socketFootprint], modelTriangles);
+    zRange = connectorZRange(sourceMesh, sourceBounds, settings, [maleFootprint, socketFootprint], modelTriangles, sourceTopSampler);
     if (!zRange) return null;
     dimensions = connectorDimensionsForZRange(zRange, settings);
     ({ maleFootprint, maleRoofFootprint, socketFootprint, side } = buildDovetailFootprints(axis, seam, xCenter, dimensions, clearance));
@@ -2122,9 +2143,9 @@ function connectorDimensionsForZRange(zRange, settings) {
   };
 }
 
-function connectorZRange(sourceMesh, sourceBounds, settings, footprints, modelTriangles = []) {
+function connectorZRange(sourceMesh, sourceBounds, settings, footprints, modelTriangles = [], sourceTopSampler = null) {
   const bottom = sourceBounds.min.z;
-  let localTop = connectorLocalTop(sourceMesh, footprints, settings);
+  let localTop = connectorLocalTop(sourceMesh, footprints, settings, sourceTopSampler);
   const modelBottom = connectorModelBottom(modelTriangles, footprints, settings);
   if (Number.isFinite(modelBottom)) localTop = Math.min(localTop, modelBottom);
   if (!Number.isFinite(localTop)) return null;
@@ -2132,7 +2153,7 @@ function connectorZRange(sourceMesh, sourceBounds, settings, footprints, modelTr
   const maxHeight = localTop - bottom - topClearance;
   const minHeight = Math.max(0.9, settings.connectorClearance * 2.5, (sourceMesh?.cell_size_mm ?? 1) * 0.75);
   if (maxHeight < minHeight) return null;
-  const preferredHeight = Math.max(minHeight, Math.min(settings.connectorSize * 4, maxHeight * 0.45));
+  const preferredHeight = Math.max(minHeight, Math.min(settings.connectorSize * 4, Math.max(settings.connectorSize, maxHeight)));
   const height = Math.min(maxHeight, preferredHeight);
   return {
     min: bottom,
@@ -2185,16 +2206,25 @@ function roofZAtPoint(point, roof) {
   return roof.zMax - roof.rise + Math.max(0, Math.min(1, t)) * roof.rise;
 }
 
-function connectorLocalTop(sourceMesh, footprints, settings) {
+function connectorLocalTop(sourceMesh, footprints, settings, sampler = null) {
   const spacing = Math.max(0.8, Math.min(settings.connectorSize * 0.35, sourceMesh?.cell_size_mm ?? 2));
   const samples = sampleFootprints(footprints, spacing);
-  let localTop = Infinity;
+  const tops = [];
   for (const sample of samples) {
-    const top = supportTopAtXY(sourceMesh, sample.x, sample.y);
-    if (!Number.isFinite(top)) return -Infinity;
-    localTop = Math.min(localTop, top);
+    const top = supportTopAtXY(sourceMesh, sample.x, sample.y, sampler);
+    if (Number.isFinite(top)) tops.push(top);
   }
-  return localTop;
+  if (!tops.length) return -Infinity;
+
+  tops.sort((a, b) => a - b);
+  const coverage = tops.length / Math.max(1, samples.length);
+  if (coverage < 0.35) return -Infinity;
+
+  const lowOutlierTrim = Math.max(0, Math.min(tops.length - 1, Math.floor(tops.length * 0.2)));
+  const robustIndex = Math.max(lowOutlierTrim, Math.min(tops.length - 1, Math.floor(tops.length * 0.35)));
+  const robustTop = tops[robustIndex];
+  const medianTop = tops[Math.floor(tops.length / 2)];
+  return Math.min(medianTop, Math.max(robustTop, medianTop - settings.connectorSize * 0.75));
 }
 
 function sampleFootprints(footprints, spacing) {
@@ -4136,6 +4166,8 @@ function evaluateDovetailGapSpanQa(plan) {
   const chunkById = new Map((plan.chunks ?? []).map((chunk) => [chunk.id, chunk]));
   for (const connector of plan.connectors ?? []) {
     if (!Number.isFinite(connector.seam_mm)) continue;
+    const bounds = expandedDovetailQaBounds(connector);
+    if (!bounds) continue;
     for (const chunkId of [connector.male_chunk, connector.female_chunk]) {
       const chunk = chunkById.get(chunkId);
       if (!chunk?.mesh) continue;
@@ -4147,7 +4179,11 @@ function evaluateDovetailGapSpanQa(plan) {
           meshVertex(mesh, mesh.triangles[index + 1]),
           meshVertex(mesh, mesh.triangles[index + 2]),
         ];
+        if (!triangleOverlapsBounds(tri, bounds)) continue;
+        const metrics = triangleQualityMetrics(tri[0], tri[1], tri[2]);
+        if (!isDovetailGapHairTriangle(metrics)) continue;
         for (const [a, b] of [[tri[0], tri[1]], [tri[1], tri[2]], [tri[2], tri[0]]]) {
+          if (!edgeOverlapsBounds(a, b, bounds)) continue;
           const span = dovetailClearanceBandEdge(connector, chunkId, a, b);
           if (!span) continue;
           ++count;
@@ -4172,6 +4208,54 @@ function evaluateDovetailGapSpanQa(plan) {
   return { count, worst, samples };
 }
 
+function isDovetailGapHairTriangle(metrics) {
+  return metrics.aspectRatio >= DOVETAIL_GAP_HAIR_ASPECT_RATIO &&
+    metrics.altitude <= DOVETAIL_GAP_HAIR_MAX_THICKNESS_MM &&
+    metrics.longestEdge >= DOVETAIL_GAP_HAIR_MIN_EDGE_MM &&
+    metrics.area > 1e-8;
+}
+
+function expandedDovetailQaBounds(connector) {
+  const bounds = connector.footprint_bounds_mm;
+  if (!bounds) return null;
+  const margin = Math.max(0.8, (connector.clearance_mm ?? 0.3) * 2);
+  const zMargin = Math.max(0.8, (connector.clearance_mm ?? 0.3) * 2);
+  return {
+    min: {
+      x: bounds.min.x - margin,
+      y: bounds.min.y - margin,
+      z: connector.z_range_mm.min - zMargin,
+    },
+    max: {
+      x: bounds.max.x + margin,
+      y: bounds.max.y + margin,
+      z: connector.z_range_mm.max + zMargin,
+    },
+  };
+}
+
+function triangleOverlapsBounds(triangle, bounds) {
+  const min = {
+    x: Math.min(triangle[0].x, triangle[1].x, triangle[2].x),
+    y: Math.min(triangle[0].y, triangle[1].y, triangle[2].y),
+    z: Math.min(triangle[0].z, triangle[1].z, triangle[2].z),
+  };
+  const max = {
+    x: Math.max(triangle[0].x, triangle[1].x, triangle[2].x),
+    y: Math.max(triangle[0].y, triangle[1].y, triangle[2].y),
+    z: Math.max(triangle[0].z, triangle[1].z, triangle[2].z),
+  };
+  return max.x >= bounds.min.x && min.x <= bounds.max.x &&
+    max.y >= bounds.min.y && min.y <= bounds.max.y &&
+    max.z >= bounds.min.z && min.z <= bounds.max.z;
+}
+
+function edgeOverlapsBounds(a, b, bounds) {
+  return Math.max(a.x, b.x) >= bounds.min.x && Math.min(a.x, b.x) <= bounds.max.x &&
+    Math.max(a.y, b.y) >= bounds.min.y && Math.min(a.y, b.y) <= bounds.max.y &&
+    Math.max(a.z, b.z) >= bounds.min.z && Math.min(a.z, b.z) <= bounds.max.z;
+}
+
 function dovetailClearanceBandEdge(connector, chunkId, a, b) {
   const axis = connector.axis;
   const seam = connector.seam_mm;
@@ -4193,9 +4277,13 @@ function dovetailClearanceBandEdge(connector, chunkId, a, b) {
     return null;
   }
 
+  const endpointAInBand = pointInDovetailClearanceBand(connector, a);
+  const endpointBInBand = pointInDovetailClearanceBand(connector, b);
+  if (!endpointAInBand && !endpointBInBand && !band.crossesBand) return null;
+
   const length = pointDistance(a, b);
   const crossDistance = sideA * sideB < 0 ? Math.abs(sideA) + Math.abs(sideB) : 0;
-  const minLength = Math.max(0.16, (connector.clearance_mm ?? 0.3) * 0.45);
+  const minLength = Math.max(0.5, (connector.clearance_mm ?? 0.3) * 1.4);
   if (length < minLength || band.clearanceLength < minLength) return null;
 
   return { length, crossDistance, clearanceLength: band.clearanceLength, midpoint: band.point, chunkId };
@@ -4203,13 +4291,18 @@ function dovetailClearanceBandEdge(connector, chunkId, a, b) {
 
 function edgeClearanceBandSample(connector, a, b) {
   const samples = [];
+  let previousInBand = null;
+  let crossesBand = false;
   for (const t of [0.08, 0.16, 0.25, 0.35, 0.5, 0.65, 0.75, 0.84, 0.92]) {
     const point = {
       x: a.x + (b.x - a.x) * t,
       y: a.y + (b.y - a.y) * t,
       z: a.z + (b.z - a.z) * t,
     };
-    if (pointInDovetailClearanceBand(connector, point)) samples.push({ t, point });
+    const inBand = pointInDovetailClearanceBand(connector, point);
+    if (previousInBand !== null && previousInBand !== inBand) crossesBand = true;
+    previousInBand = inBand;
+    if (inBand) samples.push({ t, point });
   }
   if (!samples.length) return null;
   const length = pointDistance(a, b);
@@ -4219,6 +4312,7 @@ function edgeClearanceBandSample(connector, a, b) {
   return {
     point: representative.point,
     clearanceLength: Math.max(length * Math.abs(last.t - first.t), length / 9),
+    crossesBand,
   };
 }
 
@@ -4240,7 +4334,7 @@ function formatDovetailGapSpanQaStatus(qa) {
   const detail = worst
     ? ` Worst is ${worst.chunk_id} near ${worst.connector_id}: about ${formatStatusNumber(worst.clearance_length_mm ?? worst.edge_length_mm)} mm lies in the empty connector clearance band.`
     : "";
-  return `Gap QA warning: ${qa.count.toLocaleString()} dovetail clearance-band edge${qa.count === 1 ? "" : "s"} detected.${detail}`;
+  return `Gap QA advisory: ${qa.count.toLocaleString()} possible dovetail clearance-band hair${qa.count === 1 ? "" : "s"} detected.${detail}`;
 }
 
 function formatDimensions(size) {
@@ -6023,6 +6117,9 @@ function setJobProgress(value) {
 
 function setSplitProgress(value) {
   setProgress(controlsEl.splitProgressShell, controlsEl.splitProgress, value);
+  if (Number(value) >= 100) {
+    window.setTimeout(() => resetProgress(controlsEl.splitProgressShell, controlsEl.splitProgress), 250);
+  }
 }
 
 function setProgress(shell, progress, value) {
