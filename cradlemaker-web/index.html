@@ -4,12 +4,13 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>CradleMaker</title>
-    <link rel="stylesheet" href="./src/styles.css?v=brand-logo-1" />
+    <link rel="stylesheet" href="./src/styles.css?v=support-ui-cleanup-1" />
     <script type="importmap">
       {
         "imports": {
           "three": "./vendor/three/build/three.module.js",
-          "three/addons/": "./vendor/three/examples/jsm/"
+          "three/addons/": "./vendor/three/examples/jsm/",
+          "three-mesh-bvh": "./vendor/three-mesh-bvh/index.module.js"
         }
       }
     </script>
@@ -101,10 +102,6 @@
             Import STL
             <input id="model-file" type="file" accept=".stl,model/stl" />
           </label>
-          <label>
-            Sample
-            <select id="sample-model"></select>
-          </label>
           <button id="load-sample" type="button">Load sample</button>
         </details>
 
@@ -162,10 +159,6 @@
           <label>
             Threshold angle <output id="support-threshold-angle-value">40 deg</output>
             <input id="support-threshold-angle" type="range" min="0" max="89" step="1" value="40" />
-          </label>
-          <label class="inline-toggle">
-            <input id="support-critical-regions-only" type="checkbox" />
-            Support critical regions only
           </label>
           <label class="inline-toggle">
             <input id="support-remove-small-overhang" type="checkbox" checked />
@@ -242,40 +235,71 @@
               <input id="tree-support-branch-angle" type="range" min="5" max="85" step="1" value="45" />
             </label>
           </details>
+          <details class="advanced-options">
+            <summary>Cradle</summary>
+            <label class="inline-toggle">
+              <input id="base-enabled" type="checkbox" checked />
+              Add base plate
+            </label>
+            <label class="inline-toggle">
+              <input id="base-join-uprights" type="checkbox" checked />
+              Join uprights at bottom
+            </label>
+            <label>
+              Base margin <output id="base-margin-value">8 mm</output>
+              <input id="base-margin" type="range" min="0" max="40" step="1" value="8" />
+            </label>
+            <label>
+              Base thickness <output id="base-thickness-value">3 mm</output>
+              <input id="base-thickness" type="range" min="0.5" max="20" step="0.5" value="3" />
+            </label>
+          </details>
           <div class="button-grid">
             <button id="generate-supports" type="button">Generate supports</button>
-            <button id="toggle-manual-support" type="button" aria-pressed="false">Manual marks off</button>
+            <div id="job-progress-shell" class="progress-shell" hidden>
+              <progress id="job-progress" max="100" value="0" aria-label="Generate supports progress"></progress>
+            </div>
             <button id="toggle-coverage" type="button">Show coverage</button>
-            <button id="clear-manual" type="button">Clear manual</button>
           </div>
+          <details class="advanced-options">
+            <summary>Review and paint</summary>
+            <label>
+              Support display
+              <select id="support-display-mode">
+                <option value="solid" selected>Solid supports</option>
+                <option value="ghost">Translucent supports</option>
+                <option value="hidden">Hidden supports</option>
+              </select>
+            </label>
+            <label>
+              Support opacity <output id="support-opacity-value">100%</output>
+              <input id="support-opacity" type="range" min="10" max="100" step="5" value="100" />
+            </label>
+            <label>
+              Coverage paint
+              <select id="support-paint-mode">
+                <option value="off" selected>Off</option>
+                <option value="enforce">Needs support</option>
+                <option value="block">No support here</option>
+                <option value="erase">Erase paint</option>
+              </select>
+            </label>
+            <label>
+              Brush size <output id="support-brush-radius-value">4 mm diameter</output>
+              <input id="support-brush-radius" type="range" min="1" max="100" step="0.5" value="4" />
+            </label>
+            <label class="inline-toggle">
+              <input id="support-block-cuts-base" type="checkbox" />
+              No-support paint cuts base plate
+            </label>
+            <button id="clear-paint" type="button">Clear paint</button>
+            <p class="control-note">Paint on the model surface, then regenerate supports. Green paint enforces coverage; red paint removes coverage.</p>
+          </details>
           <div id="qa-dashboard" class="qa-dashboard" aria-label="Cradle QA dashboard"></div>
           <details class="status-details">
             <summary>Details</summary>
             <div id="job-status" class="job-status" role="status">Support core ready check has not run.</div>
           </details>
-          <div id="job-progress-shell" class="progress-shell" hidden>
-            <progress id="job-progress" max="100" value="0" aria-label="Generate supports progress"></progress>
-          </div>
-        </details>
-
-        <details class="control-block print-workflow">
-          <summary>Cradle</summary>
-          <label class="inline-toggle">
-            <input id="base-enabled" type="checkbox" checked />
-            Add base plate
-          </label>
-          <label class="inline-toggle">
-            <input id="base-join-uprights" type="checkbox" checked />
-            Join uprights at bottom
-          </label>
-          <label>
-            Base margin <output id="base-margin-value">8 mm</output>
-            <input id="base-margin" type="range" min="0" max="40" step="1" value="8" />
-          </label>
-          <label>
-            Base thickness <output id="base-thickness-value">3 mm</output>
-            <input id="base-thickness" type="range" min="0.5" max="20" step="0.5" value="3" />
-          </label>
         </details>
 
         <details class="control-block print-workflow">
@@ -399,12 +423,11 @@
           <div class="export-grid cnc-workflow" hidden>
             <button id="export-cnc-stl" class="primary-action" type="button">Export foam relief STL</button>
           </div>
-          <p class="hint print-workflow">Use Manual marks in Supports when you need to place manual support intent.</p>
           <p class="hint cnc-workflow" hidden>Import the exported STL into VCarve as a 3D relief/component.</p>
         </details>
       </aside>
     </main>
 
-    <script type="module" src="./src/main.js?v=column-bridge-1"></script>
-  </body>
+  <script type="module" src="./src/main.js?v=bvh-spatial-1"></script>
+</body>
 </html>
