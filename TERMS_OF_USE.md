@@ -11,8 +11,7 @@ their own license terms, as listed in `THIRD_PARTY_NOTICES.md`.
 ## Permitted Use
 
 You may view, download, run, and copy CradleMaker only for personal,
-educational, research, museum, conservation, preservation, or other
-non-commercial purposes.
+educational, research, or other non-commercial purposes.
 
 You may modify CradleMaker only for your own permitted non-commercial use.
 You may not distribute modified versions, derivative works, hosted copies, or
