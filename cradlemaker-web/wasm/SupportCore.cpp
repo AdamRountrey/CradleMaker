@@ -192,6 +192,9 @@ struct SupportGenerationStats {
     std::size_t tree_waypoint_branches = 0;
     std::size_t tree_slope_reroutes = 0;
     std::size_t tree_model_reroutes = 0;
+    int grid_cols = 0;
+    int grid_rows = 0;
+    double effective_contact_cell_size_mm = 0.8;
     double timing_grid_ms = 0.0;
     double timing_model_ceiling_ms = 0.0;
     double timing_overhang_ms = 0.0;
@@ -550,7 +553,7 @@ SupportSettings read_support_settings(const std::string& json)
     settings.top_z_distance_mm = std::max(0.0, settings.top_z_distance_mm);
     settings.xy_distance_mm = std::max(0.0, settings.xy_distance_mm);
     settings.edge_clearance_mm = std::clamp(settings.edge_clearance_mm, 0.0, 25.0);
-    settings.contact_cell_size_mm = std::clamp(settings.contact_cell_size_mm, 0.6, 8.0);
+    settings.contact_cell_size_mm = std::clamp(settings.contact_cell_size_mm, 0.25, 8.0);
     settings.manual_contact_radius_mm = std::clamp(settings.manual_contact_radius_mm, settings.contact_cell_size_mm, 50.0);
     settings.tree_branch_distance_mm = std::clamp(settings.tree_branch_distance_mm, settings.contact_cell_size_mm * 2.0, 40.0);
     settings.tree_tip_diameter_mm = std::clamp(settings.tree_tip_diameter_mm, 0.4, 12.0);
@@ -1140,7 +1143,7 @@ ContactGrid make_contact_grid(const MeshStats& mesh_stats, const SupportSettings
     int cols = std::max(1, int(std::ceil((max_x - min_x) / cell_size)));
     int rows = std::max(1, int(std::ceil((max_y - min_y) / cell_size)));
 
-    constexpr int max_cells = 360000;
+    constexpr int max_cells = 1200000;
     if (cols * rows > max_cells) {
         const double area = std::max(1.0, (max_x - min_x) * (max_y - min_y));
         cell_size = std::sqrt(area / max_cells);
@@ -1627,6 +1630,7 @@ std::size_t prune_sparse_auto_contacts(ContactGrid& grid)
                 continue;
 
             int comparable_neighbors = 0;
+            int contact_neighbors = 0;
             for (int dy = -1; dy <= 1; ++dy) {
                 for (int dx = -1; dx <= 1; ++dx) {
                     if (dx == 0 && dy == 0)
@@ -1634,13 +1638,17 @@ std::size_t prune_sparse_auto_contacts(ContactGrid& grid)
                     if (!occupied(ix + dx, iy + dy) || !has_target(ix + dx, iy + dy))
                         continue;
 
+                    ++contact_neighbors;
                     const double neighbor_top = source_top[grid.index(ix + dx, iy + dy)];
                     if (std::abs(neighbor_top - source_top[cell_index]) <= comparable_height_mm)
                         ++comparable_neighbors;
                 }
             }
 
-            if (comparable_neighbors < 3)
+            // Broad sloped cradle surfaces can have large Z deltas between adjacent
+            // cells. Treat only genuinely isolated contacts as sparse; otherwise a
+            // tilted museum object can lose most of its support footprint here.
+            if (comparable_neighbors < 3 && contact_neighbors < 3)
                 remove[std::size_t(cell_index)] = 1;
         }
     }
@@ -3498,6 +3506,9 @@ SupportGenerationStats generate_orca_contact_proxy(
 
     const double support_cutoff_z = -std::sin(settings.threshold_angle_deg * kPi / 180.0);
     ContactGrid grid = make_contact_grid(mesh_stats, settings);
+    stats.grid_cols = grid.cols;
+    stats.grid_rows = grid.rows;
+    stats.effective_contact_cell_size_mm = grid.cell_size;
     stats.timing_grid_ms = mark_ms();
     populate_model_collision_ceiling(grid, mesh_stats, settings);
     stats.timing_model_ceiling_ms = mark_ms();
@@ -3895,6 +3906,12 @@ std::string prepare_support_job_json_impl(const std::string& job_json, const boo
     append_number(out, settings.foam_gap_xy_mm);
     out << R"json(,"contact_cell_size_mm":)json";
     append_number(out, settings.contact_cell_size_mm);
+    out << R"json(,"effective_contact_cell_size_mm":)json";
+    append_number(out, support_stats.effective_contact_cell_size_mm);
+    out << R"json(,"grid_cols":)json"
+        << support_stats.grid_cols
+        << R"json(,"grid_rows":)json"
+        << support_stats.grid_rows;
     out << R"json(,"interface_top_layers":)json"
         << settings.interface_top_layers
         << R"json(,"interface_thickness_mm":)json";
@@ -3989,14 +4006,14 @@ std::string prepare_support_job_json_impl(const std::string& job_json, const boo
         << R"json(},)json";
     phase_start = Clock::now();
     if (binary_meshes)
-        append_support_mesh_metadata_json(out, "support_mesh", g_last_binary_result.support, settings.contact_cell_size_mm);
+        append_support_mesh_metadata_json(out, "support_mesh", g_last_binary_result.support, support_stats.effective_contact_cell_size_mm);
     else
-        append_support_mesh_json(out, "support_mesh", support_mesh, settings.contact_cell_size_mm);
+        append_support_mesh_json(out, "support_mesh", support_mesh, support_stats.effective_contact_cell_size_mm);
     out << ",";
     if (binary_meshes)
-        append_support_mesh_metadata_json(out, "interface_mesh", g_last_binary_result.interface_mesh, settings.contact_cell_size_mm);
+        append_support_mesh_metadata_json(out, "interface_mesh", g_last_binary_result.interface_mesh, support_stats.effective_contact_cell_size_mm);
     else
-        append_support_mesh_json(out, "interface_mesh", interface_mesh, settings.contact_cell_size_mm);
+        append_support_mesh_json(out, "interface_mesh", interface_mesh, support_stats.effective_contact_cell_size_mm);
     const double mesh_json_ms = mark_ms();
     out << ",";
     append_tree_layer_disks_json(out, tree_layer_data);

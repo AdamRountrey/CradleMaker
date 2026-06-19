@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>CradleMaker</title>
-    <link rel="stylesheet" href="./src/styles.css?v=support-ui-cleanup-1" />
+    <link rel="stylesheet" href="./src/styles.css?v=resolution-prompt-2" />
     <script type="importmap">
       {
         "imports": {
@@ -184,7 +184,7 @@
             <div class="compact-grid">
               <label>
                 Cradle resolution
-                <input id="support-base-pattern-spacing" type="number" min="0.6" max="8" step="0.1" value="0.8" />
+                <input id="support-base-pattern-spacing" type="number" min="0.25" max="8" step="0.05" value="0.8" />
               </label>
             </div>
             <label class="inline-toggle option-toggle">
@@ -299,6 +299,13 @@
             <p class="control-note">Paint on the model surface, then regenerate supports. Green paint enforces coverage; red paint removes coverage.</p>
           </details>
           <div id="qa-dashboard" class="qa-dashboard" aria-label="Cradle QA dashboard"></div>
+          <div id="resolution-prompt" class="resolution-prompt" hidden>
+            <p id="resolution-prompt-text"></p>
+            <div class="prompt-actions">
+              <button id="apply-resolution-suggestion" type="button">Apply suggested resolution</button>
+              <button id="dismiss-resolution-suggestion" type="button">Dismiss</button>
+            </div>
+          </div>
           <details class="status-details">
             <summary>Details</summary>
             <div id="job-status" class="job-status" role="status">Support core ready check has not run.</div>
@@ -431,6 +438,6 @@
       </aside>
     </main>
 
-  <script type="module" src="./src/main.js?v=split-qa-speed-4"></script>
+  <script type="module" src="./src/main.js?v=resolution-prompt-2"></script>
 </body>
 </html>

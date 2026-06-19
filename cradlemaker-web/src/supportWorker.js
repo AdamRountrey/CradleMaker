@@ -1,4 +1,4 @@
-import { activeWasmBasename, loadCradlemakerCore } from "./wasmCore.js?v=column-bridge-1";
+import { activeWasmBasename, loadCradlemakerCore } from "./wasmCore.js?v=cradle-hires-1";
 
 self.postMessage({ type: "ready" });
 

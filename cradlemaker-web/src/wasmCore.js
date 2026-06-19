@@ -6,8 +6,8 @@ let nextSupportWorkerRequestId = 1;
 let supportOptionSchemaPromise = null;
 let supportCorePrewarmPromise = null;
 const supportWorkerRequests = new Map();
-const WASM_VERSION = "brush-diameter-100-1";
-const SUPPORT_WORKER_VERSION = "brush-diameter-100-1";
+const WASM_VERSION = "cradle-hires-1";
+const SUPPORT_WORKER_VERSION = "cradle-hires-1";
 const DEFAULT_WASM_BASENAME = "cradlemaker-core";
 const PTHREAD_WASM_BASENAME = "cradlemaker-core-threaded";
 
