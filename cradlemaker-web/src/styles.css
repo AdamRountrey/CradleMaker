@@ -399,6 +399,33 @@ button[data-active="true"] {
   line-height: 1.25;
 }
 
+.resolution-prompt {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid rgba(184, 73, 67, 0.36);
+  border-left: 4px solid var(--support);
+  border-radius: 6px;
+  background: rgba(255, 246, 229, 0.78);
+  color: var(--panel-ink);
+}
+
+.resolution-prompt[hidden] {
+  display: none;
+}
+
+.resolution-prompt p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.prompt-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
 .status-details {
   border: 1px solid rgba(7, 23, 36, 0.16);
   border-radius: 6px;

@@ -4,7 +4,7 @@ import { STLLoader } from "three/addons/loaders/STLLoader.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
 import { CENTER, acceleratedRaycast, computeBoundsTree, disposeBoundsTree } from "three-mesh-bvh";
 import createManifoldModule from "../vendor/manifold/manifold.js";
-import { getSupportOptionSchema, prepareSupportJob, prewarmSupportCore } from "./wasmCore.js?v=paint-speed-1";
+import { getSupportOptionSchema, prepareSupportJob, prewarmSupportCore } from "./wasmCore.js?v=resolution-prompt-2";
 import { defaultOrcaSupportConfig } from "./orcaSupportOptions.js?v=organic-voxel-1";
 
 THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
@@ -18,6 +18,10 @@ const BED_SIZE = 220;
 const CONNECTOR_MIN_ROOF_ANGLE_DEG = 45;
 const CONNECTOR_MIN_PROJECTION_MM = 0.8;
 const CONNECTOR_MIN_PROJECTION_WIDTH_RATIO = 0.45;
+const CONNECTOR_PLACER_MAX_CANDIDATES = 27;
+const CONNECTOR_PLACER_MIN_BODY_COVERAGE = 0.72;
+const CONNECTOR_PLACER_MIN_WALL_COVERAGE = 0.62;
+const CONNECTOR_PLACER_TARGET_WALL_MM = 2.0;
 const SPLIT_SLIVER_ASPECT_RATIO = 60;
 const SPLIT_SLIVER_MAX_THICKNESS_MM = 0.16;
 const SPLIT_CONNECTOR_SLIVER_MIN_EDGE_MM = 0.18;
@@ -118,6 +122,10 @@ const controlsEl = {
   jobProgressShell: document.querySelector("#job-progress-shell"),
   splitProgress: document.querySelector("#split-progress"),
   splitProgressShell: document.querySelector("#split-progress-shell"),
+  resolutionPrompt: document.querySelector("#resolution-prompt"),
+  resolutionPromptText: document.querySelector("#resolution-prompt-text"),
+  applyResolutionSuggestion: document.querySelector("#apply-resolution-suggestion"),
+  dismissResolutionSuggestion: document.querySelector("#dismiss-resolution-suggestion"),
   cncBlockWidth: document.querySelector("#cnc-block-width"),
   cncBlockDepth: document.querySelector("#cnc-block-depth"),
   cncBlockHeight: document.querySelector("#cnc-block-height"),
@@ -190,6 +198,7 @@ const state = {
   modelCenterOfMassCache: null,
   modelManifoldPrewarmToken: 0,
   modelManifoldPrewarmTimer: null,
+  resolutionSuggestion: null,
 };
 
 const scene = new THREE.Scene();
@@ -214,6 +223,11 @@ setStartupStatus("Viewer renderer created; building workspace...");
 const orbit = new OrbitControls(camera, renderer.domElement);
 orbit.enableDamping = true;
 orbit.screenSpacePanning = false;
+orbit.mouseButtons = {
+  LEFT: THREE.MOUSE.ROTATE,
+  MIDDLE: THREE.MOUSE.PAN,
+  RIGHT: THREE.MOUSE.PAN,
+};
 orbit.target.set(0, 0, 0);
 
 const transformControls = new TransformControls(camera, renderer.domElement);
@@ -485,6 +499,8 @@ function bindControls() {
   controlsEl.exportSplitStls?.addEventListener("click", () => exportSplitStls());
   controlsEl.exportSplitManifest?.addEventListener("click", () => exportSplitManifest());
   controlsEl.splitPlatePreset?.addEventListener("change", () => applySplitPlatePreset());
+  controlsEl.applyResolutionSuggestion?.addEventListener("click", () => applyResolutionSuggestion());
+  controlsEl.dismissResolutionSuggestion?.addEventListener("click", () => clearResolutionPrompt());
   controlsEl.interfaceEnabled?.addEventListener("change", () => {
     if (controlsEl.interfaceEnabled.checked && Number(controlsEl.supportInterfaceTopLayers.value) <= 0) {
       controlsEl.supportInterfaceTopLayers.value = "2";
@@ -532,6 +548,7 @@ function bindControls() {
     controlsEl.cncModelLift,
   ].filter(Boolean)) {
     input.addEventListener("input", () => {
+      if (input === controlsEl.supportBasePatternSpacing) clearResolutionPrompt();
       if (
         input === controlsEl.splitBuildWidth ||
         input === controlsEl.splitBuildDepth ||
@@ -1195,6 +1212,15 @@ async function showWasmPending() {
     const treeWaypointBranchCount = jobResult.support?.tree_waypoint_branches ?? 0;
     const treeSlopeRerouteCount = jobResult.support?.tree_slope_reroutes ?? 0;
     const treeModelRerouteCount = jobResult.support?.tree_model_reroutes ?? 0;
+    const requestedCellSize = Number(jobResult.support?.contact_cell_size_mm ?? supportConfig.contact_cell_size_mm ?? 0);
+    const effectiveCellSize = Number(jobResult.support?.effective_contact_cell_size_mm ?? jobResult.support_mesh?.cell_size_mm ?? requestedCellSize);
+    const gridCols = Number(jobResult.support?.grid_cols ?? 0);
+    const gridRows = Number(jobResult.support?.grid_rows ?? 0);
+    const resolutionText = Number.isFinite(effectiveCellSize) && effectiveCellSize > 0
+      ? (Math.abs(effectiveCellSize - requestedCellSize) > 0.01
+          ? ` Effective cradle resolution ${formatStatusNumber(effectiveCellSize)} mm (requested ${formatStatusNumber(requestedCellSize)} mm) over ${gridCols.toLocaleString()} x ${gridRows.toLocaleString()} cells.`
+          : ` Cradle resolution ${formatStatusNumber(effectiveCellSize)} mm over ${gridCols.toLocaleString()} x ${gridRows.toLocaleString()} cells.`)
+      : "";
     const requestedOrcaTreeMode = Boolean(jobResult.support?.requested_orca_tree_mode);
     const realOrcaTreeAvailable = Boolean(jobResult.support?.real_orca_tree_available);
     const originalOrganicTree = Boolean(jobResult.support?.original_organic_tree);
@@ -1244,6 +1270,19 @@ async function showWasmPending() {
       ? ` Timings: ${phaseTimings.map((phase) => `${phase.label} ${formatDurationMs(phase.ms)}`).join(", ")}.${wasmTimingText}${wasmOutputTimingText}${trimTimingText}${workerTimingText}${qaWorkerTimingText}`
       : "";
     const totalTriangleCount = supportTriangleCount + interfaceTriangleCount;
+    const resolutionRecommendation = resolutionAdjustmentRecommendation({
+      requestedCellSize,
+      effectiveCellSize,
+      gridCols,
+      gridRows,
+      totalTriangleCount,
+      contactCellCount,
+      envelopeCellCount,
+      prunedSparseCellCount,
+      overhangFacetCount,
+      meshQa,
+      supportedDownwardPercent,
+    });
     supportStatus.textContent = totalTriangleCount
       ? `${supportTriangleCount.toLocaleString()} cradle + ${interfaceTriangleCount.toLocaleString()} interface triangles`
       : `${manualCount} coverage marks`;
@@ -1255,14 +1294,19 @@ async function showWasmPending() {
       meshQa,
       modelMeshQa,
       stabilityQa,
+      resolutionRecommendation,
+      effectiveCellSize,
+      gridCols,
+      gridRows,
       unsupportedCellCount,
       splitReady: totalTriangleCount > 0,
     });
+    showResolutionPrompt(resolutionRecommendation);
     const cradleLabel = treeMode ? "original organic tree cradle" : "solid cradle";
     const cradleArticle = cradleLabel.startsWith("original") ? "an" : "a";
     setJobStatus(
       totalTriangleCount
-        ? `Generated ${cradleArticle} ${cradleLabel} from ${contactCellCount.toLocaleString()} contact cells, including ${envelopeCellCount.toLocaleString()} underside-envelope cells, ${prunedSparseCellCount.toLocaleString()} sparse side/contact cells pruned, ${prunedSmallIslandCellCount.toLocaleString()} tiny island cells removed, ${baseCellCount.toLocaleString()} footprint base cells, ${bottomJoinCellCount.toLocaleString()} bottom-join cells, ${columnMergeCellCount.toLocaleString()} safe column-merge cells, column components ${columnComponentsBefore.toLocaleString()} -> ${columnComponentsAfter.toLocaleString()}, ${closedGapCount.toLocaleString()} closed gaps, ${unsupportedCellCount.toLocaleString()} unsupported coverage cells, ${overhangFacetCount.toLocaleString()} overhang facets, ${nativeManualCount.toLocaleString()} manual/enforce marks, ${nativeBlockerCount.toLocaleString()} no-support marks removing ${nativeBlockerRemovedCells.toLocaleString()} cells, ${treeMode ? `${treeBranchCount.toLocaleString()} organic branches, ` : ""}${interfaceCellCount.toLocaleString()} soft-interface cells from ${interfaceLayers.toLocaleString()} interface layers, ${edgeRemovedCells.toLocaleString()} cells removed for a ${edgeClearance.toLocaleString()} mm support-free edge, and ${foamRemovedCells.toLocaleString()} cells removed for a ${foamGapZ.toLocaleString()} mm Z / ${foamGapXY.toLocaleString()} mm XY foam gap. ${orcaTreeText} ${treeRoutingText} ${qaIntersectionText} ${qaCoverageText} ${meshQaText} ${modelTrimText} ${modelMeshQaText} ${stabilityQaText} ${qaClearanceText} Prepared ${Object.keys(supportConfig).length}/${schema.length} Orca support settings and ${Object.keys(cradleConfig).length} cradle settings.${runtimeText}${timingText}`
+        ? `Generated ${cradleArticle} ${cradleLabel} from ${contactCellCount.toLocaleString()} contact cells, including ${envelopeCellCount.toLocaleString()} underside-envelope cells, ${prunedSparseCellCount.toLocaleString()} sparse side/contact cells pruned, ${prunedSmallIslandCellCount.toLocaleString()} tiny island cells removed, ${baseCellCount.toLocaleString()} footprint base cells, ${bottomJoinCellCount.toLocaleString()} bottom-join cells, ${columnMergeCellCount.toLocaleString()} safe column-merge cells, column components ${columnComponentsBefore.toLocaleString()} -> ${columnComponentsAfter.toLocaleString()}, ${closedGapCount.toLocaleString()} closed gaps, ${unsupportedCellCount.toLocaleString()} unsupported coverage cells, ${overhangFacetCount.toLocaleString()} overhang facets, ${nativeManualCount.toLocaleString()} manual/enforce marks, ${nativeBlockerCount.toLocaleString()} no-support marks removing ${nativeBlockerRemovedCells.toLocaleString()} cells, ${treeMode ? `${treeBranchCount.toLocaleString()} organic branches, ` : ""}${interfaceCellCount.toLocaleString()} soft-interface cells from ${interfaceLayers.toLocaleString()} interface layers, ${edgeRemovedCells.toLocaleString()} cells removed for a ${edgeClearance.toLocaleString()} mm support-free edge, and ${foamRemovedCells.toLocaleString()} cells removed for a ${foamGapZ.toLocaleString()} mm Z / ${foamGapXY.toLocaleString()} mm XY foam gap.${resolutionText} ${orcaTreeText} ${treeRoutingText} ${qaIntersectionText} ${qaCoverageText} ${meshQaText} ${modelTrimText} ${modelMeshQaText} ${stabilityQaText} ${qaClearanceText} Prepared ${Object.keys(supportConfig).length}/${schema.length} Orca support settings and ${Object.keys(cradleConfig).length} cradle settings.${runtimeText}${timingText}`
         : `No support regions found. Prepared ${Object.keys(supportConfig).length}/${schema.length} Orca support settings and ${Object.keys(cradleConfig).length} cradle settings.`,
       qa.intersects_model || meshQa.unsupported_cells || modelMeshQa.needs_exact_trim || stabilityQa.severity === "error" ? "error" : "pending"
     );
@@ -1912,12 +1956,12 @@ function addZSlideDovetails(chunks, sourceBounds, settings, sourceMesh) {
   for (const chunk of chunks) {
     const right = byGrid.get(`${chunk.grid.x + 1}:${chunk.grid.y}:${chunk.grid.z}`);
     if (right) {
-      const connector = addZSlideDovetailPair(chunk, right, "x", sourceBounds, settings, sourceMesh, modelTriangles, connectors.length + 1, sourceTopSampler);
+      const connector = addZSlideDovetailPair(chunk, right, "x", sourceBounds, settings, sourceMesh, modelTriangles, connectors.length + 1, sourceTopSampler, connectors);
       if (connector) connectors.push(connector);
     }
     const back = byGrid.get(`${chunk.grid.x}:${chunk.grid.y + 1}:${chunk.grid.z}`);
     if (back) {
-      const connector = addZSlideDovetailPair(chunk, back, "y", sourceBounds, settings, sourceMesh, modelTriangles, connectors.length + 1, sourceTopSampler);
+      const connector = addZSlideDovetailPair(chunk, back, "y", sourceBounds, settings, sourceMesh, modelTriangles, connectors.length + 1, sourceTopSampler, connectors);
       if (connector) connectors.push(connector);
     }
   }
@@ -1931,74 +1975,72 @@ function addZSlideDovetails(chunks, sourceBounds, settings, sourceMesh) {
   return connectors;
 }
 
-function addZSlideDovetailPair(maleChunk, femaleChunk, axis, sourceBounds, settings, sourceMesh, modelTriangles, index, sourceTopSampler = null) {
+function addZSlideDovetailPair(maleChunk, femaleChunk, axis, sourceBounds, settings, sourceMesh, modelTriangles, index, sourceTopSampler = null, existingConnectors = []) {
   const size = settings.connectorSize;
   const clearance = settings.connectorClearance;
   const label = `D${String(index).padStart(2, "0")}`;
-  let zRange;
-  let dimensions;
-  let maleFootprint;
-  let maleRoofFootprint;
-  let socketFootprint;
-  let side;
+  let placement;
 
   if (axis === "x") {
     const seam = (maleChunk.box.max.x + femaleChunk.box.min.x) / 2;
-    const yCenter = overlapCenter(maleChunk.bounds.min.y, maleChunk.bounds.max.y, femaleChunk.bounds.min.y, femaleChunk.bounds.max.y);
-    dimensions = connectorDimensionsForZRange({ min: sourceBounds.min.z, max: sourceBounds.min.z + size }, settings);
-    ({ maleFootprint, socketFootprint, side } = buildDovetailFootprints(axis, seam, yCenter, dimensions, clearance));
-    zRange = connectorZRange(sourceMesh, sourceBounds, settings, [maleFootprint, socketFootprint], modelTriangles, sourceTopSampler);
-    if (!zRange) return null;
-    dimensions = connectorDimensionsForZRange(zRange, settings);
-    ({ maleFootprint, maleRoofFootprint, socketFootprint, side } = buildDovetailFootprints(axis, seam, yCenter, dimensions, clearance));
-    zRange = connectorZRange(sourceMesh, sourceBounds, settings, [maleFootprint, socketFootprint], modelTriangles, sourceTopSampler);
-    if (!zRange) return null;
-    dimensions = connectorDimensionsForZRange(zRange, settings);
-    ({ maleFootprint, maleRoofFootprint, socketFootprint, side } = buildDovetailFootprints(axis, seam, yCenter, dimensions, clearance));
-    maleChunk.features.push({
-      type: "tongue",
-      zMin: zRange.min,
-      zMax: zRange.max,
-      points: maleFootprint,
-      roof: roofProfile(side, maleRoofFootprint, zRange.max, dimensions.roofRise),
-    });
-    femaleChunk.features.push({
-      type: "slot",
-      side,
-      zMin: zRange.min,
-      zMax: zRange.max + clearance,
-      roof: roofProfile(side, socketFootprint, zRange.max + clearance, dimensions.roofRise),
-      points: socketFootprint,
+    placement = chooseDovetailPlacement({
+      axis,
+      seam,
+      overlapMin: Math.max(maleChunk.bounds.min.y, femaleChunk.bounds.min.y),
+      overlapMax: Math.min(maleChunk.bounds.max.y, femaleChunk.bounds.max.y),
+      fallbackCenter: overlapCenter(maleChunk.bounds.min.y, maleChunk.bounds.max.y, femaleChunk.bounds.min.y, femaleChunk.bounds.max.y),
+      sourceBounds,
+      settings,
+      sourceMesh,
+      modelTriangles,
+      sourceTopSampler,
+      existingConnectors,
     });
   } else {
     const seam = (maleChunk.box.max.y + femaleChunk.box.min.y) / 2;
-    const xCenter = overlapCenter(maleChunk.bounds.min.x, maleChunk.bounds.max.x, femaleChunk.bounds.min.x, femaleChunk.bounds.max.x);
-    dimensions = connectorDimensionsForZRange({ min: sourceBounds.min.z, max: sourceBounds.min.z + size }, settings);
-    ({ maleFootprint, socketFootprint, side } = buildDovetailFootprints(axis, seam, xCenter, dimensions, clearance));
-    zRange = connectorZRange(sourceMesh, sourceBounds, settings, [maleFootprint, socketFootprint], modelTriangles, sourceTopSampler);
-    if (!zRange) return null;
-    dimensions = connectorDimensionsForZRange(zRange, settings);
-    ({ maleFootprint, maleRoofFootprint, socketFootprint, side } = buildDovetailFootprints(axis, seam, xCenter, dimensions, clearance));
-    zRange = connectorZRange(sourceMesh, sourceBounds, settings, [maleFootprint, socketFootprint], modelTriangles, sourceTopSampler);
-    if (!zRange) return null;
-    dimensions = connectorDimensionsForZRange(zRange, settings);
-    ({ maleFootprint, maleRoofFootprint, socketFootprint, side } = buildDovetailFootprints(axis, seam, xCenter, dimensions, clearance));
-    maleChunk.features.push({
-      type: "tongue",
-      zMin: zRange.min,
-      zMax: zRange.max,
-      points: maleFootprint,
-      roof: roofProfile(side, maleRoofFootprint, zRange.max, dimensions.roofRise),
-    });
-    femaleChunk.features.push({
-      type: "slot",
-      side,
-      zMin: zRange.min,
-      zMax: zRange.max + clearance,
-      roof: roofProfile(side, socketFootprint, zRange.max + clearance, dimensions.roofRise),
-      points: socketFootprint,
+    placement = chooseDovetailPlacement({
+      axis,
+      seam,
+      overlapMin: Math.max(maleChunk.bounds.min.x, femaleChunk.bounds.min.x),
+      overlapMax: Math.min(maleChunk.bounds.max.x, femaleChunk.bounds.max.x),
+      fallbackCenter: overlapCenter(maleChunk.bounds.min.x, maleChunk.bounds.max.x, femaleChunk.bounds.min.x, femaleChunk.bounds.max.x),
+      sourceBounds,
+      settings,
+      sourceMesh,
+      modelTriangles,
+      sourceTopSampler,
+      existingConnectors,
     });
   }
+
+  if (!placement) return null;
+
+  const {
+    center,
+    zRange,
+    dimensions,
+    maleFootprint,
+    maleRoofFootprint,
+    socketFootprint,
+    side,
+    stats,
+  } = placement;
+
+  maleChunk.features.push({
+    type: "tongue",
+    zMin: zRange.min,
+    zMax: zRange.max,
+    points: maleFootprint,
+    roof: roofProfile(side, maleRoofFootprint, zRange.max, dimensions.roofRise),
+  });
+  femaleChunk.features.push({
+    type: "slot",
+    side,
+    zMin: zRange.min,
+    zMax: zRange.max + clearance,
+    roof: roofProfile(side, socketFootprint, zRange.max + clearance, dimensions.roofRise),
+    points: socketFootprint,
+  });
 
   return {
     id: label,
@@ -2010,6 +2052,7 @@ function addZSlideDovetailPair(maleChunk, femaleChunk, axis, sourceBounds, setti
     seam_mm: roundedCoordinate(zRange.seam ?? (axis === "x"
       ? (maleChunk.box.max.x + femaleChunk.box.min.x) / 2
       : (maleChunk.box.max.y + femaleChunk.box.min.y) / 2)),
+    center_mm: roundedCoordinate(center),
     clearance_mm: clearance,
     nominal_size_mm: size,
     effective_size_mm: roundedCoordinate(dimensions.effectiveSize),
@@ -2025,7 +2068,340 @@ function addZSlideDovetailPair(maleChunk, femaleChunk, axis, sourceBounds, setti
     roof_angle_deg: roundedCoordinate(dimensions.roofAngleDeg),
     support_free_roof: dimensions.supportFreeRoof,
     local_cradle_top_mm: roundedCoordinate(zRange.localTop),
+    placement_score: roundedCoordinate(stats.score),
+    placement_body_coverage: roundedCoordinate(stats.bodyCoverage),
+    placement_wall_coverage: roundedCoordinate(stats.wallCoverage),
   };
+}
+
+function chooseDovetailPlacement({
+  axis,
+  seam,
+  overlapMin,
+  overlapMax,
+  fallbackCenter,
+  sourceBounds,
+  settings,
+  sourceMesh,
+  modelTriangles,
+  sourceTopSampler,
+  existingConnectors = [],
+}) {
+  const candidates = dovetailCandidateCenters(overlapMin, overlapMax, fallbackCenter, settings, sourceMesh);
+  let best = null;
+
+  for (const center of candidates) {
+    const candidate = buildDovetailPlacementAtCenter({
+      axis,
+      seam,
+      center,
+      sourceBounds,
+      settings,
+      sourceMesh,
+      modelTriangles,
+      sourceTopSampler,
+      existingConnectors,
+      fallbackCenter,
+    });
+    if (!candidate) continue;
+    if (!Number.isFinite(candidate.stats.score)) continue;
+    if (!best || candidate.stats.score > best.stats.score) best = candidate;
+  }
+
+  if (!best) return null;
+  if (sourceMesh &&
+    (best.stats.bodyCoverage < CONNECTOR_PLACER_MIN_BODY_COVERAGE ||
+      best.stats.wallCoverage < CONNECTOR_PLACER_MIN_WALL_COVERAGE)) {
+    return null;
+  }
+  return best;
+}
+
+function dovetailCandidateCenters(overlapMin, overlapMax, fallbackCenter, settings, sourceMesh) {
+  const cellSize = Number(sourceMesh?.cell_size_mm) || 1;
+  const wallMargin = Math.max(CONNECTOR_PLACER_TARGET_WALL_MM, settings.connectorSize * 0.3, cellSize * 3);
+  const usableMin = overlapMin + settings.connectorSize / 2 + settings.connectorClearance + wallMargin;
+  const usableMax = overlapMax - settings.connectorSize / 2 - settings.connectorClearance - wallMargin;
+  const min = usableMin <= usableMax ? usableMin : overlapMin;
+  const max = usableMin <= usableMax ? usableMax : overlapMax;
+  const span = Math.max(0, max - min);
+  const step = Math.max(settings.connectorSize * 0.45, cellSize * 8, 1);
+  const count = Math.max(1, Math.min(CONNECTOR_PLACER_MAX_CANDIDATES, Math.floor(span / step) + 1));
+  const centers = new Set();
+  const add = (value) => {
+    if (!Number.isFinite(value)) return;
+    centers.add(String(roundedCoordinate(Math.max(min, Math.min(max, value)))));
+  };
+
+  add(fallbackCenter);
+  add((min + max) / 2);
+  add(min + span * 0.25);
+  add(min + span * 0.75);
+  if (count === 1) {
+    add((min + max) / 2);
+  } else {
+    for (let index = 0; index < count; index += 1) {
+      add(min + (span * index) / (count - 1));
+    }
+  }
+
+  return [...centers].map((value) => Number(value));
+}
+
+function buildDovetailPlacementAtCenter({
+  axis,
+  seam,
+  center,
+  sourceBounds,
+  settings,
+  sourceMesh,
+  modelTriangles,
+  sourceTopSampler,
+  existingConnectors,
+  fallbackCenter,
+}) {
+  let dimensions = connectorDimensionsForZRange({ min: sourceBounds.min.z, max: sourceBounds.min.z + settings.connectorSize }, settings);
+  let maleFootprint;
+  let maleRoofFootprint;
+  let socketFootprint;
+  let side;
+  let zRange;
+
+  for (let pass = 0; pass < 3; pass += 1) {
+    ({ maleFootprint, maleRoofFootprint, socketFootprint, side } = buildDovetailFootprints(axis, seam, center, dimensions, settings.connectorClearance));
+    zRange = connectorZRange(sourceMesh, sourceBounds, settings, [maleFootprint, socketFootprint], modelTriangles, sourceTopSampler);
+    if (!zRange) return null;
+    zRange.seam = seam;
+    dimensions = connectorDimensionsForZRange(zRange, settings);
+  }
+
+  ({ maleFootprint, maleRoofFootprint, socketFootprint, side } = buildDovetailFootprints(axis, seam, center, dimensions, settings.connectorClearance));
+  const stats = scoreDovetailPlacement({
+    axis,
+    seam,
+    center,
+    fallbackCenter,
+    maleFootprint,
+    maleRoofFootprint,
+    socketFootprint,
+    side,
+    zRange,
+    dimensions,
+    sourceMesh,
+    sourceTopSampler,
+    settings,
+    existingConnectors,
+  });
+
+  return {
+    center,
+    zRange,
+    dimensions,
+    maleFootprint,
+    maleRoofFootprint,
+    socketFootprint,
+    side,
+    stats,
+  };
+}
+
+function scoreDovetailPlacement({
+  axis,
+  seam,
+  center,
+  fallbackCenter,
+  maleRoofFootprint,
+  socketFootprint,
+  maleFootprint,
+  zRange,
+  dimensions,
+  sourceMesh,
+  sourceTopSampler,
+  settings,
+  existingConnectors,
+}) {
+  const collisionPenalty = dovetailConnectorCollisionPenalty(
+    [maleFootprint, socketFootprint],
+    zRange,
+    existingConnectors,
+    settings
+  );
+  if (!Number.isFinite(collisionPenalty)) {
+    return {
+      score: -Infinity,
+      bodyCoverage: 0,
+      wallCoverage: 0,
+      collision: true,
+    };
+  }
+
+  if (!sourceMesh) {
+    return {
+      score: 1 - collisionPenalty,
+      bodyCoverage: 1,
+      wallCoverage: 1,
+      collision: false,
+    };
+  }
+
+  const cellSize = Number(sourceMesh.cell_size_mm) || 1;
+  const sampleSpacing = Math.max(cellSize * 1.5, Math.min(settings.connectorSize * 0.18, 1.25));
+  const minSolidTop = zRange.max + Math.max(0.08, settings.connectorClearance * 0.35);
+  const bodyCoverage = supportCoverageForSamples(
+    sourceMesh,
+    sampleFootprints([maleRoofFootprint, socketFootprint], sampleSpacing),
+    minSolidTop,
+    sourceTopSampler
+  );
+  const wallSamples = dovetailSocketGuardSamples(socketFootprint, axis, settings, cellSize, sampleSpacing);
+  const wallCoverage = supportCoverageForSamples(sourceMesh, wallSamples, minSolidTop, sourceTopSampler);
+  const height = Math.max(0, zRange.max - zRange.min);
+  const nearbyPenalty = nearbyConnectorPenalty(axis, seam, center, existingConnectors, settings);
+  const fallbackPenalty = Math.abs(center - fallbackCenter) * 0.025;
+  const roofBonus = dimensions.supportFreeRoof ? 8 : -8;
+  const score =
+    bodyCoverage * 90 +
+    wallCoverage * 170 +
+    Math.min(35, height * 3) +
+    roofBonus -
+    nearbyPenalty -
+    fallbackPenalty -
+    collisionPenalty;
+
+  return {
+    score,
+    bodyCoverage,
+    wallCoverage,
+    collision: false,
+    guardSamples: wallSamples.length,
+  };
+}
+
+function dovetailConnectorCollisionPenalty(candidatePolygons, zRange, connectors, settings) {
+  const clearance = Math.max(0.2, settings.connectorClearance ?? 0.3);
+  const candidateBounds = footprintBounds(candidatePolygons);
+  let penalty = 0;
+
+  for (const connector of connectors ?? []) {
+    if (!connector?.footprint_bounds_mm) continue;
+    const z = connector.z_range_mm;
+    if (z && (z.max < zRange.min - clearance || z.min > zRange.max + clearance)) continue;
+    if (!bounds2dOverlap(candidateBounds, connector.footprint_bounds_mm, clearance)) continue;
+
+    const existingPolygons = connectorFootprintPolygons(connector);
+    for (const candidate of candidatePolygons) {
+      for (const existing of existingPolygons) {
+        if (polygonsOverlap2d(candidate, existing)) return Infinity;
+        const distance = polygonDistance2d(candidate, existing);
+        const minGap = Math.max(clearance * 2, 0.8);
+        if (distance < minGap) penalty += (minGap - distance) * 80;
+      }
+    }
+  }
+
+  return penalty;
+}
+
+function connectorFootprintPolygons(connector) {
+  return [
+    connector.male_footprint_mm,
+    connector.socket_footprint_mm,
+  ].filter((polygon) => Array.isArray(polygon) && polygon.length >= 3);
+}
+
+function bounds2dOverlap(a, b, margin = 0) {
+  if (!a || !b) return false;
+  return a.max.x + margin >= b.min.x &&
+    a.min.x - margin <= b.max.x &&
+    a.max.y + margin >= b.min.y &&
+    a.min.y - margin <= b.max.y;
+}
+
+function polygonsOverlap2d(a, b) {
+  if (!a?.length || !b?.length) return false;
+  if (a.some((point) => pointInPolygon2d(point, b))) return true;
+  if (b.some((point) => pointInPolygon2d(point, a))) return true;
+  for (let aIndex = 0; aIndex < a.length; aIndex += 1) {
+    const a0 = a[aIndex];
+    const a1 = a[(aIndex + 1) % a.length];
+    for (let bIndex = 0; bIndex < b.length; bIndex += 1) {
+      const b0 = b[bIndex];
+      const b1 = b[(bIndex + 1) % b.length];
+      if (segmentsIntersect2d(a0, a1, b0, b1)) return true;
+    }
+  }
+  return false;
+}
+
+function polygonDistance2d(a, b) {
+  let distance = Infinity;
+  for (const point of a) distance = Math.min(distance, distanceToPolygonEdges2d(point, b));
+  for (const point of b) distance = Math.min(distance, distanceToPolygonEdges2d(point, a));
+  return distance;
+}
+
+function supportCoverageForSamples(mesh, samples, minTop, sampler = null) {
+  if (!samples.length) return 0;
+  let covered = 0;
+  for (const sample of samples) {
+    const top = supportTopAtXY(mesh, sample.x, sample.y, sampler);
+    if (Number.isFinite(top) && top >= minTop) covered += 1;
+  }
+  return covered / samples.length;
+}
+
+function dovetailSocketGuardSamples(socketFootprint, axis, settings, cellSize, spacing) {
+  const xs = socketFootprint.map((point) => point.x);
+  const ys = socketFootprint.map((point) => point.y);
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+  const wall = Math.max(CONNECTOR_PLACER_TARGET_WALL_MM, settings.connectorClearance * 2.5, cellSize * 3);
+  const samples = [];
+  const addLine = (a, b) => {
+    const length = Math.hypot(b.x - a.x, b.y - a.y);
+    const count = Math.max(2, Math.ceil(length / Math.max(spacing, 0.25)));
+    for (let index = 0; index <= count; index += 1) {
+      const t = index / count;
+      samples.push({
+        x: a.x + (b.x - a.x) * t,
+        y: a.y + (b.y - a.y) * t,
+      });
+    }
+  };
+
+  if (axis === "x") {
+    addLine({ x: maxX + wall, y: minY }, { x: maxX + wall, y: maxY });
+    addLine({ x: minX + wall, y: minY - wall }, { x: maxX, y: minY - wall });
+    addLine({ x: minX + wall, y: maxY + wall }, { x: maxX, y: maxY + wall });
+  } else {
+    addLine({ x: minX, y: maxY + wall }, { x: maxX, y: maxY + wall });
+    addLine({ x: minX - wall, y: minY + wall }, { x: minX - wall, y: maxY });
+    addLine({ x: maxX + wall, y: minY + wall }, { x: maxX + wall, y: maxY });
+  }
+
+  return samples;
+}
+
+function nearbyConnectorPenalty(axis, seam, center, connectors, settings) {
+  const current = connectorAnchorPoint({ axis, seam_mm: seam, center_mm: center });
+  const minDistance = settings.connectorSize * 1.6;
+  let penalty = 0;
+  for (const connector of connectors ?? []) {
+    const other = connectorAnchorPoint(connector);
+    if (!other) continue;
+    const distance = Math.hypot(current.x - other.x, current.y - other.y);
+    if (distance < minDistance) penalty += (minDistance - distance) * 8;
+  }
+  return penalty;
+}
+
+function connectorAnchorPoint(connector) {
+  if (!connector || !Number.isFinite(connector.seam_mm) || !Number.isFinite(connector.center_mm)) return null;
+  return connector.axis === "x"
+    ? { x: connector.seam_mm, y: connector.center_mm }
+    : { x: connector.center_mm, y: connector.seam_mm };
 }
 
 function buildDovetailFootprints(axis, seam, center, dimensions, clearance) {
@@ -5991,6 +6367,7 @@ function setJobStatus(message, stateName = "idle") {
 }
 
 function resetQaDashboard() {
+  clearResolutionPrompt();
   setQaDashboard([
     { label: "Model", value: "Ready", detail: "Load or import", state: "idle" },
     { label: "Coverage", value: "--", detail: "Generate cradle", state: "idle" },
@@ -6045,6 +6422,16 @@ function updateGeneratedQaDashboard(summary) {
     : summary.stabilityQa?.severity === "caution"
       ? "caution"
       : "ok";
+  const resolutionRecommendation = summary.resolutionRecommendation ?? null;
+  const resolutionState = resolutionRecommendation
+    ? (resolutionRecommendation.severity === "error" ? "error" : "caution")
+    : "ok";
+  const resolutionValue = resolutionRecommendation
+    ? "Adjust"
+    : `${formatStatusNumber(summary.effectiveCellSize ?? 0)} mm`;
+  const resolutionDetail = resolutionRecommendation
+    ? resolutionRecommendation.cardDetail
+    : `${Number(summary.gridCols ?? 0).toLocaleString()} x ${Number(summary.gridRows ?? 0).toLocaleString()} cells`;
   const stabilityValue = stabilityDashboardValue(summary.stabilityQa);
   const stabilityDetail = stabilityDashboardDetail(summary.stabilityQa);
   const totalTriangles = Number(summary.supportTriangleCount ?? 0) + Number(summary.interfaceTriangleCount ?? 0);
@@ -6081,12 +6468,131 @@ function updateGeneratedQaDashboard(summary) {
       state: totalTriangles ? "ok" : "idle",
     },
     {
+      label: "Resolution",
+      value: resolutionValue,
+      detail: resolutionDetail,
+      state: resolutionState,
+    },
+    {
       label: "Split",
       value: summary.splitReady ? "Ready" : "--",
       detail: "Preview chunks",
       state: summary.splitReady ? "pending" : "idle",
     },
   ]);
+}
+
+function resolutionAdjustmentRecommendation({
+  requestedCellSize,
+  effectiveCellSize,
+  gridCols,
+  gridRows,
+  totalTriangleCount,
+  contactCellCount,
+  envelopeCellCount,
+  prunedSparseCellCount,
+  overhangFacetCount,
+  meshQa,
+  supportedDownwardPercent,
+}) {
+  const requested = Number(requestedCellSize);
+  const effective = Number(effectiveCellSize);
+  if (!Number.isFinite(requested) || requested <= 0 || !Number.isFinite(effective) || effective <= 0) return null;
+
+  const minResolution = Number(controlsEl.supportBasePatternSpacing?.min) || 0.25;
+  const suggestedFine = Math.max(minResolution, Math.min(requested * 0.5, requested - 0.05));
+  const roundedFine = roundedResolution(suggestedFine);
+  if (effective > requested + 0.01) {
+    return {
+      type: "auto-coarsened",
+      severity: "caution",
+      suggested: roundedResolution(effective),
+      cardDetail: `${formatStatusNumber(effective)} mm effective`,
+      message: `The requested ${formatStatusNumber(requested)} mm cradle resolution exceeded the current grid limit, so CradleMaker used ${formatStatusNumber(effective)} mm over ${Number(gridCols ?? 0).toLocaleString()} x ${Number(gridRows ?? 0).toLocaleString()} cells.`,
+      applyLabel: `Use ${formatStatusNumber(effective)} mm`,
+    };
+  }
+
+  if (requested <= minResolution + 0.001) return null;
+
+  const contactCount = Number(contactCellCount ?? 0);
+  const envelopeCount = Number(envelopeCellCount ?? 0);
+  const triangleCount = Number(totalTriangleCount ?? 0);
+  const overhangCount = Number(overhangFacetCount ?? 0);
+  const contactRatio = envelopeCount > 0 ? contactCount / envelopeCount : 1;
+  const thinFeatureMiss =
+    (triangleCount === 0 && (envelopeCount > 0 || overhangCount > 0)) ||
+    (envelopeCount >= 25 && contactCount <= Math.max(4, envelopeCount * 0.08));
+
+  if (thinFeatureMiss && roundedFine < requested - 0.001) {
+    return {
+      type: "thin-feature-miss",
+      severity: triangleCount === 0 ? "error" : "caution",
+      suggested: roundedFine,
+      cardDetail: `Thin features? Try ${formatStatusNumber(roundedFine)} mm`,
+      message: `Very little cradle was produced from the sampled underside (${contactCount.toLocaleString()} contact cells from ${envelopeCount.toLocaleString()} candidate cells). The model may have thin parts that the ${formatStatusNumber(requested)} mm cradle grid is missing. Try ${formatStatusNumber(roundedFine)} mm and regenerate supports.`,
+      applyLabel: `Use ${formatStatusNumber(roundedFine)} mm`,
+    };
+  }
+
+  const sparseRatio = envelopeCellCount > 0 ? prunedSparseCellCount / envelopeCellCount : 0;
+  const meshGap = Number(meshQa?.max_gap_mm ?? 0);
+  const unsupportedMeshCells = Number(meshQa?.unsupported_cells ?? 0);
+  const supportedPercent = Number(supportedDownwardPercent ?? 100);
+  const likelyCoarse =
+    sparseRatio > 0.18 ||
+    contactRatio < 0.35 ||
+    unsupportedMeshCells > 0 ||
+    supportedPercent < 99.5 ||
+    meshGap > Math.max(0.4, requested * 0.8);
+
+  if (!likelyCoarse || roundedFine >= requested - 0.001) return null;
+
+  return {
+    type: "too-coarse",
+    severity: unsupportedMeshCells || supportedPercent < 95 ? "error" : "caution",
+    suggested: roundedFine,
+    cardDetail: `Try ${formatStatusNumber(roundedFine)} mm`,
+    message: `This cradle may be undersampling thin features at ${formatStatusNumber(requested)} mm resolution. Try ${formatStatusNumber(roundedFine)} mm and regenerate supports.`,
+    applyLabel: `Use ${formatStatusNumber(roundedFine)} mm`,
+  };
+}
+
+function roundedResolution(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 0.25;
+  return Math.max(0.25, Math.round(number * 100) / 100);
+}
+
+function showResolutionPrompt(recommendation) {
+  state.resolutionSuggestion = recommendation ?? null;
+  if (!controlsEl.resolutionPrompt || !controlsEl.resolutionPromptText) return;
+  if (!recommendation) {
+    clearResolutionPrompt();
+    return;
+  }
+  controlsEl.resolutionPrompt.hidden = false;
+  controlsEl.resolutionPromptText.textContent = recommendation.message;
+  if (controlsEl.applyResolutionSuggestion) {
+    controlsEl.applyResolutionSuggestion.textContent = recommendation.applyLabel || "Apply suggested resolution";
+  }
+}
+
+function clearResolutionPrompt() {
+  state.resolutionSuggestion = null;
+  if (controlsEl.resolutionPrompt) controlsEl.resolutionPrompt.hidden = true;
+  if (controlsEl.resolutionPromptText) controlsEl.resolutionPromptText.textContent = "";
+}
+
+function applyResolutionSuggestion() {
+  const suggestion = state.resolutionSuggestion;
+  if (!suggestion || !Number.isFinite(Number(suggestion.suggested))) return;
+  controlsEl.supportBasePatternSpacing.value = String(suggestion.suggested);
+  clearGeneratedSupport();
+  clearResolutionPrompt();
+  syncOptionPanels();
+  updateOutputs();
+  updateButtons();
 }
 
 function stabilityDashboardValue(qa) {
