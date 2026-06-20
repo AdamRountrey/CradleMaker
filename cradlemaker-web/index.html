@@ -124,21 +124,6 @@
               <option value="hidden">Hidden model</option>
             </select>
           </label>
-          <label>
-            Rotation preset
-            <select id="rotation-preset">
-              <option value="0,0,0" selected>0 / 0 / 0</option>
-              <option value="90,0,0">X 90</option>
-              <option value="0,90,0">Y 90</option>
-              <option value="0,0,90">Z 90</option>
-              <option value="45,0,0">X 45</option>
-              <option value="0,45,0">Y 45</option>
-              <option value="0,0,45">Z 45</option>
-              <option value="30,15,0">X 30 / Y 15</option>
-              <option value="0,30,15">Y 30 / Z 15</option>
-            </select>
-          </label>
-          <button id="apply-rotation-preset" type="button">Apply rotation</button>
           <label class="print-workflow">
             Elevation <output id="elevation-value">18 mm</output>
             <input id="elevation" type="range" min="0" max="120" step="1" value="18" />
@@ -258,7 +243,7 @@
             </label>
           </details>
           <div class="button-grid">
-            <button id="generate-supports" type="button">Generate supports</button>
+            <button id="generate-supports" class="primary-action" type="button">Generate supports</button>
             <div id="job-progress-shell" class="progress-shell" hidden>
               <progress id="job-progress" max="100" value="0" aria-label="Generate supports progress"></progress>
             </div>
@@ -373,9 +358,10 @@
               <span class="param-label">Block depth</span>
               <input id="cnc-block-depth" type="number" min="25" max="2500" step="1" value="300" />
             </label>
-            <label class="param-cell">
+            <label id="cnc-block-height-cell" class="param-cell">
               <span class="param-label">Block height</span>
               <input id="cnc-block-height" type="number" min="10" max="500" step="1" value="76.2" />
+              <output id="cnc-block-height-value" class="param-note">Used when slabs are off</output>
             </label>
             <label class="param-cell">
               <span class="param-label">Surface resolution (mm)</span>
@@ -383,25 +369,12 @@
               <output id="cnc-resolution-value" class="param-note">0.5 mm grid</output>
             </label>
             <label class="param-cell">
-              <span class="param-label">Tool stickout (in)</span>
-              <input id="cnc-tool-stickout-in" type="number" min="0.1" max="6" step="0.05" value="1" />
-              <output id="cnc-stickout-value" class="param-note">25.4 mm</output>
+              <span class="param-label">XY clearance</span>
+              <input id="cnc-clearance-xy" type="number" min="0" max="30" step="0.1" value="1" />
             </label>
             <label class="param-cell">
-              <span class="param-label">Bit diameter (in)</span>
-              <input id="cnc-bit-diameter-in" type="number" min="0.02" max="2" step="0.01" value="0.25" />
-              <output id="cnc-bit-diameter-value" class="param-note">6.35 mm</output>
-            </label>
-            <label class="param-cell">
-              <span class="param-label">Tool end</span>
-              <select id="cnc-tool-end">
-                <option value="flat" selected>Flat end mill</option>
-                <option value="ball">Ball nose</option>
-              </select>
-            </label>
-            <label class="param-cell">
-              <span class="param-label">Cavity clearance</span>
-              <input id="cnc-clearance" type="number" min="0" max="20" step="0.1" value="1" />
+              <span class="param-label">Z clearance</span>
+              <input id="cnc-clearance-z" type="number" min="0" max="30" step="0.1" value="1" />
             </label>
           </div>
           <label class="inline-toggle">
@@ -413,8 +386,73 @@
             <input id="cnc-model-lift" type="range" min="0" max="120" step="0.5" value="0" />
             <output id="cnc-model-lift-value" class="param-note">0 mm</output>
           </label>
+          <details class="nested-options">
+            <summary>Slabs and alignment</summary>
+            <label class="inline-toggle">
+              <input id="cnc-slabs-enabled" type="checkbox" />
+              Use multiple slabs
+            </label>
+            <div class="compact-grid">
+              <label class="param-cell">
+                <span class="param-label">Slab count</span>
+                <input id="cnc-slab-count" type="number" min="1" max="24" step="1" value="3" />
+              </label>
+              <label class="param-cell">
+                <span class="param-label">Slab thickness (in)</span>
+                <input id="cnc-slab-thickness-in" type="number" min="0.5" max="2" step="0.05" value="1" />
+                <output id="cnc-slab-thickness-value" class="param-note">25.4 mm each, 76.2 mm total</output>
+              </label>
+              <label class="param-cell">
+                <span class="param-label">Dowel diameter (mm)</span>
+                <input id="cnc-dowel-diameter-mm" type="number" min="2" max="30" step="0.1" value="6.35" />
+              </label>
+              <label class="param-cell">
+                <span class="param-label">Dowel clearance (mm)</span>
+                <input id="cnc-dowel-clearance" type="number" min="0" max="3" step="0.05" value="0.25" />
+              </label>
+            </div>
+          </details>
+          <details class="nested-options">
+            <summary>Finger holes</summary>
+            <div class="compact-grid">
+              <label class="inline-toggle">
+                <input id="cnc-auto-finger-holes" type="checkbox" />
+                Auto finger holes
+              </label>
+              <label class="param-cell">
+                <span class="param-label">Finger-hole diameter</span>
+                <input id="cnc-finger-hole-diameter" type="number" min="8" max="80" step="1" value="30" />
+              </label>
+            </div>
+            <div class="button-grid">
+              <button id="cnc-add-finger-hole" type="button">Add finger hole</button>
+              <button id="cnc-clear-finger-holes" type="button">Clear finger holes</button>
+            </div>
+          </details>
+          <details class="nested-options">
+            <summary>Tool</summary>
+            <div class="compact-grid">
+              <label class="param-cell">
+                <span class="param-label">Tool stickout (in)</span>
+                <input id="cnc-tool-stickout-in" type="number" min="0.1" max="6" step="0.05" value="1" />
+                <output id="cnc-stickout-value" class="param-note">25.4 mm</output>
+              </label>
+              <label class="param-cell">
+                <span class="param-label">Bit diameter (in)</span>
+                <input id="cnc-bit-diameter-in" type="number" min="0.02" max="2" step="0.01" value="0.25" />
+                <output id="cnc-bit-diameter-value" class="param-note">6.35 mm</output>
+              </label>
+              <label class="param-cell">
+                <span class="param-label">Tool end</span>
+                <select id="cnc-tool-end">
+                  <option value="flat" selected>Flat end mill</option>
+                  <option value="ball">Ball nose</option>
+                </select>
+              </label>
+            </div>
+          </details>
           <div class="button-grid">
-            <button id="cnc-generate" type="button">Preview CNC foam</button>
+            <button id="cnc-generate" class="primary-action" type="button">Preview CNC foam</button>
             <button id="cnc-auto-fit" type="button">Auto-fit height</button>
             <button id="cnc-clear" type="button">Clear CNC preview</button>
           </div>
@@ -432,12 +470,14 @@
           </div>
           <div class="export-grid cnc-workflow" hidden>
             <button id="export-cnc-stl" class="primary-action" type="button">Export foam relief STL</button>
+            <button id="export-cnc-slab-stls" type="button">Export slab STLs</button>
+            <button id="export-cnc-slab-manifest" type="button">Export slab manifest</button>
           </div>
           <p class="hint cnc-workflow" hidden>Import the exported STL into VCarve as a 3D relief/component.</p>
         </details>
       </aside>
     </main>
 
-  <script type="module" src="./src/main.js?v=resolution-prompt-2"></script>
+  <script type="module" src="./src/main.js?v=cnc-slab-height-disabled-1"></script>
 </body>
 </html>

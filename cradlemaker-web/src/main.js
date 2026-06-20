@@ -37,6 +37,7 @@ const INCH_TO_MM = 25.4;
 const CNC_TOOL_SAFETY_MARGIN_MM = 1.5;
 const CNC_MIN_FLOOR_THICKNESS_MM = 6;
 const CNC_MAX_GRID_CELLS = 900000;
+const CNC_FINGER_HOLE_SUPPORT_INSET_MM = 1;
 const ENABLE_MODEL_MANIFOLD_PREWARM = false;
 let manifoldCorePromise = null;
 let qaWorker = null;
@@ -66,8 +67,6 @@ const controlsEl = {
   modelDisplayMode: document.querySelector("#model-display-mode"),
   orientModel: document.querySelector("#orient-model"),
   resetOrientation: document.querySelector("#reset-orientation"),
-  rotationPreset: document.querySelector("#rotation-preset"),
-  applyRotationPreset: document.querySelector("#apply-rotation-preset"),
   elevation: document.querySelector("#elevation"),
   supportType: document.querySelector("#support-type"),
   supportStyle: document.querySelector("#support-style"),
@@ -128,19 +127,32 @@ const controlsEl = {
   dismissResolutionSuggestion: document.querySelector("#dismiss-resolution-suggestion"),
   cncBlockWidth: document.querySelector("#cnc-block-width"),
   cncBlockDepth: document.querySelector("#cnc-block-depth"),
+  cncBlockHeightCell: document.querySelector("#cnc-block-height-cell"),
   cncBlockHeight: document.querySelector("#cnc-block-height"),
   cncResolution: document.querySelector("#cnc-resolution"),
   cncToolStickoutIn: document.querySelector("#cnc-tool-stickout-in"),
   cncBitDiameterIn: document.querySelector("#cnc-bit-diameter-in"),
   cncToolEnd: document.querySelector("#cnc-tool-end"),
-  cncClearance: document.querySelector("#cnc-clearance"),
+  cncClearanceXy: document.querySelector("#cnc-clearance-xy"),
+  cncClearanceZ: document.querySelector("#cnc-clearance-z"),
   cncAutoLift: document.querySelector("#cnc-auto-lift"),
   cncModelLift: document.querySelector("#cnc-model-lift"),
+  cncAutoFingerHoles: document.querySelector("#cnc-auto-finger-holes"),
+  cncFingerHoleDiameter: document.querySelector("#cnc-finger-hole-diameter"),
+  cncAddFingerHole: document.querySelector("#cnc-add-finger-hole"),
+  cncClearFingerHoles: document.querySelector("#cnc-clear-finger-holes"),
+  cncSlabsEnabled: document.querySelector("#cnc-slabs-enabled"),
+  cncSlabCount: document.querySelector("#cnc-slab-count"),
+  cncSlabThicknessIn: document.querySelector("#cnc-slab-thickness-in"),
+  cncDowelDiameterMm: document.querySelector("#cnc-dowel-diameter-mm"),
+  cncDowelClearance: document.querySelector("#cnc-dowel-clearance"),
   cncGenerate: document.querySelector("#cnc-generate"),
   cncAutoFit: document.querySelector("#cnc-auto-fit"),
   cncClear: document.querySelector("#cnc-clear"),
   cncStatus: document.querySelector("#cnc-status"),
   exportCncStl: document.querySelector("#export-cnc-stl"),
+  exportCncSlabStls: document.querySelector("#export-cnc-slab-stls"),
+  exportCncSlabManifest: document.querySelector("#export-cnc-slab-manifest"),
 };
 
 const outputs = {
@@ -161,7 +173,9 @@ const outputs = {
   cncStickout: document.querySelector("#cnc-stickout-value"),
   cncResolution: document.querySelector("#cnc-resolution-value"),
   cncBitDiameter: document.querySelector("#cnc-bit-diameter-value"),
+  cncBlockHeight: document.querySelector("#cnc-block-height-value"),
   cncModelLift: document.querySelector("#cnc-model-lift-value"),
+  cncSlabThickness: document.querySelector("#cnc-slab-thickness-value"),
 };
 
 const state = {
@@ -192,6 +206,11 @@ const state = {
   workflowMode: "print",
   cncMesh: null,
   cncQa: null,
+  cncSlabs: [],
+  cncSlabPlan: null,
+  cncFingerHoles: [],
+  cncFingerHoleMode: false,
+  cncBusy: false,
   modelPayloadCache: null,
   modelManifoldCache: null,
   modelQaCache: null,
@@ -244,6 +263,7 @@ transformControls.addEventListener("dragging-changed", (event) => {
 
 transformControls.addEventListener("objectChange", () => {
   clearGeneratedSupport();
+  clearCncFingerHoleMarks();
   clearCncPreview();
   invalidateModelPayloadCache();
   applyModelTransform();
@@ -302,6 +322,16 @@ const materialCncFoam = new THREE.MeshStandardMaterial({
   side: THREE.DoubleSide,
   flatShading: true,
 });
+const cncSlabPalette = [
+  0x8fb6d9,
+  0x9acb8f,
+  0xd8c46e,
+  0xc99aa5,
+  0x9b8fcb,
+  0xd39a6a,
+  0x7dbfb7,
+  0xb7c87a,
+];
 const materialCncUnreachable = new THREE.MeshBasicMaterial({
   color: 0xc9463a,
   transparent: true,
@@ -313,6 +343,13 @@ const materialCncIntersection = new THREE.MeshBasicMaterial({
   color: 0xff4a2a,
   transparent: true,
   opacity: 0.36,
+  side: THREE.DoubleSide,
+  depthWrite: false,
+});
+const materialCncMarker = new THREE.MeshBasicMaterial({
+  color: 0x2f66b1,
+  transparent: true,
+  opacity: 0.76,
   side: THREE.DoubleSide,
   depthWrite: false,
 });
@@ -431,7 +468,6 @@ function bindControls() {
   controlsEl.clearPaint?.addEventListener("click", () => clearPaintedCoverageMarks());
   controlsEl.orientModel.addEventListener("click", () => toggleOrientationHelper());
   controlsEl.resetOrientation.addEventListener("click", () => resetOrientation());
-  controlsEl.applyRotationPreset?.addEventListener("click", () => applyRotationPreset());
   controlsEl.generateSupports.addEventListener("click", () => {
     state.supportPaintMode = "off";
     if (controlsEl.supportPaintMode) controlsEl.supportPaintMode.value = "off";
@@ -476,6 +512,26 @@ function bindControls() {
   });
   controlsEl.cncClear?.addEventListener("click", () => clearCncPreview());
   controlsEl.exportCncStl?.addEventListener("click", () => exportCncFoamStl());
+  controlsEl.exportCncSlabStls?.addEventListener("click", () => exportCncSlabStls());
+  controlsEl.exportCncSlabManifest?.addEventListener("click", () => exportCncSlabManifest());
+  controlsEl.cncAddFingerHole?.addEventListener("click", () => {
+    state.cncFingerHoleMode = !state.cncFingerHoleMode;
+    renderer.domElement.style.cursor = state.cncFingerHoleMode ? "crosshair" : "";
+    setCncStatus(
+      state.cncFingerHoleMode
+        ? "Finger-hole add mode on; click the CNC cavity margin after previewing."
+        : "Finger-hole add mode off.",
+      state.cncFingerHoleMode ? "pending" : "idle"
+    );
+    updateButtons();
+  });
+  controlsEl.cncClearFingerHoles?.addEventListener("click", () => {
+    state.cncFingerHoles = [];
+    state.cncFingerHoleMode = false;
+    clearCncPreview();
+    setCncStatus("Manual finger holes cleared. Preview CNC foam to rebuild.", "pending");
+    updateButtons();
+  });
   controlsEl.cncAutoLift?.addEventListener("change", () => {
     clearCncPreview();
     syncCncLiftControls();
@@ -544,8 +600,16 @@ function bindControls() {
     controlsEl.cncResolution,
     controlsEl.cncToolStickoutIn,
     controlsEl.cncBitDiameterIn,
-    controlsEl.cncClearance,
+    controlsEl.cncClearanceXy,
+    controlsEl.cncClearanceZ,
     controlsEl.cncModelLift,
+    controlsEl.cncAutoFingerHoles,
+    controlsEl.cncFingerHoleDiameter,
+    controlsEl.cncSlabsEnabled,
+    controlsEl.cncSlabCount,
+    controlsEl.cncSlabThicknessIn,
+    controlsEl.cncDowelDiameterMm,
+    controlsEl.cncDowelClearance,
   ].filter(Boolean)) {
     input.addEventListener("input", () => {
       if (input === controlsEl.supportBasePatternSpacing) clearResolutionPrompt();
@@ -565,8 +629,16 @@ function bindControls() {
         input === controlsEl.cncResolution ||
         input === controlsEl.cncToolStickoutIn ||
         input === controlsEl.cncBitDiameterIn ||
-        input === controlsEl.cncClearance ||
-        input === controlsEl.cncModelLift
+        input === controlsEl.cncClearanceXy ||
+        input === controlsEl.cncClearanceZ ||
+        input === controlsEl.cncModelLift ||
+        input === controlsEl.cncAutoFingerHoles ||
+        input === controlsEl.cncFingerHoleDiameter ||
+        input === controlsEl.cncSlabsEnabled ||
+        input === controlsEl.cncSlabCount ||
+        input === controlsEl.cncSlabThicknessIn ||
+        input === controlsEl.cncDowelDiameterMm ||
+        input === controlsEl.cncDowelClearance
       ) {
         if (input === controlsEl.cncModelLift && controlsEl.cncAutoLift) {
           controlsEl.cncAutoLift.checked = false;
@@ -759,6 +831,7 @@ function loadStlGeometry(geometry, label) {
   controlsEl.elevation.value = String(defaultElevation);
 
   state.manualSupports = [];
+  clearCncFingerHoleMarks();
   state.nextManualId = 1;
 
   setOrientationHelper(false);
@@ -787,6 +860,9 @@ function clearSceneModel() {
   state.interfaceMesh = null;
   state.cncMesh = null;
   state.cncQa = null;
+  state.cncSlabs = [];
+  state.cncSlabPlan = null;
+  clearCncFingerHoleMarks();
   invalidateModelPayloadCache();
   state.coverage = null;
   state.splitChunks = [];
@@ -889,6 +965,11 @@ function frameObject() {
 function onPointerDown(event) {
   if (!state.modelMesh || event.button !== 0) return;
   if (transformControls.enabled) return;
+  if (state.workflowMode === "cnc" && state.cncFingerHoleMode) {
+    event.preventDefault();
+    addCncFingerHoleFromEvent(event);
+    return;
+  }
   if (!state.manualSupportMode && state.supportPaintMode === "off") return;
 
   if (state.supportPaintMode === "enforce" || state.supportPaintMode === "block" || state.supportPaintMode === "erase") {
@@ -956,6 +1037,43 @@ function onPointerUp(event) {
   state.lastPaintWorldPoint = null;
   renderer.domElement.releasePointerCapture?.(event.pointerId);
   orbit.enabled = !transformControls.enabled;
+}
+
+function addCncFingerHoleFromEvent(event) {
+  if (state.cncBusy) {
+    setCncStatus("CNC preview is rebuilding. Please wait for it to finish before adding another finger hole.", "working");
+    return false;
+  }
+  if (!state.modelMesh || !state.cncQa) {
+    setCncStatus("Preview CNC foam first, then click near the cavity margin to add a finger hole.", "pending");
+    return false;
+  }
+  setPointerFromEvent(event);
+  raycaster.setFromCamera(pointer, camera);
+  const hits = raycaster.intersectObjects(cncGroup.children, true);
+  if (!hits.length) {
+    setCncStatus("Click on or near the CNC foam surface to place a finger hole.", "pending");
+    return false;
+  }
+
+  const point = hits[0].point;
+  state.cncFingerHoles.push({
+    id: `finger-${state.cncFingerHoles.length + 1}`,
+    x: roundedCoordinate(point.x),
+    y: roundedCoordinate(point.y),
+  });
+  state.cncFingerHoleMode = false;
+  setCncStatus("Finger hole added; rebuilding CNC preview. Keep this view open and wait...", "working");
+  generateCncFoamPreview({
+    keepExistingPreview: true,
+    initialStatus: "Finger hole added; rebuilding CNC preview. Keep this view open and wait...",
+  }).catch((error) => {
+    console.error(error);
+    setCncStatus(`CNC preview failed after finger-hole placement: ${error?.message || error}`, "error");
+    updateButtons();
+  });
+  updateButtons();
+  return true;
 }
 
 function snapshotPaintEvent(event) {
@@ -5159,71 +5277,115 @@ function pointDistanceSquared(a, b) {
   return dx * dx + dy * dy + dz * dz;
 }
 
-async function generateCncFoamPreview() {
+async function generateCncFoamPreview(options = {}) {
   if (!state.modelMesh) return;
 
-  setCncStatus("Sampling model for CNC foam relief...", "working");
-  clearGeneratedSupport();
-  clearCncPreview({ keepStatus: true });
-  setCncQaDashboard([
-    { label: "CNC", value: "Sampling", detail: "Reading model envelope", state: "working" },
-    { label: "Reach", value: "--", detail: "Waiting", state: "idle" },
-    { label: "Block", value: "--", detail: "Waiting", state: "idle" },
-    { label: "Export", value: "--", detail: "Waiting", state: "idle" },
-  ]);
-  await nextFrame();
-
-  const settings = cncSettings();
-  const result = await buildCncFoamRelief(settings, async (message) => {
-    setCncStatus(message, "working");
-    await nextFrame();
-  });
-  renderCncFoamPreview(result);
-  updateCncQaDashboard(result.qa);
-  const qa = result.qa;
-  const stateName = !qa.block_fits
-    ? "error"
-    : qa.unreachable_cells || qa.selected_tool_miss_cells
-      ? "caution"
-      : "ok";
-  setCncStatus(
-    `CNC foam relief ready: ${result.mesh.triangle_count.toLocaleString()} export triangles, ${formatStatusNumber(qa.reached_percent)}% selected-tool clearance, ${qa.unreachable_cells.toLocaleString()} cells too deep for stickout, ${qa.selected_tool_miss_cells.toLocaleString()} cells likely need a smaller finishing tool. Export remains the desired VCarve relief target.`,
-    stateName
-  );
+  state.cncBusy = true;
+  renderer.domElement.style.cursor = "wait";
   updateButtons();
+
+  try {
+    setCncStatus(options.initialStatus || "Sampling model for CNC foam relief...", "working");
+    clearGeneratedSupport();
+    if (!options.keepExistingPreview) {
+      clearCncPreview({ keepStatus: true });
+      setCncQaDashboard([
+        { label: "CNC", value: "Sampling", detail: "Reading model envelope", state: "working" },
+        { label: "Reach", value: "--", detail: "Waiting", state: "idle" },
+        { label: "Block", value: "--", detail: "Waiting", state: "idle" },
+        { label: "Export", value: "--", detail: "Waiting", state: "idle" },
+      ]);
+    } else {
+      setCncQaDashboard([
+        { label: "CNC", value: "Rebuilding", detail: "Keeping current preview visible", state: "working" },
+        { label: "Finger holes", value: "Updating", detail: "Please wait", state: "working" },
+        { label: "Export", value: "--", detail: "Will refresh when done", state: "idle" },
+      ]);
+    }
+    await nextFrame();
+
+    const settings = cncSettings();
+    const result = await buildCncFoamRelief(settings, async (message) => {
+      setCncStatus(message, "working");
+      await nextFrame();
+    });
+    renderCncFoamPreview(result);
+    updateCncQaDashboard(result.qa);
+    const qa = result.qa;
+    const stateName = !qa.block_fits
+      ? "error"
+      : qa.unreachable_cells || qa.selected_tool_miss_cells || (qa.slab_count && !qa.dowel_valid)
+        ? "caution"
+        : "ok";
+    setCncStatus(
+      `CNC foam relief ready: ${result.mesh.triangle_count.toLocaleString()} export triangles, ${formatStatusNumber(qa.reached_percent)}% selected-tool clearance, ${qa.unreachable_cells.toLocaleString()} cells too deep for stickout, ${qa.selected_tool_miss_cells.toLocaleString()} cells likely need a smaller finishing tool, ${qa.finger_holes.toLocaleString()} finger holes, and ${qa.slab_count.toLocaleString()} slab exports.${qa.dowel_warning ? ` ${qa.dowel_warning}` : ""} Export remains the desired VCarve relief target.`,
+      stateName
+    );
+  } finally {
+    state.cncBusy = false;
+    renderer.domElement.style.cursor = state.cncFingerHoleMode ? "crosshair" : "";
+    updateButtons();
+  }
 }
 
 function cncSettings() {
   const width = positiveNumber(controlsEl.cncBlockWidth?.value, 300);
   const depth = positiveNumber(controlsEl.cncBlockDepth?.value, 300);
-  const height = positiveNumber(controlsEl.cncBlockHeight?.value, 76.2);
+  const blockHeightMm = positiveNumber(controlsEl.cncBlockHeight?.value, 76.2);
+  const slabsEnabled = Boolean(controlsEl.cncSlabsEnabled?.checked);
+  const slabCount = Math.max(1, Math.min(24, Math.round(positiveNumber(controlsEl.cncSlabCount?.value, 3))));
+  const slabThicknessMm = Math.max(inchesToMm(0.5), Math.min(inchesToMm(2), inchesToMm(controlsEl.cncSlabThicknessIn?.value || 1)));
+  const height = slabsEnabled ? slabThicknessMm * slabCount : blockHeightMm;
   const requestedResolution = Math.max(0.2, positiveNumber(controlsEl.cncResolution?.value, 0.5));
   const maxResolutionByCells = Math.sqrt((width * depth) / CNC_MAX_GRID_CELLS);
   const resolution = Math.max(requestedResolution, maxResolutionByCells);
   const toolStickoutMm = inchesToMm(controlsEl.cncToolStickoutIn?.value || 1);
   const bitDiameterMm = Math.max(0.5, inchesToMm(controlsEl.cncBitDiameterIn?.value || 0.25));
   const toolEnd = controlsEl.cncToolEnd?.value === "ball" ? "ball" : "flat";
-  const clearanceMm = Math.max(0, positiveNumber(controlsEl.cncClearance?.value, 1));
+  const clearanceXyMm = Math.max(0, positiveNumber(controlsEl.cncClearanceXy?.value, 1));
+  const clearanceZMm = Math.max(0, positiveNumber(controlsEl.cncClearanceZ?.value, 1));
   const autoLiftEnabled = controlsEl.cncAutoLift?.checked !== false;
   const modelLiftMm = Math.max(0, positiveNumber(controlsEl.cncModelLift?.value, 0));
-  const allowedDepthMm = Math.max(0, Math.min(toolStickoutMm - CNC_TOOL_SAFETY_MARGIN_MM, height - CNC_MIN_FLOOR_THICKNESS_MM));
+  const fingerHoleDiameterMm = Math.max(8, positiveNumber(controlsEl.cncFingerHoleDiameter?.value, 30));
+  const dowelDiameterMm = Math.max(1, positiveNumber(controlsEl.cncDowelDiameterMm?.value, 6.35));
+  const dowelClearanceMm = Math.max(0, positiveNumber(controlsEl.cncDowelClearance?.value, 0.25));
+  const perSetupAllowedDepthMm = Math.max(0, toolStickoutMm - CNC_TOOL_SAFETY_MARGIN_MM);
+  const slabCanThroughCut = slabsEnabled && toolStickoutMm + 1e-6 >= slabThicknessMm;
+  const singleSetupAllowedDepthMm = Math.max(0, Math.min(perSetupAllowedDepthMm, height - CNC_MIN_FLOOR_THICKNESS_MM));
+  const slabStackAllowedDepthMm = Math.max(0, height - CNC_MIN_FLOOR_THICKNESS_MM);
+  const allowedDepthMm = slabCanThroughCut ? slabStackAllowedDepthMm : singleSetupAllowedDepthMm;
 
   return {
     width,
     depth,
     height,
+    blockHeightMm,
     resolution,
     requestedResolution,
     toolStickoutMm,
     bitDiameterMm,
     bitRadiusMm: bitDiameterMm / 2,
     toolEnd,
-    clearanceMm,
+    clearanceMm: clearanceZMm,
+    clearanceXyMm,
+    clearanceZMm,
     autoLiftEnabled,
     modelLiftMm,
     modelPlacementOffsetMm: modelLiftMm,
     allowedDepthMm,
+    perSetupAllowedDepthMm,
+    slabCanThroughCut,
     minFloorMm: CNC_MIN_FLOOR_THICKNESS_MM,
+    autoFingerHoles: Boolean(controlsEl.cncAutoFingerHoles?.checked),
+    fingerHoleDiameterMm,
+    fingerHoleRadiusMm: fingerHoleDiameterMm / 2,
+    manualFingerHoles: [...state.cncFingerHoles],
+    slabsEnabled,
+    slabCount,
+    slabThicknessMm,
+    dowelDiameterMm,
+    dowelClearanceMm,
+    dowelRadiusMm: dowelDiameterMm / 2 + dowelClearanceMm,
   };
 }
 
@@ -5292,6 +5454,7 @@ async function buildCncFoamRelief(settings, report = null) {
   }
 
   const enclosedVoidCells = fillEnclosedCncFootprintVoids(undersideZ, nx, ny);
+  const xyClearanceCells = applyCncXyClearance(undersideZ, nx, ny, dx, dy, settings.clearanceXyMm);
 
   let referenceZ = -Infinity;
   let footprintCells = 0;
@@ -5307,7 +5470,7 @@ async function buildCncFoamRelief(settings, report = null) {
   let maxRequiredDepth = 0;
   for (let index = 0; index < cellCount; index += 1) {
     if (!Number.isFinite(undersideZ[index])) continue;
-    const required = Math.max(0, referenceZ - undersideZ[index] + settings.clearanceMm);
+    const required = Math.max(0, referenceZ - undersideZ[index] + settings.clearanceZMm);
     rawDepth[index] = required;
     maxRequiredDepth = Math.max(maxRequiredDepth, required);
   }
@@ -5347,11 +5510,17 @@ async function buildCncFoamRelief(settings, report = null) {
   if (report) await report("Preparing CNC relief surface...");
   const reliefPrep = prepareCncReliefDepth(reachableDepth, nx, ny, dx, dy, settings);
   const finalDepth = reliefPrep.depth;
+  const preFingerHoleDepth = new Float64Array(finalDepth);
+  const fingerHolePlan = applyCncFingerHoles(finalDepth, preFingerHoleDepth, nx, ny, xMin, yMin, dx, dy, settings);
+  const dowelPlan = settings.slabsEnabled
+    ? planCncDowelHoles(finalDepth, nx, ny, xMin, yMin, dx, dy, settings, fingerHolePlan.holes)
+    : { holes: [], valid: true, warning: "" };
   if (report) await report("Simulating selected CNC cutter against relief...");
   const toolSimulation = simulateSelectedCncTool(finalDepth, nx, ny, dx, dy, settings);
   let maxCarvedDepth = 0;
   let selectedToolMissCells = 0;
   let toolReachedCells = 0;
+  let toolTestCells = 0;
   let intersectionCells = 0;
   let maxIntersectionMm = 0;
   let maxSelectedToolMissMm = 0;
@@ -5361,6 +5530,7 @@ async function buildCncFoamRelief(settings, report = null) {
     const carvedDepth = finalDepth[index];
     maxCarvedDepth = Math.max(maxCarvedDepth, carvedDepth);
     if (carvedDepth <= 0.001) continue;
+    toolTestCells += 1;
     const selectedToolShortfall = carvedDepth - toolSimulation.depth[index];
     if (selectedToolShortfall > intersectionToleranceMm) {
       intersection[index] = 1;
@@ -5381,18 +5551,22 @@ async function buildCncFoamRelief(settings, report = null) {
   }
 
   const foamMesh = buildCncFoamBlockMesh(finalDepth, nx, ny, xMin, yMin, dx, dy, settings.height);
+  const slabPlan = settings.slabsEnabled
+    ? buildCncSlabPlan(finalDepth, nx, ny, xMin, yMin, dx, dy, settings, dowelPlan.holes)
+    : null;
   const unreachableMesh = buildCncUnreachableOverlay(unreachable, nx, ny, xMin, yMin, dx, dy, settings.height + 0.35);
   const intersectionMesh = buildCncSurfaceOverlay(intersection, finalDepth, nx, ny, xMin, yMin, dx, dy, settings.height, 0.35, 3);
   const modelBounds = new THREE.Box3().setFromObject(state.modelMesh);
   const modelSize = modelBounds.getSize(new THREE.Vector3());
-  const blockFits = modelSize.x + settings.clearanceMm * 2 <= settings.width && modelSize.y + settings.clearanceMm * 2 <= settings.depth;
+  const blockFits = modelSize.x + settings.clearanceXyMm * 2 <= settings.width && modelSize.y + settings.clearanceXyMm * 2 <= settings.depth;
   const qa = {
     footprint_cells: footprintCells,
     reached_cells: toolReachedCells,
-    depth_reachable_cells: depthReachableCells,
+    depth_reachable_cells: toolTestCells,
+    sampled_clearance_cells: depthReachableCells,
     unreachable_cells: unreachableCells,
     lifted_out_cells: liftedOutCells,
-    reached_percent: depthReachableCells ? (toolReachedCells / depthReachableCells) * 100 : 0,
+    reached_percent: toolTestCells ? (toolReachedCells / toolTestCells) * 100 : 0,
     max_required_depth_mm: maxRequiredDepth,
     max_carved_depth_mm: maxCarvedDepth,
     reference_z_mm: referenceZ,
@@ -5400,6 +5574,8 @@ async function buildCncFoamRelief(settings, report = null) {
     model_placement_offset_mm: settings.modelPlacementOffsetMm,
     auto_lift_enabled: settings.autoLiftEnabled,
     allowed_depth_mm: settings.allowedDepthMm,
+    per_setup_allowed_depth_mm: settings.perSetupAllowedDepthMm,
+    slab_can_through_cut: settings.slabCanThroughCut,
     min_floor_mm: settings.height - maxCarvedDepth,
     block_fits: blockFits,
     tool_limited_cells: selectedToolMissCells,
@@ -5416,12 +5592,26 @@ async function buildCncFoamRelief(settings, report = null) {
     max_intersection_mm: maxIntersectionMm,
     intersection_tolerance_mm: intersectionToleranceMm,
     enclosed_void_cells: enclosedVoidCells,
+    xy_clearance_cells: xyClearanceCells,
+    clearance_xy_mm: settings.clearanceXyMm,
+    clearance_z_mm: settings.clearanceZMm,
+    finger_holes: fingerHolePlan.holes.length,
+    manual_finger_holes: fingerHolePlan.manualCount,
+    auto_finger_holes: fingerHolePlan.autoCount,
+    finger_hole_carved_cells: fingerHolePlan.carvedCells,
+    finger_hole_candidates: fingerHolePlan.candidateCount,
+    dowel_holes: dowelPlan.holes.length,
+    dowel_valid: dowelPlan.valid,
+    dowel_warning: dowelPlan.warning,
+    slab_count: slabPlan?.slabs?.length ?? 0,
+    slab_through_cut_count: slabPlan?.throughCutCount ?? 0,
+    slab_min_wall_mm: slabPlan?.minWallMm ?? null,
     tool_end: settings.toolEnd,
     grid: { nx, ny, dx, dy, resolution: settings.resolution },
     settings,
   };
 
-  return { mesh: foamMesh, unreachableMesh, intersectionMesh, qa };
+  return { mesh: foamMesh, unreachableMesh, intersectionMesh, qa, slabPlan, fingerHolePlan };
 }
 
 async function fillCncUndersideWithBvhAsync(undersideZ, nx, ny, xMin, yMin, dx, dy, report = null) {
@@ -5570,6 +5760,359 @@ function rasterizeTriangleUnderside(a, b, c, undersideZ, nx, ny, xMin, yMin, dx,
 
 function prepareCncReliefDepth(targetDepth, nx, ny, dx, dy, settings) {
   return { depth: new Float64Array(targetDepth), smoothingPasses: 0 };
+}
+
+function applyCncXyClearance(undersideZ, nx, ny, dx, dy, clearanceMm) {
+  const radius = Math.max(0, clearanceMm || 0);
+  if (radius <= 0.001) return 0;
+  const source = new Float64Array(undersideZ);
+  const rx = Math.ceil(radius / dx);
+  const ry = Math.ceil(radius / dy);
+  const radiusSquared = radius * radius;
+  let expandedCells = 0;
+
+  for (let iy = 0; iy < ny; iy += 1) {
+    for (let ix = 0; ix < nx; ix += 1) {
+      const z = source[iy * nx + ix];
+      if (!Number.isFinite(z)) continue;
+      for (let oy = -ry; oy <= ry; oy += 1) {
+        const sy = iy + oy;
+        if (sy < 0 || sy >= ny) continue;
+        for (let ox = -rx; ox <= rx; ox += 1) {
+          const sx = ix + ox;
+          if (sx < 0 || sx >= nx) continue;
+          const distSquared = (ox * dx) * (ox * dx) + (oy * dy) * (oy * dy);
+          if (distSquared > radiusSquared + 1e-9) continue;
+          const targetIndex = sy * nx + sx;
+          if (!Number.isFinite(undersideZ[targetIndex])) expandedCells += 1;
+          if (!Number.isFinite(undersideZ[targetIndex]) || z < undersideZ[targetIndex]) undersideZ[targetIndex] = z;
+        }
+      }
+    }
+  }
+
+  return expandedCells;
+}
+
+function applyCncFingerHoles(depths, cavityDepths, nx, ny, xMin, yMin, dx, dy, settings) {
+  const candidates = cncCavityBoundaryCandidates(cavityDepths, nx, ny, xMin, yMin, dx, dy, settings);
+  const holes = [];
+  const radius = Math.max(4, settings.fingerHoleRadiusMm || 15);
+
+  for (const manual of settings.manualFingerHoles ?? []) {
+    const snapped = snapCncFingerHoleToCandidate(manual, candidates, radius);
+    if (snapped && !cncPointNearAny(snapped, holes, radius * 1.4)) holes.push({ ...snapped, source: "manual" });
+  }
+
+  let autoCount = 0;
+  if (settings.autoFingerHoles) {
+    for (const hole of chooseAutoCncFingerHoles(candidates, holes, radius)) {
+      if (cncPointNearAny(hole, holes, radius * 1.4)) continue;
+      holes.push({ ...hole, source: "auto" });
+      autoCount += 1;
+    }
+  }
+
+  let carvedCells = 0;
+  for (const hole of holes) carvedCells += carveCncFingerHole(depths, cavityDepths, nx, ny, xMin, yMin, dx, dy, hole, radius);
+  return {
+    holes,
+    candidateCount: candidates.length,
+    manualCount: holes.filter((hole) => hole.source === "manual").length,
+    autoCount,
+    carvedCells,
+  };
+}
+
+function cncCavityBoundaryCandidates(depths, nx, ny, xMin, yMin, dx, dy, settings) {
+  const candidates = [];
+  const xMax = xMin + nx * dx;
+  const yMax = yMin + ny * dy;
+  const minEdgeMargin = Math.max((settings.fingerHoleRadiusMm ?? 15) + 4, (settings.bitRadiusMm ?? 0) + 2);
+  const neighborOffsets = [{ x: 1, y: 0 }, { x: -1, y: 0 }, { x: 0, y: 1 }, { x: 0, y: -1 }];
+
+  for (let iy = 0; iy < ny; iy += 1) {
+    for (let ix = 0; ix < nx; ix += 1) {
+      const depth = depths[iy * nx + ix];
+      if (depth <= 0.001) continue;
+      let outwardX = 0;
+      let outwardY = 0;
+      let isBoundary = false;
+      for (const offset of neighborOffsets) {
+        const sx = ix + offset.x;
+        const sy = iy + offset.y;
+        const neighborDepth = sx < 0 || sx >= nx || sy < 0 || sy >= ny ? 0 : depths[sy * nx + sx];
+        if (neighborDepth <= 0.001) {
+          isBoundary = true;
+          outwardX += offset.x;
+          outwardY += offset.y;
+        }
+      }
+      if (!isBoundary) continue;
+      const x = xMin + (ix + 0.5) * dx;
+      const y = yMin + (iy + 0.5) * dy;
+      const edgeMargin = Math.min(x - xMin, xMax - x, y - yMin, yMax - y);
+      if (edgeMargin < minEdgeMargin) continue;
+      const normalLength = Math.hypot(outwardX, outwardY) || 1;
+      const shallowScore = Math.max(0, (settings.allowedDepthMm ?? 0) - depth);
+      candidates.push({
+        x,
+        y,
+        ix,
+        iy,
+        depth,
+        normalX: outwardX / normalLength,
+        normalY: outwardY / normalLength,
+        edgeMargin,
+        score: edgeMargin * 0.7 + shallowScore * 0.35 - depth * 0.12,
+      });
+    }
+  }
+
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates;
+}
+
+function snapCncFingerHoleToCandidate(point, candidates, radius) {
+  if (!candidates.length || !point) return null;
+  let best = null;
+  let bestDistance = Infinity;
+  const maxDistance = Math.max(20, radius * 4);
+  for (const candidate of candidates) {
+    const distance = Math.hypot(candidate.x - point.x, candidate.y - point.y);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      best = candidate;
+    }
+  }
+  return best && bestDistance <= maxDistance ? best : null;
+}
+
+function chooseAutoCncFingerHoles(candidates, existing, radius) {
+  const available = candidates.filter((candidate) => !cncPointNearAny(candidate, existing, radius * 1.4));
+  if (available.length < 2) return available.slice(0, 2);
+  const first = available[0];
+  let second = null;
+  let secondScore = -Infinity;
+  for (const candidate of available.slice(1)) {
+    const distance = Math.hypot(candidate.x - first.x, candidate.y - first.y);
+    if (distance < radius * 3) continue;
+    const normalOpposition = -(candidate.normalX * first.normalX + candidate.normalY * first.normalY);
+    const score = candidate.score + distance * 0.5 + normalOpposition * radius * 4;
+    if (score > secondScore) {
+      secondScore = score;
+      second = candidate;
+    }
+  }
+  return second ? [first, second] : available.slice(0, 2);
+}
+
+function carveCncFingerHole(depths, cavityDepths, nx, ny, xMin, yMin, dx, dy, hole, radius) {
+  const ix0 = Math.max(0, Math.floor((hole.x - radius - xMin) / dx));
+  const ix1 = Math.min(nx - 1, Math.ceil((hole.x + radius - xMin) / dx));
+  const iy0 = Math.max(0, Math.floor((hole.y - radius - yMin) / dy));
+  const iy1 = Math.min(ny - 1, Math.ceil((hole.y + radius - yMin) / dy));
+  const radiusSquared = radius * radius;
+  const seamTolerance = Math.max(dx, dy) * 0.75;
+  const throatWidth = Math.max(CNC_FINGER_HOLE_SUPPORT_INSET_MM, Math.min(dx, dy) * 2.5);
+  const throatHalfWidth = Math.max(radius * 0.22, Math.min(dx, dy) * 2);
+  const throatDepth = Math.max(hole.depth || 0, radius * 0.55);
+  let carvedCells = 0;
+  for (let iy = iy0; iy <= iy1; iy += 1) {
+    const cy = yMin + (iy + 0.5) * dy;
+    for (let ix = ix0; ix <= ix1; ix += 1) {
+      const index = iy * nx + ix;
+      const cx = xMin + (ix + 0.5) * dx;
+      const relX = cx - hole.x;
+      const relY = cy - hole.y;
+      const outwardDistance = relX * hole.normalX + relY * hole.normalY;
+      const isCavityCell = cavityDepths[index] > 0.001;
+      const inwardLimit = isCavityCell ? CNC_FINGER_HOLE_SUPPORT_INSET_MM : seamTolerance;
+      if (outwardDistance < -inwardLimit) continue;
+      const distSquared = relX * relX + relY * relY;
+      if (distSquared > radiusSquared) continue;
+      const tangentDistance = Math.abs(relX * -hole.normalY + relY * hole.normalX);
+      const scallopDepth = Math.sqrt(Math.max(0, radiusSquared - distSquared));
+      const opensToCavity = outwardDistance >= -CNC_FINGER_HOLE_SUPPORT_INSET_MM &&
+        outwardDistance <= throatWidth &&
+        tangentDistance <= throatHalfWidth;
+      const targetDepth = opensToCavity ? Math.max(scallopDepth, throatDepth) : scallopDepth;
+      const before = depths[index];
+      depths[index] = Math.max(before, targetDepth);
+      if (depths[index] > before + 0.001) carvedCells += 1;
+    }
+  }
+  return carvedCells;
+}
+
+function cncPointNearAny(point, points, distance) {
+  return points.some((other) => Math.hypot(point.x - other.x, point.y - other.y) < distance);
+}
+
+function planCncDowelHoles(depths, nx, ny, xMin, yMin, dx, dy, settings, fingerHoles) {
+  const candidates = cncCavityBoundaryCandidates(depths, nx, ny, xMin, yMin, dx, dy, {
+    ...settings,
+    fingerHoleRadiusMm: Math.max(settings.dowelRadiusMm + 4, settings.fingerHoleRadiusMm),
+  });
+  const holes = [];
+  const offset = Math.max(settings.dowelRadiusMm + 8, settings.clearanceXyMm + settings.dowelRadiusMm + 5);
+  const xMax = xMin + nx * dx;
+  const yMax = yMin + ny * dy;
+  const minEdge = settings.dowelRadiusMm + 6;
+
+  for (const candidate of candidates) {
+    const x = candidate.x + candidate.normalX * offset;
+    const y = candidate.y + candidate.normalY * offset;
+    if (x < xMin + minEdge || x > xMax - minEdge || y < yMin + minEdge || y > yMax - minEdge) continue;
+    const ix = Math.floor((x - xMin) / dx);
+    const iy = Math.floor((y - yMin) / dy);
+    if (ix < 0 || ix >= nx || iy < 0 || iy >= ny) continue;
+    if (depths[iy * nx + ix] > 0.001) continue;
+    if (cncPointNearAny({ x, y }, fingerHoles, settings.dowelRadiusMm + settings.fingerHoleRadiusMm + 6)) continue;
+    const hole = { x, y, radiusMm: settings.dowelRadiusMm, score: candidate.score };
+    if (cncPointNearAny(hole, holes, settings.dowelRadiusMm * 5)) continue;
+    holes.push(hole);
+    if (holes.length >= 12) break;
+  }
+
+  const selected = chooseNonCollinearCncPoints(holes, 3);
+  return {
+    holes: selected,
+    valid: selected.length >= 3,
+    warning: selected.length >= 3 ? "" : "Could not safely place three dowel holes; increase block size or reduce cavity/clearance.",
+  };
+}
+
+function chooseNonCollinearCncPoints(candidates, count) {
+  if (candidates.length <= count) return candidates;
+  const first = candidates[0];
+  let second = candidates[1];
+  let bestDistance = -Infinity;
+  for (const candidate of candidates.slice(1)) {
+    const distance = Math.hypot(candidate.x - first.x, candidate.y - first.y);
+    if (distance > bestDistance) {
+      bestDistance = distance;
+      second = candidate;
+    }
+  }
+  let third = null;
+  let bestArea = -Infinity;
+  for (const candidate of candidates) {
+    if (candidate === first || candidate === second) continue;
+    const area = Math.abs((second.x - first.x) * (candidate.y - first.y) - (second.y - first.y) * (candidate.x - first.x));
+    if (area > bestArea) {
+      bestArea = area;
+      third = candidate;
+    }
+  }
+  return [first, second, third].filter(Boolean).slice(0, count);
+}
+
+function buildCncSlabPlan(depths, nx, ny, xMin, yMin, dx, dy, settings, dowelHoles) {
+  const slabs = [];
+  const slabThickness = Math.max(1, settings.slabThicknessMm);
+  const slabCount = Math.max(1, Math.round(settings.slabCount || Math.ceil(settings.height / slabThickness)));
+  let throughCutCount = 0;
+  let minWallMm = Infinity;
+  for (const hole of dowelHoles) {
+    minWallMm = Math.min(
+      minWallMm,
+      hole.x - xMin - hole.radiusMm,
+      xMin + settings.width - hole.x - hole.radiusMm,
+      hole.y - yMin - hole.radiusMm,
+      yMin + settings.depth - hole.y - hole.radiusMm
+    );
+  }
+
+  for (let index = 0; index < slabCount; index += 1) {
+    const topDepth = index * slabThickness;
+    const bottomDepth = Math.min(settings.height, (index + 1) * slabThickness);
+    const thickness = bottomDepth - topDepth;
+    const globalBottom = settings.height - bottomDepth;
+    const mesh = buildCncSlabMesh(depths, nx, ny, xMin, yMin, dx, dy, thickness, topDepth, bottomDepth, dowelHoles);
+    if (mesh.through_cut_cells) throughCutCount += 1;
+    slabs.push({
+      id: `S${String(index + 1).padStart(2, "0")}`,
+      mesh,
+      top_depth_mm: roundedCoordinate(topDepth),
+      bottom_depth_mm: roundedCoordinate(bottomDepth),
+      thickness_mm: roundedCoordinate(thickness),
+      global_bottom_mm: roundedCoordinate(globalBottom),
+      through_cut_cells: mesh.through_cut_cells ?? 0,
+    });
+  }
+
+  return {
+    slabs,
+    dowelHoles,
+    throughCutCount,
+    minWallMm: Number.isFinite(minWallMm) ? roundedCoordinate(minWallMm) : null,
+    settings: {
+      slab_count: slabCount,
+      slab_thickness_mm: roundedCoordinate(settings.slabThicknessMm),
+      dowel_diameter_mm: roundedCoordinate(settings.dowelDiameterMm),
+      dowel_clearance_mm: roundedCoordinate(settings.dowelClearanceMm),
+    },
+  };
+}
+
+function buildCncSlabMesh(depths, nx, ny, xMin, yMin, dx, dy, slabHeight, topDepth, bottomDepth, dowelHoles) {
+  const mesh = { vertices: [], triangles: [], triangle_count: 0, through_cut_cells: 0 };
+  const heights = new Float64Array(nx * ny);
+  const epsilon = 0.001;
+
+  for (let iy = 0; iy < ny; iy += 1) {
+    const y = yMin + (iy + 0.5) * dy;
+    for (let ix = 0; ix < nx; ix += 1) {
+      const x = xMin + (ix + 0.5) * dx;
+      let height = slabHeight - Math.max(0, Math.min(slabHeight, depths[iy * nx + ix] - topDepth));
+      for (const hole of dowelHoles) {
+        if (Math.hypot(x - hole.x, y - hole.y) <= hole.radiusMm) {
+          height = 0;
+          break;
+        }
+      }
+      if (height <= epsilon) {
+        if (depths[iy * nx + ix] >= bottomDepth - epsilon) mesh.through_cut_cells += 1;
+        height = 0;
+      }
+      heights[iy * nx + ix] = height;
+    }
+  }
+
+  const cellHeight = (ix, iy) => (ix < 0 || ix >= nx || iy < 0 || iy >= ny ? 0 : heights[iy * nx + ix]);
+  for (let iy = 0; iy < ny; iy += 1) {
+    for (let ix = 0; ix < nx; ix += 1) {
+      const height = heights[iy * nx + ix];
+      if (height <= epsilon) continue;
+      const x0 = xMin + ix * dx;
+      const x1 = x0 + dx;
+      const y0 = yMin + iy * dy;
+      const y1 = y0 + dy;
+      appendQuadCoords(mesh, x0, y0, height, x1, y0, height, x1, y1, height, x0, y1, height);
+      appendQuadCoords(mesh, x0, y0, 0, x0, y1, 0, x1, y1, 0, x1, y0, 0);
+
+      const left = cellHeight(ix - 1, iy);
+      const right = cellHeight(ix + 1, iy);
+      const down = cellHeight(ix, iy - 1);
+      const up = cellHeight(ix, iy + 1);
+      if (left < height - epsilon) appendQuadCoords(mesh, x0, y1, left, x0, y0, left, x0, y0, height, x0, y1, height);
+      if (right < height - epsilon) appendQuadCoords(mesh, x1, y0, right, x1, y1, right, x1, y1, height, x1, y0, height);
+      if (down < height - epsilon) appendQuadCoords(mesh, x0, y0, down, x1, y0, down, x1, y0, height, x0, y0, height);
+      if (up < height - epsilon) appendQuadCoords(mesh, x1, y1, up, x0, y1, up, x0, y1, height, x1, y1, height);
+    }
+  }
+
+  mesh.triangle_count = Math.floor(mesh.triangles.length / 3);
+  return mesh;
+}
+
+function appendQuadCoords(mesh, ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz) {
+  const a = pushMeshVertex(mesh, ax, ay, az);
+  const b = pushMeshVertex(mesh, bx, by, bz);
+  const c = pushMeshVertex(mesh, cx, cy, cz);
+  const d = pushMeshVertex(mesh, dx, dy, dz);
+  appendSideQuad(mesh, a, b, c, d);
 }
 
 function simulateSelectedCncTool(desiredDepth, nx, ny, dx, dy, settings) {
@@ -5780,6 +6323,19 @@ function appendSideQuad(mesh, a, b, c, d) {
   pushMeshTriangle(mesh, a, c, d);
 }
 
+function cncSlabMaterial(index) {
+  return new THREE.MeshStandardMaterial({
+    color: cncSlabPalette[index % cncSlabPalette.length],
+    roughness: 0.88,
+    metalness: 0,
+    transparent: true,
+    opacity: 0.58,
+    side: THREE.DoubleSide,
+    flatShading: true,
+    depthWrite: false,
+  });
+}
+
 function renderCncFoamPreview(result) {
   cncGroup.clear();
   splitGroup.clear();
@@ -5794,11 +6350,42 @@ function renderCncFoamPreview(result) {
   state.splitPreviewVisible = false;
   state.cncMesh = result.mesh;
   state.cncQa = result.qa;
-  renderMeshIntoGroup(cncGroup, result.mesh, materialCncFoam, "CNC VCarve relief target");
+  state.cncSlabPlan = result.slabPlan ?? null;
+  state.cncSlabs = result.slabPlan?.slabs ?? [];
+  if (state.cncSlabs.length) {
+    for (const [index, slab] of state.cncSlabs.entries()) {
+      const slabMesh = renderMeshIntoGroup(cncGroup, slab.mesh, cncSlabMaterial(index), `CNC foam slab ${slab.id}`);
+      if (slabMesh) slabMesh.position.z = slab.global_bottom_mm;
+    }
+  } else {
+    renderMeshIntoGroup(cncGroup, result.mesh, materialCncFoam, "CNC VCarve relief target");
+  }
   renderMeshIntoGroup(cncGroup, result.unreachableMesh, materialCncUnreachable, "CNC unreachable overlay");
   renderMeshIntoGroup(cncGroup, result.intersectionMesh, materialCncIntersection, "CNC clearance risk overlay");
+  renderCncPlanMarkers(result.fingerHolePlan?.holes ?? [], result.slabPlan?.dowelHoles ?? [], result.qa?.settings?.height ?? 0);
   cncGroup.visible = true;
   supportGroup.visible = false;
+}
+
+function renderCncPlanMarkers(fingerHoles, dowelHoles, blockHeight) {
+  for (const hole of fingerHoles) {
+    const ring = new THREE.Mesh(
+      new THREE.RingGeometry(Math.max(0.5, (hole.radiusMm ?? 15) * 0.85), Math.max(1, hole.radiusMm ?? 15), 36),
+      materialCncMarker
+    );
+    ring.position.set(hole.x, hole.y, blockHeight + 1.2);
+    ring.name = `CNC ${hole.source || "planned"} finger hole`;
+    cncGroup.add(ring);
+  }
+  for (const hole of dowelHoles) {
+    const ring = new THREE.Mesh(
+      new THREE.RingGeometry(Math.max(0.5, (hole.radiusMm ?? 3) * 0.75), Math.max(1, hole.radiusMm ?? 3), 28),
+      materialCncMarker
+    );
+    ring.position.set(hole.x, hole.y, blockHeight + 2.0);
+    ring.name = "CNC dowel alignment hole";
+    cncGroup.add(ring);
+  }
 }
 
 function renderMeshIntoGroup(group, supportMesh, material, name) {
@@ -5821,9 +6408,17 @@ function clearCncPreview(options = {}) {
   cncGroup.clear();
   state.cncMesh = null;
   state.cncQa = null;
+  state.cncSlabs = [];
+  state.cncSlabPlan = null;
   if (!options.keepStatus) setCncStatus("Load a model to preview a foam relief.", "idle");
   if (state.workflowMode === "cnc") resetQaDashboard();
   updateButtons();
+}
+
+function clearCncFingerHoleMarks() {
+  state.cncFingerHoles = [];
+  state.cncFingerHoleMode = false;
+  if (renderer?.domElement && !state.cncBusy) renderer.domElement.style.cursor = "";
 }
 
 async function autoFitCncLift() {
@@ -5876,7 +6471,9 @@ function updateCncQaDashboard(qa) {
     {
       label: "Depth",
       value: `${formatStatusNumber(qa.max_carved_depth_mm)} mm`,
-      detail: `${formatStatusNumber(qa.allowed_depth_mm)} mm allowed, ${formatStatusNumber(qa.model_placement_offset_mm)} mm ${qa.auto_lift_enabled ? "auto" : "manual"} offset`,
+      detail: qa.settings.slabsEnabled
+        ? `${formatStatusNumber(qa.allowed_depth_mm)} mm stack allowed, ${formatStatusNumber(qa.per_setup_allowed_depth_mm)} mm per slab reach`
+        : `${formatStatusNumber(qa.allowed_depth_mm)} mm allowed, ${formatStatusNumber(qa.model_placement_offset_mm)} mm ${qa.auto_lift_enabled ? "auto" : "manual"} offset`,
       state: qa.unreachable_cells ? "caution" : "ok",
     },
     {
@@ -5904,6 +6501,26 @@ function updateCncQaDashboard(qa) {
       value: qa.tool_end === "ball" ? "Ball nose" : "Flat end",
       detail: `${formatStatusNumber(qa.settings.bitRadiusMm)} mm radius, ${formatStatusNumber(qa.tool_simulation_resolution_mm)} mm sim grid`,
       state: "ok",
+    },
+    {
+      label: "Clearance",
+      value: `${formatStatusNumber(qa.clearance_xy_mm)} / ${formatStatusNumber(qa.clearance_z_mm)} mm`,
+      detail: `${qa.xy_clearance_cells.toLocaleString()} XY-expanded cells`,
+      state: "ok",
+    },
+    {
+      label: "Finger holes",
+      value: qa.finger_holes ? qa.finger_holes.toLocaleString() : "None",
+      detail: `${qa.auto_finger_holes.toLocaleString()} auto, ${qa.manual_finger_holes.toLocaleString()} manual`,
+      state: qa.settings.autoFingerHoles && qa.finger_holes < 2 ? "caution" : "ok",
+    },
+    {
+      label: "Slabs",
+      value: qa.slab_count ? qa.slab_count.toLocaleString() : "Off",
+      detail: qa.slab_count
+        ? `${qa.dowel_holes.toLocaleString()} dowels, ${qa.slab_can_through_cut ? "through-cut reach OK" : "stickout < slab"}`
+        : "Single relief STL",
+      state: qa.slab_count && (!qa.dowel_valid || !qa.slab_can_through_cut) ? "caution" : "ok",
     },
   ]);
 }
@@ -6276,8 +6893,23 @@ function updateOutputs() {
   if (outputs.cncBitDiameter && controlsEl.cncBitDiameterIn) {
     outputs.cncBitDiameter.textContent = `${formatStatusNumber(inchesToMm(controlsEl.cncBitDiameterIn.value))} mm`;
   }
+  if (outputs.cncBlockHeight && controlsEl.cncSlabsEnabled && controlsEl.cncSlabCount && controlsEl.cncSlabThicknessIn) {
+    const slabsEnabled = Boolean(controlsEl.cncSlabsEnabled.checked);
+    if (slabsEnabled) {
+      const slabCount = Math.max(1, Math.round(positiveNumber(controlsEl.cncSlabCount.value, 3)));
+      const slabThicknessMm = inchesToMm(controlsEl.cncSlabThicknessIn.value || 1);
+      outputs.cncBlockHeight.textContent = `Overridden by slabs: ${formatStatusNumber(slabThicknessMm * slabCount)} mm`;
+    } else {
+      outputs.cncBlockHeight.textContent = "Used when slabs are off";
+    }
+  }
   if (outputs.cncModelLift && controlsEl.cncModelLift) {
     outputs.cncModelLift.textContent = `${formatStatusNumber(controlsEl.cncModelLift.value)} mm`;
+  }
+  if (outputs.cncSlabThickness && controlsEl.cncSlabCount && controlsEl.cncSlabThicknessIn) {
+    const slabCount = Math.max(1, Math.round(positiveNumber(controlsEl.cncSlabCount.value, 3)));
+    const slabThicknessMm = inchesToMm(controlsEl.cncSlabThicknessIn.value || 1);
+    outputs.cncSlabThickness.textContent = `${formatStatusNumber(slabThicknessMm)} mm each, ${formatStatusNumber(slabThicknessMm * slabCount)} mm total`;
   }
 }
 
@@ -6287,6 +6919,9 @@ function updateButtons() {
   const generatedSupportTriangles = state.supportMesh?.triangle_count ?? 0;
   const generatedInterfaceTriangles = state.interfaceMesh?.triangle_count ?? 0;
   const generatedCncTriangles = state.cncMesh?.triangle_count ?? 0;
+  const generatedCncSlabs = state.cncSlabs?.length ?? 0;
+  const cncBusy = Boolean(state.cncBusy);
+  const cncSlabsEnabled = Boolean(controlsEl.cncSlabsEnabled?.checked);
   if (controlsEl.toggleModelVisibility) {
     controlsEl.toggleModelVisibility.disabled = !hasModel;
     controlsEl.toggleModelVisibility.textContent = state.modelVisible ? "Hide model" : "Show model";
@@ -6299,6 +6934,16 @@ function updateButtons() {
     if (controlsEl.modelDisplayMode.value !== state.modelDisplayMode) {
       controlsEl.modelDisplayMode.value = state.modelDisplayMode;
     }
+  }
+  if (controlsEl.cncBlockHeight) {
+    controlsEl.cncBlockHeight.disabled = cncBusy || cncSlabsEnabled;
+  }
+  if (controlsEl.cncBlockHeightCell) {
+    const blockHeightOverridden = cncSlabsEnabled;
+    controlsEl.cncBlockHeightCell.classList.toggle("is-disabled", cncBusy || blockHeightOverridden);
+    controlsEl.cncBlockHeightCell.title = blockHeightOverridden
+      ? "Use multiple slabs sets total foam height from slab count and slab thickness."
+      : "";
   }
   if (controlsEl.supportDisplayMode) {
     controlsEl.supportDisplayMode.disabled = generatedSupportTriangles === 0 && generatedInterfaceTriangles === 0;
@@ -6326,13 +6971,15 @@ function updateButtons() {
   }
   controlsEl.orientModel.disabled = !hasModel;
   controlsEl.resetOrientation.disabled = !hasModel;
-  if (controlsEl.applyRotationPreset) {
-    controlsEl.applyRotationPreset.disabled = !hasModel;
-  }
   controlsEl.generateSupports.disabled = !hasModel;
-  if (controlsEl.cncGenerate) controlsEl.cncGenerate.disabled = !hasModel;
-  if (controlsEl.cncAutoFit) controlsEl.cncAutoFit.disabled = !hasModel;
-  if (controlsEl.cncClear) controlsEl.cncClear.disabled = generatedCncTriangles === 0;
+  if (controlsEl.cncGenerate) controlsEl.cncGenerate.disabled = !hasModel || cncBusy;
+  if (controlsEl.cncAutoFit) controlsEl.cncAutoFit.disabled = !hasModel || cncBusy;
+  if (controlsEl.cncClear) controlsEl.cncClear.disabled = generatedCncTriangles === 0 || cncBusy;
+  if (controlsEl.cncAddFingerHole) {
+    controlsEl.cncAddFingerHole.disabled = !hasModel || !state.cncQa?.finger_hole_candidates || cncBusy;
+    controlsEl.cncAddFingerHole.textContent = state.cncFingerHoleMode ? "Stop adding" : "Add finger hole";
+  }
+  if (controlsEl.cncClearFingerHoles) controlsEl.cncClearFingerHoles.disabled = !state.cncFingerHoles.length || cncBusy;
   if (controlsEl.toggleCoverage) {
     controlsEl.toggleCoverage.disabled = !state.coverage?.cells?.length;
     controlsEl.toggleCoverage.textContent = state.coverageVisible ? "Hide coverage" : "Show coverage";
@@ -6344,7 +6991,9 @@ function updateButtons() {
   if (controlsEl.exportPly) controlsEl.exportPly.disabled = generatedSupportTriangles === 0;
   if (controlsEl.exportInterfaceStl) controlsEl.exportInterfaceStl.disabled = generatedInterfaceTriangles === 0;
   if (controlsEl.exportInterfacePly) controlsEl.exportInterfacePly.disabled = generatedInterfaceTriangles === 0;
-  if (controlsEl.exportCncStl) controlsEl.exportCncStl.disabled = generatedCncTriangles === 0;
+  if (controlsEl.exportCncStl) controlsEl.exportCncStl.disabled = generatedCncTriangles === 0 || cncBusy;
+  if (controlsEl.exportCncSlabStls) controlsEl.exportCncSlabStls.disabled = generatedCncSlabs === 0 || cncBusy;
+  if (controlsEl.exportCncSlabManifest) controlsEl.exportCncSlabManifest.disabled = !state.cncSlabPlan || cncBusy;
   if (controlsEl.previewSplit) controlsEl.previewSplit.disabled = generatedSupportTriangles === 0;
   if (controlsEl.clearSplit) controlsEl.clearSplit.disabled = !state.splitPreviewVisible;
   if (controlsEl.exportSplitStls) controlsEl.exportSplitStls.disabled = !state.splitChunks.length;
@@ -6352,7 +7001,7 @@ function updateButtons() {
   const totalGeneratedTriangles = generatedSupportTriangles + generatedInterfaceTriangles;
   if (state.workflowMode === "cnc") {
     supportStatus.textContent = generatedCncTriangles
-      ? `${generatedCncTriangles.toLocaleString()} CNC foam relief triangles`
+      ? `${generatedCncTriangles.toLocaleString()} CNC foam relief triangles${generatedCncSlabs ? `, ${generatedCncSlabs.toLocaleString()} slab STLs ready` : ""}`
       : "CNC foam relief not generated";
   } else {
     supportStatus.textContent = totalGeneratedTriangles
@@ -6765,25 +7414,11 @@ function resetOrientation() {
   if (!state.modelMesh) return;
   state.modelMesh.rotation.set(0, 0, 0);
   clearGeneratedSupport();
+  clearCncFingerHoleMarks();
+  clearCncPreview();
   applyElevation();
   updateManualMarkers();
   modelStatus.textContent = "Rotation reset";
-}
-
-function applyRotationPreset() {
-  if (!state.modelMesh || !controlsEl.rotationPreset) return;
-  const angles = controlsEl.rotationPreset.value.split(",").map((value) => Number(value));
-  if (angles.length !== 3 || angles.some((value) => !Number.isFinite(value))) return;
-
-  state.modelMesh.rotation.set(
-    THREE.MathUtils.degToRad(angles[0]),
-    THREE.MathUtils.degToRad(angles[1]),
-    THREE.MathUtils.degToRad(angles[2])
-  );
-  clearGeneratedSupport();
-  applyElevation();
-  updateManualMarkers();
-  modelStatus.textContent = `Applied rotation ${angles.join(" / ")} degrees`;
 }
 
 function resize() {
@@ -6832,6 +7467,72 @@ function exportCncFoamStl() {
 
   const stl = supportMeshToAsciiStl(state.cncMesh, "cradlemaker_cnc_foam_relief");
   downloadTextFile(stl, supportExportName("cnc-foam-relief", "stl"), "model/stl");
+}
+
+function exportCncSlabStls() {
+  if (!state.cncSlabs?.length) return;
+  const slabs = [...state.cncSlabs];
+  setCncStatus(`Preparing ${slabs.length.toLocaleString()} CNC slab STL download${slabs.length === 1 ? "" : "s"}...`, "working");
+  for (const [index, slab] of slabs.entries()) {
+    window.setTimeout(() => {
+      const stl = supportMeshToAsciiStl(slab.mesh, `cradlemaker_cnc_foam_${slab.id.toLowerCase()}`);
+      downloadTextFile(stl, supportExportName(`cnc-foam-${slab.id.toLowerCase()}`, "stl"), "model/stl");
+      if (index === slabs.length - 1) {
+        setCncStatus(`Exported ${slabs.length.toLocaleString()} CNC slab STL${slabs.length === 1 ? "" : "s"}.`, "pending");
+      }
+    }, index * 180);
+  }
+}
+
+function exportCncSlabManifest() {
+  if (!state.cncSlabPlan) return;
+  downloadTextFile(JSON.stringify(cncSlabManifest(), null, 2), supportExportName("cnc-slab-manifest", "json"), "application/json");
+}
+
+function cncSlabManifest() {
+  const plan = state.cncSlabPlan;
+  const qa = state.cncQa ?? {};
+  return {
+    version: 1,
+    created_at: new Date().toISOString(),
+    model: state.modelMesh?.name || "model",
+    coordinate_mode: "local_slab_stl_with_manifest_offsets",
+    block_mm: {
+      width: qa.settings?.width,
+      depth: qa.settings?.depth,
+      height: qa.settings?.height,
+    },
+    clearance_mm: {
+      xy: qa.clearance_xy_mm,
+      z: qa.clearance_z_mm,
+    },
+    slab_settings: plan.settings,
+    dowel_holes: (plan.dowelHoles ?? []).map((hole, index) => ({
+      id: `D${index + 1}`,
+      x_mm: roundedCoordinate(hole.x),
+      y_mm: roundedCoordinate(hole.y),
+      radius_mm: roundedCoordinate(hole.radiusMm),
+      diameter_mm: roundedCoordinate(hole.radiusMm * 2),
+    })),
+    qa: {
+      slab_count: qa.slab_count,
+      slab_through_cut_count: qa.slab_through_cut_count,
+      dowel_valid: qa.dowel_valid,
+      dowel_warning: qa.dowel_warning,
+      min_wall_mm: qa.slab_min_wall_mm,
+    },
+    slabs: (plan.slabs ?? []).map((slab) => ({
+      id: slab.id,
+      filename_hint: supportExportName(`cnc-foam-${slab.id.toLowerCase()}`, "stl"),
+      local_z_min_mm: 0,
+      local_z_max_mm: slab.thickness_mm,
+      stack_global_bottom_mm: slab.global_bottom_mm,
+      top_depth_from_stack_top_mm: slab.top_depth_mm,
+      bottom_depth_from_stack_top_mm: slab.bottom_depth_mm,
+      through_cut_cells: slab.through_cut_cells,
+      triangle_count: slab.mesh?.triangle_count ?? 0,
+    })),
+  };
 }
 
 function exportSplitStls() {
