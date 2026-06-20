@@ -244,6 +244,15 @@ input[type="text"] {
   gap: 5px;
 }
 
+.param-cell.is-disabled {
+  opacity: 0.48;
+}
+
+.param-cell.is-disabled .param-label,
+.param-cell.is-disabled .param-note {
+  color: var(--muted);
+}
+
 .param-label {
   color: var(--panel-ink);
   font-size: 13px;

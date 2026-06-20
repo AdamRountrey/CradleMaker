@@ -27,7 +27,7 @@ http://127.0.0.1:5177/cradlemaker-web/
 ## Current Features
 
 - STL import and bundled sample model loading.
-- Three.js model viewer with grid, model visibility modes, rotation presets, and surface-painted support enforcer/blocker regions.
+- Three.js model viewer with grid, model visibility modes, rotation helper, and surface-painted support enforcer/blocker regions.
 - Stable normal/default cradle generation through the CradleMaker WASM support core.
 - QA dashboard for support coverage, model intersections, mesh support reach, and estimated stability.
 - BVH-accelerated model picking, paint interaction, model-intersection QA, and CNC foam relief sampling.
@@ -35,7 +35,7 @@ http://127.0.0.1:5177/cradlemaker-web/
 - Optional foam gap clearance for adding padding after printing.
 - Split preview for large cradles, with per-chunk STL export and manifest export.
 - Z-slide dovetail connector work for split chunks.
-- CNC foam workflow for ShopBot/VCarve-style top-side relief carving from foam blocks.
+- CNC foam workflow for ShopBot/VCarve-style top-side relief carving from foam blocks, including separate XY/Z clearance, finger-hole pockets, multi-slab exports, dowel alignment holes, and tool reach QA.
 - GitHub Pages deployment from the static `cradlemaker-web/` folder.
 
 ## Terms of Use
@@ -61,7 +61,7 @@ cradlemaker-web/
 
 Organic/tree support experiments are kept in the codebase for future work, but the current UI intentionally exposes only the stable `Normal auto` / `Default (Grid/Organic)` cradle workflow.
 
-The CNC foam workflow exports a 3D STL relief/block for VCarve import. It auto-fits model lift by default when the carve is too deep, with a manual lift override when needed, and limits the cavity surface with a flat-end or ball-nose cutter envelope so the preview does not show details the chosen tool cannot reach. It does not generate ShopBot toolpaths.
+The CNC foam workflow exports VCarve-importable STL relief/block geometry for top-side ShopBot-style carving. It supports separate XY and Z cavity clearance, auto-fit model lift, flat-end or ball-nose tool reach QA, optional finger-hole pockets around the cavity margin, and optional multi-slab foam workflows. In slab mode, slab count and slab thickness define the total foam height, and each slab can be exported as a local-coordinate STL with a JSON manifest and through-slab dowel alignment holes. It does not generate ShopBot toolpaths.
 
 Painted support enforcer/blocker regions are available in print mode. Coverage paint is a surface mask; regenerate supports after painting to apply it.
 
