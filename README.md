@@ -35,7 +35,7 @@ http://127.0.0.1:5177/cradlemaker-web/
 - Optional foam gap clearance for adding padding after printing.
 - Split preview for large cradles, with per-chunk STL export and manifest export.
 - Z-slide dovetail connector work for split chunks.
-- CNC foam workflow for ShopBot/VCarve-style top-side relief carving from foam blocks, including separate XY/Z clearance, finger-hole pockets, multi-slab exports, dowel alignment holes, and tool reach QA.
+- CNC foam workflow for ShopBot/VCarve-style top-side relief carving from foam blocks, including separate XY/Z clearance, finger-hole pockets, multi-slab exports, dowel alignment holes, slab-island alignment checks, and tool reach QA.
 - GitHub Pages deployment from the static `cradlemaker-web/` folder.
 
 ## Terms of Use
@@ -61,7 +61,7 @@ cradlemaker-web/
 
 Organic/tree support experiments are kept in the codebase for future work, but the current UI intentionally exposes only the stable `Normal auto` / `Default (Grid/Organic)` cradle workflow.
 
-The CNC foam workflow exports VCarve-importable STL relief/block geometry for top-side ShopBot-style carving. It supports separate XY and Z cavity clearance, auto-fit model lift, flat-end or ball-nose tool reach QA, optional finger-hole pockets around the cavity margin, and optional multi-slab foam workflows. In slab mode, slab count and slab thickness define the total foam height, and each slab can be exported as a local-coordinate STL with a JSON manifest and through-slab dowel alignment holes. It does not generate ShopBot toolpaths.
+The CNC foam workflow exports VCarve-importable STL relief/block geometry for top-side ShopBot-style carving. It supports separate XY and Z cavity clearance, auto-fit model lift, flat-end or ball-nose tool reach QA, optional finger-hole pockets around the cavity margin, and optional multi-slab foam workflows. In slab mode, slab count and slab thickness define the total foam height, and each slab can be exported as a local-coordinate STL with a JSON manifest and through-slab dowel alignment holes. Disconnected foam islands in slabs are checked for alignment: each island must fit at least two dowels, otherwise that island is omitted and reported in QA. It does not generate ShopBot toolpaths.
 
 Painted support enforcer/blocker regions are available in print mode. Coverage paint is a surface mask; regenerate supports after painting to apply it.
 

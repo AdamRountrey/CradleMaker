@@ -249,9 +249,11 @@ orbit.mouseButtons = {
 };
 orbit.target.set(0, 0, 0);
 
+let pendingInteractiveReanchorFrame = 0;
+let orientationHelperActive = false;
 const transformControls = new TransformControls(camera, renderer.domElement);
 transformControls.setMode("rotate");
-transformControls.setSpace("local");
+transformControls.setSpace("world");
 transformControls.enabled = false;
 const transformHelper = typeof transformControls.getHelper === "function" ? transformControls.getHelper() : transformControls;
 transformHelper.visible = false;
@@ -259,6 +261,9 @@ scene.add(transformHelper);
 
 transformControls.addEventListener("dragging-changed", (event) => {
   orbit.enabled = !event.value;
+  if (!event.value) {
+    reanchorModelAfterInteractiveTransform();
+  }
 });
 
 transformControls.addEventListener("objectChange", () => {
@@ -266,7 +271,7 @@ transformControls.addEventListener("objectChange", () => {
   clearCncFingerHoleMarks();
   clearCncPreview();
   invalidateModelPayloadCache();
-  applyModelTransform();
+  reanchorModelAfterInteractiveTransform();
   scheduleModelManifoldPrewarm();
   updateManualMarkers();
 });
@@ -910,7 +915,7 @@ function centerGeometryXY(geometry) {
 }
 
 function applyModelTransform() {
-  if (!state.modelMesh) return;
+  if (!state.modelMesh) return false;
   let changed = false;
   if (state.workflowMode === "cnc") {
     changed = applyCncModelPlacement();
@@ -918,17 +923,55 @@ function applyModelTransform() {
     changed = applyElevation();
   }
   if (changed) scheduleModelManifoldPrewarm();
+  return changed;
+}
+
+function reanchorModelAfterInteractiveTransform() {
+  if (!state.modelMesh) return;
+  const changedNow = applyModelTransform();
+  if (changedNow) {
+    updateManualMarkers();
+    transformControls.updateMatrixWorld(true);
+  }
+  if (pendingInteractiveReanchorFrame) {
+    cancelAnimationFrame(pendingInteractiveReanchorFrame);
+  }
+  pendingInteractiveReanchorFrame = requestAnimationFrame(() => {
+    pendingInteractiveReanchorFrame = 0;
+    const changedLater = applyModelTransform();
+    if (changedLater) {
+      updateManualMarkers();
+      transformControls.updateMatrixWorld(true);
+    }
+  });
 }
 
 function applyElevation() {
   if (!state.modelMesh) return false;
-  const box = new THREE.Box3().setFromObject(state.modelMesh);
-  const deltaZ = Number(controlsEl.elevation.value) - box.min.z;
+  const minZ = modelWorldGeometryMinZ(state.modelMesh);
+  if (!Number.isFinite(minZ)) return false;
+  const deltaZ = Number(controlsEl.elevation.value) - minZ;
   if (Math.abs(deltaZ) <= 1e-7) return false;
   state.modelMesh.position.z += deltaZ;
   state.modelMesh.updateMatrixWorld(true);
   invalidateModelPayloadCache();
   return true;
+}
+
+function modelWorldGeometryMinZ(mesh) {
+  if (!mesh?.geometry?.attributes?.position) return NaN;
+  mesh.updateMatrixWorld(true);
+  const position = mesh.geometry.attributes.position;
+  const elements = mesh.matrixWorld.elements;
+  let minZ = Infinity;
+  for (let index = 0; index < position.count; index += 1) {
+    const x = position.getX(index);
+    const y = position.getY(index);
+    const z = position.getZ(index);
+    const worldZ = elements[2] * x + elements[6] * y + elements[10] * z + elements[14];
+    if (worldZ < minZ) minZ = worldZ;
+  }
+  return minZ;
 }
 
 function applyCncModelPlacement(settings = cncSettings()) {
@@ -5317,8 +5360,11 @@ async function generateCncFoamPreview(options = {}) {
       : qa.unreachable_cells || qa.selected_tool_miss_cells || (qa.slab_count && !qa.dowel_valid)
         ? "caution"
         : "ok";
+    const slabIslandText = qa.slab_count
+      ? ` ${qa.slab_island_dowels_added.toLocaleString()} island dowels added; ${qa.slab_islands_omitted.toLocaleString()} unalignable islands omitted.`
+      : "";
     setCncStatus(
-      `CNC foam relief ready: ${result.mesh.triangle_count.toLocaleString()} export triangles, ${formatStatusNumber(qa.reached_percent)}% selected-tool clearance, ${qa.unreachable_cells.toLocaleString()} cells too deep for stickout, ${qa.selected_tool_miss_cells.toLocaleString()} cells likely need a smaller finishing tool, ${qa.finger_holes.toLocaleString()} finger holes, and ${qa.slab_count.toLocaleString()} slab exports.${qa.dowel_warning ? ` ${qa.dowel_warning}` : ""} Export remains the desired VCarve relief target.`,
+      `CNC foam relief ready: ${result.mesh.triangle_count.toLocaleString()} export triangles, ${formatStatusNumber(qa.reached_percent)}% selected-tool clearance, ${qa.unreachable_cells.toLocaleString()} cells too deep for stickout, ${qa.selected_tool_miss_cells.toLocaleString()} cells likely need a smaller finishing tool, ${qa.finger_holes.toLocaleString()} finger holes, and ${qa.slab_count.toLocaleString()} slab exports.${slabIslandText}${qa.dowel_warning ? ` ${qa.dowel_warning}` : ""} Export remains the desired VCarve relief target.`,
       stateName
     );
   } finally {
@@ -5600,12 +5646,16 @@ async function buildCncFoamRelief(settings, report = null) {
     auto_finger_holes: fingerHolePlan.autoCount,
     finger_hole_carved_cells: fingerHolePlan.carvedCells,
     finger_hole_candidates: fingerHolePlan.candidateCount,
-    dowel_holes: dowelPlan.holes.length,
-    dowel_valid: dowelPlan.valid,
-    dowel_warning: dowelPlan.warning,
+    dowel_holes: slabPlan?.dowelHoles?.length ?? dowelPlan.holes.length,
+    dowel_valid: dowelPlan.valid && (slabPlan?.islandDowelValid ?? true),
+    dowel_warning: [dowelPlan.warning, slabPlan?.islandWarning].filter(Boolean).join(" "),
     slab_count: slabPlan?.slabs?.length ?? 0,
     slab_through_cut_count: slabPlan?.throughCutCount ?? 0,
     slab_min_wall_mm: slabPlan?.minWallMm ?? null,
+    slab_island_components: slabPlan?.islandComponentCount ?? 0,
+    slab_island_dowels_added: slabPlan?.islandDowelsAdded ?? 0,
+    slab_islands_omitted: slabPlan?.culledIslandCount ?? 0,
+    slab_island_cells_omitted: slabPlan?.culledIslandCells ?? 0,
     tool_end: settings.toolEnd,
     grid: { nx, ny, dx, dy, resolution: settings.resolution },
     settings,
@@ -6008,13 +6058,195 @@ function chooseNonCollinearCncPoints(candidates, count) {
   return [first, second, third].filter(Boolean).slice(0, count);
 }
 
+function computeCncSlabRawHeights(depths, nx, ny, slabHeight, topDepth) {
+  const heights = new Float64Array(nx * ny);
+  for (let index = 0; index < heights.length; index += 1) {
+    heights[index] = slabHeight - Math.max(0, Math.min(slabHeight, depths[index] - topDepth));
+  }
+  return heights;
+}
+
+function findCncSlabComponents(heights, nx, ny, epsilon = 0.001) {
+  const labels = new Int32Array(nx * ny);
+  labels.fill(-1);
+  const components = [];
+  const queue = [];
+  for (let start = 0; start < heights.length; start += 1) {
+    if (heights[start] <= epsilon || labels[start] !== -1) continue;
+    const componentId = components.length;
+    const cells = [];
+    labels[start] = componentId;
+    queue.length = 0;
+    queue.push(start);
+    while (queue.length) {
+      const index = queue.pop();
+      cells.push(index);
+      const ix = index % nx;
+      const iy = Math.floor(index / nx);
+      const neighbors = [
+        ix > 0 ? index - 1 : -1,
+        ix < nx - 1 ? index + 1 : -1,
+        iy > 0 ? index - nx : -1,
+        iy < ny - 1 ? index + nx : -1,
+      ];
+      for (const neighbor of neighbors) {
+        if (neighbor < 0 || labels[neighbor] !== -1 || heights[neighbor] <= epsilon) continue;
+        labels[neighbor] = componentId;
+        queue.push(neighbor);
+      }
+    }
+    components.push({ id: componentId, cells });
+  }
+  return { labels, components };
+}
+
+function planCncSlabIslandDowels(heights, nx, ny, xMin, yMin, dx, dy, settings, plannedDowels, slabId) {
+  const { labels, components } = findCncSlabComponents(heights, nx, ny);
+  const culledMask = new Uint8Array(nx * ny);
+  let addedDowels = 0;
+  let culledComponents = 0;
+  let culledCells = 0;
+  const minComponentCells = Math.max(4, Math.ceil((Math.PI * settings.dowelRadiusMm * settings.dowelRadiusMm * 2.5) / Math.max(0.001, dx * dy)));
+
+  for (const component of components) {
+    const existing = plannedDowels.filter((hole) => cncDowelFitsSlabComponent(hole, labels, component.id, nx, ny, xMin, yMin, dx, dy, settings));
+    if (existing.length >= 2) continue;
+
+    const needed = 2 - existing.length;
+    const candidates = cncIslandDowelCandidates(component, labels, nx, ny, xMin, yMin, dx, dy, settings, plannedDowels);
+    const added = chooseCncIslandDowels(existing, candidates, needed, settings);
+    for (const hole of added) {
+      plannedDowels.push({ ...hole, source: "island", slabId, componentId: component.id });
+      addedDowels += 1;
+    }
+
+    if (existing.length + added.length >= 2) continue;
+    culledComponents += 1;
+    culledCells += component.cells.length;
+    for (const cell of component.cells) culledMask[cell] = 1;
+    if (component.cells.length >= minComponentCells) {
+      console.warn(`CNC slab ${slabId} island ${component.id} omitted because it cannot fit two dowel holes.`);
+    }
+  }
+
+  return {
+    componentCount: components.length,
+    addedDowels,
+    culledComponents,
+    culledCells,
+    culledMask: culledComponents ? culledMask : null,
+  };
+}
+
+function cncIslandDowelCandidates(component, labels, nx, ny, xMin, yMin, dx, dy, settings, plannedDowels) {
+  const candidates = [];
+  const sampleStride = Math.max(1, Math.floor(component.cells.length / 600));
+  for (let cellIndex = 0; cellIndex < component.cells.length; cellIndex += sampleStride) {
+    const index = component.cells[cellIndex];
+    const ix = index % nx;
+    const iy = Math.floor(index / nx);
+    const x = xMin + (ix + 0.5) * dx;
+    const y = yMin + (iy + 0.5) * dy;
+    const hole = { x, y, radiusMm: settings.dowelRadiusMm };
+    if (!cncDowelFitsSlabComponent(hole, labels, component.id, nx, ny, xMin, yMin, dx, dy, settings)) continue;
+    if (cncPointNearAny(hole, plannedDowels, Math.max(settings.dowelRadiusMm * 4, settings.dowelRadiusMm + 8))) continue;
+    candidates.push(hole);
+  }
+  return candidates;
+}
+
+function chooseCncIslandDowels(existing, candidates, needed, settings) {
+  if (needed <= 0 || !candidates.length) return [];
+  const minSeparation = Math.max(settings.dowelRadiusMm * 4, settings.dowelRadiusMm + 10);
+  if (existing.length === 1) {
+    let best = null;
+    let bestDistance = -Infinity;
+    for (const candidate of candidates) {
+      const distance = Math.hypot(candidate.x - existing[0].x, candidate.y - existing[0].y);
+      if (distance >= minSeparation && distance > bestDistance) {
+        best = candidate;
+        bestDistance = distance;
+      }
+    }
+    return best ? [best] : [];
+  }
+
+  let bestPair = [];
+  let bestDistance = -Infinity;
+  for (let a = 0; a < candidates.length; a += 1) {
+    for (let b = a + 1; b < candidates.length; b += 1) {
+      const distance = Math.hypot(candidates[a].x - candidates[b].x, candidates[a].y - candidates[b].y);
+      if (distance >= minSeparation && distance > bestDistance) {
+        bestPair = [candidates[a], candidates[b]];
+        bestDistance = distance;
+      }
+    }
+  }
+  return bestPair.slice(0, needed);
+}
+
+function cncDowelFitsSlabComponent(hole, labels, componentId, nx, ny, xMin, yMin, dx, dy, settings) {
+  const ix = Math.floor((hole.x - xMin) / dx);
+  const iy = Math.floor((hole.y - yMin) / dy);
+  if (ix < 0 || ix >= nx || iy < 0 || iy >= ny) return false;
+  if (labels[iy * nx + ix] !== componentId) return false;
+  const wallMm = Math.max(1.5, Math.min(4, settings.dowelRadiusMm * 0.45));
+  const fitRadius = hole.radiusMm + wallMm;
+  const rx = Math.ceil(fitRadius / dx);
+  const ry = Math.ceil(fitRadius / dy);
+  const radiusSquared = fitRadius * fitRadius;
+  for (let oy = -ry; oy <= ry; oy += 1) {
+    const sy = iy + oy;
+    if (sy < 0 || sy >= ny) return false;
+    for (let ox = -rx; ox <= rx; ox += 1) {
+      const sx = ix + ox;
+      if (sx < 0 || sx >= nx) return false;
+      const distSquared = (ox * dx) * (ox * dx) + (oy * dy) * (oy * dy);
+      if (distSquared > radiusSquared) continue;
+      if (labels[sy * nx + sx] !== componentId) return false;
+    }
+  }
+  return true;
+}
+
 function buildCncSlabPlan(depths, nx, ny, xMin, yMin, dx, dy, settings, dowelHoles) {
   const slabs = [];
   const slabThickness = Math.max(1, settings.slabThicknessMm);
   const slabCount = Math.max(1, Math.round(settings.slabCount || Math.ceil(settings.height / slabThickness)));
+  const plannedDowels = dowelHoles.map((hole) => ({ ...hole, source: hole.source || "stack" }));
+  const slabIslandPlans = [];
+  let islandComponentCount = 0;
+  let islandDowelsAdded = 0;
+  let culledIslandCount = 0;
+  let culledIslandCells = 0;
   let throughCutCount = 0;
   let minWallMm = Infinity;
-  for (const hole of dowelHoles) {
+
+  for (let index = 0; index < slabCount; index += 1) {
+    const topDepth = index * slabThickness;
+    const bottomDepth = Math.min(settings.height, (index + 1) * slabThickness);
+    const thickness = bottomDepth - topDepth;
+    const heights = computeCncSlabRawHeights(depths, nx, ny, thickness, topDepth);
+    const componentPlan = planCncSlabIslandDowels(
+      heights,
+      nx,
+      ny,
+      xMin,
+      yMin,
+      dx,
+      dy,
+      settings,
+      plannedDowels,
+      `S${String(index + 1).padStart(2, "0")}`
+    );
+    slabIslandPlans[index] = componentPlan;
+    islandComponentCount += componentPlan.componentCount;
+    islandDowelsAdded += componentPlan.addedDowels;
+    culledIslandCount += componentPlan.culledComponents;
+    culledIslandCells += componentPlan.culledCells;
+  }
+
+  for (const hole of plannedDowels) {
     minWallMm = Math.min(
       minWallMm,
       hole.x - xMin - hole.radiusMm,
@@ -6029,7 +6261,20 @@ function buildCncSlabPlan(depths, nx, ny, xMin, yMin, dx, dy, settings, dowelHol
     const bottomDepth = Math.min(settings.height, (index + 1) * slabThickness);
     const thickness = bottomDepth - topDepth;
     const globalBottom = settings.height - bottomDepth;
-    const mesh = buildCncSlabMesh(depths, nx, ny, xMin, yMin, dx, dy, thickness, topDepth, bottomDepth, dowelHoles);
+    const mesh = buildCncSlabMesh(
+      depths,
+      nx,
+      ny,
+      xMin,
+      yMin,
+      dx,
+      dy,
+      thickness,
+      topDepth,
+      bottomDepth,
+      plannedDowels,
+      slabIslandPlans[index]?.culledMask ?? null
+    );
     if (mesh.through_cut_cells) throughCutCount += 1;
     slabs.push({
       id: `S${String(index + 1).padStart(2, "0")}`,
@@ -6039,14 +6284,25 @@ function buildCncSlabPlan(depths, nx, ny, xMin, yMin, dx, dy, settings, dowelHol
       thickness_mm: roundedCoordinate(thickness),
       global_bottom_mm: roundedCoordinate(globalBottom),
       through_cut_cells: mesh.through_cut_cells ?? 0,
+      island_components: slabIslandPlans[index]?.componentCount ?? 0,
+      culled_island_components: slabIslandPlans[index]?.culledComponents ?? 0,
+      culled_island_cells: slabIslandPlans[index]?.culledCells ?? 0,
     });
   }
 
   return {
     slabs,
-    dowelHoles,
+    dowelHoles: plannedDowels,
     throughCutCount,
     minWallMm: Number.isFinite(minWallMm) ? roundedCoordinate(minWallMm) : null,
+    islandComponentCount,
+    islandDowelsAdded,
+    culledIslandCount,
+    culledIslandCells,
+    islandDowelValid: culledIslandCount === 0,
+    islandWarning: culledIslandCount
+      ? `${culledIslandCount.toLocaleString()} CNC slab island${culledIslandCount === 1 ? "" : "s"} could not fit two dowels and ${culledIslandCount === 1 ? "was" : "were"} omitted.`
+      : "",
     settings: {
       slab_count: slabCount,
       slab_thickness_mm: roundedCoordinate(settings.slabThicknessMm),
@@ -6056,16 +6312,22 @@ function buildCncSlabPlan(depths, nx, ny, xMin, yMin, dx, dy, settings, dowelHol
   };
 }
 
-function buildCncSlabMesh(depths, nx, ny, xMin, yMin, dx, dy, slabHeight, topDepth, bottomDepth, dowelHoles) {
-  const mesh = { vertices: [], triangles: [], triangle_count: 0, through_cut_cells: 0 };
+function buildCncSlabMesh(depths, nx, ny, xMin, yMin, dx, dy, slabHeight, topDepth, bottomDepth, dowelHoles, culledMask = null) {
+  const mesh = { vertices: [], triangles: [], triangle_count: 0, through_cut_cells: 0, culled_island_cells: 0 };
   const heights = new Float64Array(nx * ny);
   const epsilon = 0.001;
 
   for (let iy = 0; iy < ny; iy += 1) {
     const y = yMin + (iy + 0.5) * dy;
     for (let ix = 0; ix < nx; ix += 1) {
+      const cellIndex = iy * nx + ix;
+      if (culledMask?.[cellIndex]) {
+        mesh.culled_island_cells += 1;
+        heights[cellIndex] = 0;
+        continue;
+      }
       const x = xMin + (ix + 0.5) * dx;
-      let height = slabHeight - Math.max(0, Math.min(slabHeight, depths[iy * nx + ix] - topDepth));
+      let height = slabHeight - Math.max(0, Math.min(slabHeight, depths[cellIndex] - topDepth));
       for (const hole of dowelHoles) {
         if (Math.hypot(x - hole.x, y - hole.y) <= hole.radiusMm) {
           height = 0;
@@ -6073,10 +6335,10 @@ function buildCncSlabMesh(depths, nx, ny, xMin, yMin, dx, dy, slabHeight, topDep
         }
       }
       if (height <= epsilon) {
-        if (depths[iy * nx + ix] >= bottomDepth - epsilon) mesh.through_cut_cells += 1;
+        if (depths[cellIndex] >= bottomDepth - epsilon) mesh.through_cut_cells += 1;
         height = 0;
       }
-      heights[iy * nx + ix] = height;
+      heights[cellIndex] = height;
     }
   }
 
@@ -6518,7 +6780,7 @@ function updateCncQaDashboard(qa) {
       label: "Slabs",
       value: qa.slab_count ? qa.slab_count.toLocaleString() : "Off",
       detail: qa.slab_count
-        ? `${qa.dowel_holes.toLocaleString()} dowels, ${qa.slab_can_through_cut ? "through-cut reach OK" : "stickout < slab"}`
+        ? `${qa.dowel_holes.toLocaleString()} dowels (${qa.slab_island_dowels_added.toLocaleString()} island), ${qa.slab_islands_omitted.toLocaleString()} islands omitted`
         : "Single relief STL",
       state: qa.slab_count && (!qa.dowel_valid || !qa.slab_can_through_cut) ? "caution" : "ok",
     },
@@ -7393,19 +7655,24 @@ function toggleManualSupportMode() {
 }
 
 function toggleOrientationHelper() {
-  setOrientationHelper(!transformControls.enabled);
+  setOrientationHelper(!orientationHelperActive);
 }
 
 function setOrientationHelper(enabled) {
+  orientationHelperActive = Boolean(enabled && state.modelMesh);
   transformControls.enabled = enabled;
-  transformHelper.visible = enabled;
+  transformHelper.visible = orientationHelperActive;
 
-  if (enabled && state.modelMesh) {
+  if (orientationHelperActive) {
+    transformControls.setSpace("world");
     transformControls.attach(state.modelMesh);
     controlsEl.orientModel.textContent = "Done rotating";
-    modelStatus.textContent = "Rotate helper active";
+    modelStatus.textContent = "Rotate helper active; rings stay aligned to global XYZ axes";
   } else {
+    orientationHelperActive = false;
     transformControls.detach();
+    transformControls.enabled = false;
+    transformHelper.visible = false;
     controlsEl.orientModel.textContent = "Rotate helper";
   }
 }
@@ -7513,6 +7780,9 @@ function cncSlabManifest() {
       y_mm: roundedCoordinate(hole.y),
       radius_mm: roundedCoordinate(hole.radiusMm),
       diameter_mm: roundedCoordinate(hole.radiusMm * 2),
+      source: hole.source || "stack",
+      island_slab_id: hole.slabId || null,
+      island_component_id: Number.isFinite(hole.componentId) ? hole.componentId : null,
     })),
     qa: {
       slab_count: qa.slab_count,
@@ -7520,6 +7790,10 @@ function cncSlabManifest() {
       dowel_valid: qa.dowel_valid,
       dowel_warning: qa.dowel_warning,
       min_wall_mm: qa.slab_min_wall_mm,
+      slab_island_components: qa.slab_island_components,
+      slab_island_dowels_added: qa.slab_island_dowels_added,
+      slab_islands_omitted: qa.slab_islands_omitted,
+      slab_island_cells_omitted: qa.slab_island_cells_omitted,
     },
     slabs: (plan.slabs ?? []).map((slab) => ({
       id: slab.id,
@@ -7530,6 +7804,9 @@ function cncSlabManifest() {
       top_depth_from_stack_top_mm: slab.top_depth_mm,
       bottom_depth_from_stack_top_mm: slab.bottom_depth_mm,
       through_cut_cells: slab.through_cut_cells,
+      island_components: slab.island_components,
+      culled_island_components: slab.culled_island_components,
+      culled_island_cells: slab.culled_island_cells,
       triangle_count: slab.mesh?.triangle_count ?? 0,
     })),
   };
