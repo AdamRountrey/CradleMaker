@@ -4,8 +4,8 @@ import { STLLoader } from "three/addons/loaders/STLLoader.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
 import { CENTER, acceleratedRaycast, computeBoundsTree, disposeBoundsTree } from "three-mesh-bvh";
 import createManifoldModule from "../vendor/manifold/manifold.js";
-import { getSupportOptionSchema, prepareSupportJob, prepareSupportJobInIsolatedWorker, prewarmSupportCore, resetSupportCoreRuntime } from "./wasmCore.js?v=column-taper-6";
-import { defaultOrcaSupportConfig } from "./orcaSupportOptions.js?v=organic-voxel-1";
+import { getSupportOptionSchema, prepareSupportJob, prepareSupportJobInIsolatedWorker, prewarmSupportCore, resetSupportCoreRuntime } from "./wasmCore.js?v=column-taper-7";
+import { defaultSupportConfig } from "./supportOptions.js?v=support-options-1";
 import {
   buildClearanceKernel,
   CIRCUMSCRIBED_CLEARANCE_KERNEL_MODE,
@@ -38,7 +38,7 @@ const SPLIT_CONNECTOR_SLIVER_MAX_DISTANCE_MM = 0.9;
 const DOVETAIL_GAP_HAIR_ASPECT_RATIO = 30;
 const DOVETAIL_GAP_HAIR_MAX_THICKNESS_MM = 0.35;
 const DOVETAIL_GAP_HAIR_MIN_EDGE_MM = 2;
-const DEFAULT_SUPPORT_CONFIG = defaultOrcaSupportConfig();
+const DEFAULT_SUPPORT_CONFIG = defaultSupportConfig();
 const MESH_COORDINATE_PRECISION = 100000;
 const STABLE_SUPPORT_TYPE = "normal(auto)";
 const STABLE_SUPPORT_STYLE = "default";
@@ -50,7 +50,7 @@ const CNC_FINGER_HOLE_SUPPORT_INSET_MM = 1;
 const ENABLE_MODEL_MANIFOLD_PREWARM = false;
 const ENABLE_MODEL_TRIM_WORKER_PREWARM = true;
 const MODEL_TRIM_WORKER_VERSION = "object-clearance-worker-38";
-const APP_BUNDLE_VERSION = "high-accuracy-targeted-36";
+const APP_BUNDLE_VERSION = "high-accuracy-targeted-37";
 const DEFAULT_TARGETED_MANIFOLD_BUILD = "o3";
 const DEFAULT_HIGH_ACCURACY_TARGETED_MINKOWSKI = true;
 const DEFAULT_HIGH_ACCURACY_ANALYTIC_KERNEL = true;
@@ -1996,7 +1996,7 @@ async function showWasmPending(options = {}) {
       : controlsEl.generateSupports;
   const accuracyLabel = highAccuracy ? "high-accuracy" : mediumAccuracy ? "medium-accuracy" : "fast";
 
-  setJobStatus(`Preparing ${accuracyLabel} Orca support job...`, "working");
+  setJobStatus(`Preparing ${accuracyLabel} cradle job...`, "working");
   clearResolutionPrompt();
   setQaDashboard([
     { label: "Core", value: "Preparing", detail: "Packaging model", state: "working" },
@@ -2378,9 +2378,6 @@ async function showWasmPending(options = {}) {
           ? ` Effective cradle resolution ${formatStatusNumber(effectiveCellSize)} mm (requested ${formatStatusNumber(requestedCellSize)} mm) over ${gridCols.toLocaleString()} x ${gridRows.toLocaleString()} cells.`
           : ` Cradle resolution ${formatStatusNumber(effectiveCellSize)} mm over ${gridCols.toLocaleString()} x ${gridRows.toLocaleString()} cells.`)
       : "";
-    const requestedOrcaTreeMode = Boolean(jobResult.support?.requested_orca_tree_mode);
-    const realOrcaTreeAvailable = Boolean(jobResult.support?.real_orca_tree_available);
-    const originalOrganicTree = Boolean(jobResult.support?.original_organic_tree);
     const unsupportedCellCount = jobResult.coverage?.unsupported_cells ?? 0;
     const qa = jobResult.qa ?? {};
     const supportedDownwardPercent = Number(qa.supported_downward_percent ?? 0);
@@ -2466,12 +2463,8 @@ async function showWasmPending(options = {}) {
       ? ` Print export gate: ready for final STL/PLY export (${state.printCradleSafety.reason})`
       : ` Print export warning: ${state.printCradleSafety.reason} Export will ask for confirmation.`;
     const stabilityQaText = formatStabilityQaStatus(stabilityQa);
-    const orcaTreeText = treeMode && originalOrganicTree
-      ? "Generated original organic tree cradle geometry in CradleMaker; no Orca source is bundled in this path."
-      : treeMode && requestedOrcaTreeMode && !realOrcaTreeAvailable
-      ? "Generated experimental tree cradle geometry; exact Orca organic tree support is not linked into WASM."
-      : requestedOrcaTreeMode && !realOrcaTreeAvailable
-        ? "Real Orca organic tree support is not linked into WASM yet; generated the stable solid cradle fallback."
+    const treeGeneratorText = treeMode
+      ? "Organic-tree geometry was generated entirely by CradleMaker."
       : "";
     const treeRoutingText = treeMode
       ? `Tree routing: ${treeTipContactCount.toLocaleString()} physical tip contacts, ${treeLocalUprightCount.toLocaleString()} local uprights, ${treeWaypointBranchCount.toLocaleString()} model-avoidance waypoints, ${treeSlopeRerouteCount.toLocaleString()} slope reroutes, and ${treeModelRerouteCount.toLocaleString()} model-clearance reroutes.`
@@ -2525,12 +2518,12 @@ async function showWasmPending(options = {}) {
       splitReady: totalTriangleCount > 0,
     });
     showResolutionPrompt(resolutionRecommendation);
-    const cradleLabel = treeMode ? "original organic tree cradle" : "solid cradle";
-    const cradleArticle = cradleLabel.startsWith("original") ? "an" : "a";
+    const cradleLabel = treeMode ? "organic-tree cradle" : "solid cradle";
+    const cradleArticle = treeMode ? "an" : "a";
     setJobStatus(
       totalTriangleCount
-        ? `Generated ${cradleArticle} ${cradleLabel} from ${contactCellCount.toLocaleString()} contact cells, including ${envelopeCellCount.toLocaleString()} underside-envelope cells, ${prunedSparseCellCount.toLocaleString()} sparse side/contact cells pruned, ${prunedSmallIslandCellCount.toLocaleString()} tiny island cells removed, ${baseCellCount.toLocaleString()} footprint base cells, ${bottomJoinCellCount.toLocaleString()} bottom-join cells, ${columnTaperCellCount.toLocaleString()} tapered structural cells from ${columnTaperSeedCellCount.toLocaleString()} contact-boundary seeds at ${columnTaperAngleDeg.toFixed(1)} deg (${columnTaperStepDropMm.toFixed(2)} mm lower per outward grid step, up to ${columnTaperMaxReachMm.toFixed(2)} mm theoretical base reach, ${columnTaperGridReserveMm.toFixed(2)} mm perimeter reserved for taper plus base, ${columnTaperSideGuardMm.toFixed(2)} mm conservative side guard, ${columnTaperAddedVolumeCm3.toFixed(2)} cm3 added), column components ${columnComponentsBefore.toLocaleString()} -> ${columnComponentsAfter.toLocaleString()}, ${closedGapCount.toLocaleString()} closed gaps, ${unsupportedCellCount.toLocaleString()} unsupported coverage cells, ${overhangFacetCount.toLocaleString()} overhang facets, ${nativeManualCount.toLocaleString()} manual/enforce marks, ${nativeBlockerCount.toLocaleString()} no-support marks removing ${nativeBlockerRemovedCells.toLocaleString()} cells, ${treeMode ? `${treeBranchCount.toLocaleString()} organic branches, ` : ""}${interfaceCellCount.toLocaleString()} soft-interface cells from ${interfaceLayers.toLocaleString()} interface layers, ${edgeRemovedCells.toLocaleString()} cells removed for a ${edgeClearance.toLocaleString()} mm support-free edge, and ${foamRemovedCells.toLocaleString()} cells removed for a ${foamGapZ.toLocaleString()} mm Z / ${foamGapXY.toLocaleString()} mm XY foam gap.${resolutionText} ${orcaTreeText} ${treeRoutingText} ${qaIntersectionText} ${qaCoverageText} ${meshQaText} ${modelTrimText}${generationAccuracyText}${generationRetryText}${manifoldTrimRuntimeText} ${trimGateQaText} ${voxelClearanceQaText} ${modelMeshQaText} ${stabilityQaText} ${qaClearanceText} ${printSafetyText} Prepared ${Object.keys(supportConfig).length}/${schema.length} Orca support settings and ${Object.keys(cradleConfig).length} cradle settings.${gridMemoryText}${runtimeText}${timingText}`
-        : `No support regions found. Prepared ${Object.keys(supportConfig).length}/${schema.length} Orca support settings and ${Object.keys(cradleConfig).length} cradle settings.`,
+        ? `Generated ${cradleArticle} ${cradleLabel} from ${contactCellCount.toLocaleString()} contact cells, including ${envelopeCellCount.toLocaleString()} underside-envelope cells, ${prunedSparseCellCount.toLocaleString()} sparse side/contact cells pruned, ${prunedSmallIslandCellCount.toLocaleString()} tiny island cells removed, ${baseCellCount.toLocaleString()} footprint base cells, ${bottomJoinCellCount.toLocaleString()} bottom-join cells, ${columnTaperCellCount.toLocaleString()} tapered structural cells from ${columnTaperSeedCellCount.toLocaleString()} contact-boundary seeds at ${columnTaperAngleDeg.toFixed(1)} deg (${columnTaperStepDropMm.toFixed(2)} mm lower per outward grid step, up to ${columnTaperMaxReachMm.toFixed(2)} mm theoretical base reach, ${columnTaperGridReserveMm.toFixed(2)} mm perimeter reserved for taper plus base, ${columnTaperSideGuardMm.toFixed(2)} mm conservative side guard, ${columnTaperAddedVolumeCm3.toFixed(2)} cm3 added), column components ${columnComponentsBefore.toLocaleString()} -> ${columnComponentsAfter.toLocaleString()}, ${closedGapCount.toLocaleString()} closed gaps, ${unsupportedCellCount.toLocaleString()} unsupported coverage cells, ${overhangFacetCount.toLocaleString()} overhang facets, ${nativeManualCount.toLocaleString()} manual/enforce marks, ${nativeBlockerCount.toLocaleString()} no-support marks removing ${nativeBlockerRemovedCells.toLocaleString()} cells, ${treeMode ? `${treeBranchCount.toLocaleString()} organic branches, ` : ""}${interfaceCellCount.toLocaleString()} soft-interface cells from ${interfaceLayers.toLocaleString()} interface layers, ${edgeRemovedCells.toLocaleString()} cells removed for a ${edgeClearance.toLocaleString()} mm support-free edge, and ${foamRemovedCells.toLocaleString()} cells removed for a ${foamGapZ.toLocaleString()} mm Z / ${foamGapXY.toLocaleString()} mm XY foam gap.${resolutionText} ${treeGeneratorText} ${treeRoutingText} ${qaIntersectionText} ${qaCoverageText} ${meshQaText} ${modelTrimText}${generationAccuracyText}${generationRetryText}${manifoldTrimRuntimeText} ${trimGateQaText} ${voxelClearanceQaText} ${modelMeshQaText} ${stabilityQaText} ${qaClearanceText} ${printSafetyText} Prepared ${Object.keys(supportConfig).length}/${schema.length} support settings and ${Object.keys(cradleConfig).length} cradle settings.${gridMemoryText}${runtimeText}${timingText}`
+        : `No support regions found. Prepared ${Object.keys(supportConfig).length}/${schema.length} support settings and ${Object.keys(cradleConfig).length} cradle settings.`,
       qa.intersects_model || meshQa.unsupported_cells || modelMeshQa.needs_exact_trim || meshQa.failed || modelMeshQa.failed || stabilityQa.severity === "error" || (highAccuracy && !state.printCradleSafety.exportable) ? "error" : "pending"
     );
     setJobProgress(100);

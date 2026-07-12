@@ -1,5 +1,4 @@
 #include "SupportCore.hpp"
-#include "OrcaSupportBridge.hpp"
 
 #include <algorithm>
 #include <array>
@@ -122,7 +121,6 @@ struct SupportSettings {
     bool column_taper_enabled = true;
     bool remove_small_overhangs = true;
     bool tree_mode = false;
-    bool requested_orca_tree_mode = false;
     double threshold_angle_deg = 30.0;
     double top_z_distance_mm = 0.2;
     double xy_distance_mm = 0.35;
@@ -551,11 +549,10 @@ SupportSettings read_support_settings(const std::string& json)
     settings.remove_small_overhangs = read_bool_field(json, "support_remove_small_overhang", settings.remove_small_overhangs);
     const std::string support_type = read_string_field(json, "support_type");
     const std::string support_style = read_string_field(json, "support_style");
-    settings.requested_orca_tree_mode = support_type.find("tree") != std::string::npos ||
+    settings.tree_mode = support_type.find("tree") != std::string::npos ||
         support_type.find("hybrid") != std::string::npos ||
         support_style.find("tree") != std::string::npos ||
         support_style.find("organic") != std::string::npos;
-    settings.tree_mode = settings.requested_orca_tree_mode;
     settings.threshold_angle_deg = read_number_field(json, "support_threshold_angle", settings.threshold_angle_deg);
     settings.top_z_distance_mm = read_number_field(json, "support_top_z_distance", settings.top_z_distance_mm);
     settings.xy_distance_mm = read_number_field(json, "support_object_xy_distance", settings.xy_distance_mm);
@@ -3720,7 +3717,7 @@ std::size_t mesh_contact_grid(
     return 0;
 }
 
-SupportGenerationStats generate_orca_contact_proxy(
+SupportGenerationStats generate_cradle_contact_grid(
     const MeshStats& mesh_stats,
     const SupportSettings& settings,
     const std::vector<ManualSupportPoint>& manual_points,
@@ -4031,7 +4028,7 @@ std::string core_status()
 
 std::string core_version()
 {
-    return "0.8.6";
+    return "0.8.7";
 }
 
 std::string support_option_schema_json()
@@ -4068,11 +4065,6 @@ std::string support_option_schema_json()
 ])json";
 }
 
-std::string support_core_plan_json()
-{
-    return Cradlemaker::OrcaSupportBridge::real_orca_support_plan_json();
-}
-
 std::string prepare_support_job_json_impl(const std::string& job_json, const bool binary_meshes, const bool buffered_input)
 {
     using Clock = std::chrono::steady_clock;
@@ -4101,7 +4093,7 @@ std::string prepare_support_job_json_impl(const std::string& job_json, const boo
     CoverageSamples coverage;
     QaStats qa;
     OrganicTreeLayerData tree_layer_data;
-    SupportGenerationStats support_stats = mesh_ready ? generate_orca_contact_proxy(mesh_stats, settings, manual_points, coverage, qa, support_mesh, interface_mesh, &tree_layer_data) : SupportGenerationStats {};
+    SupportGenerationStats support_stats = mesh_ready ? generate_cradle_contact_grid(mesh_stats, settings, manual_points, coverage, qa, support_mesh, interface_mesh, &tree_layer_data) : SupportGenerationStats {};
     support_stats.timing_input_parse_ms = input_parse_ms;
     support_stats.timing_settings_parse_ms = settings_parse_ms;
     support_stats.timing_generation_total_ms = mark_ms();
@@ -4122,7 +4114,7 @@ std::string prepare_support_job_json_impl(const std::string& job_json, const boo
         << (support_ready ? "support_mesh_generated" : (mesh_ready ? "no_support_regions" : "mesh_job_invalid"))
         << R"json(","native_target":"cradlemaker_support_core","algorithm":"cradle_lower_envelope_grid","message":")json"
         << (settings.tree_mode ?
-            "WASM generated an original organic tree cradle graph from sliced underside contact samples. This is Cradlemaker-owned code, not ported Orca source." :
+            "WASM generated a CradleMaker organic-tree cradle graph from sliced underside contact samples." :
             "WASM generated a high-resolution lower-envelope cradle from sliced underside samples with model-clearance trimming.")
         << R"json(","job_bytes":)json"
         << job_json.size()
@@ -4244,12 +4236,6 @@ std::string prepare_support_job_json_impl(const std::string& job_json, const boo
         << support_stats.manual_blocker_points
         << R"json(,"manual_blocker_removed_cells":)json"
         << support_stats.manual_blocker_removed_cells
-        << R"json(,"requested_orca_tree_mode":)json"
-        << (settings.requested_orca_tree_mode ? "true" : "false")
-        << R"json(,"real_orca_tree_available":)json"
-        << (Cradlemaker::OrcaSupportBridge::real_orca_tree_support_available() ? "true" : "false")
-        << R"json(,"original_organic_tree":)json"
-        << (settings.tree_mode ? "true" : "false")
         << R"json(,"tree_mode":)json"
         << (settings.tree_mode ? "true" : "false")
         << R"json(,"tree_branches":)json"

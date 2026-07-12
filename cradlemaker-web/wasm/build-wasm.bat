@@ -21,7 +21,6 @@ if exist "%OUTPUT_WASM%" del /f /q "%OUTPUT_WASM%"
 
 emcc "%ROOT%\cradlemaker-web\wasm\CradlemakerCore.cpp" ^
   "%ROOT%\cradlemaker-web\wasm\SupportCore.cpp" ^
-  "%ROOT%\cradlemaker-web\wasm\OrcaSupportBridge.cpp" ^
   -I"%ROOT%\cradlemaker-web\wasm" ^
   %PTHREAD_FLAGS% ^
   --bind ^

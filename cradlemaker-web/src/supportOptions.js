@@ -1,4 +1,4 @@
-export const ORCA_SUPPORT_OPTIONS = [
+export const SUPPORT_OPTIONS = [
   { key: "enable_support", type: "bool", defaultValue: true },
   { key: "support_interface_enabled", type: "bool", defaultValue: false },
   { key: "foam_gap_enabled", type: "bool", defaultValue: false },
@@ -49,6 +49,6 @@ export const ORCA_SUPPORT_OPTIONS = [
   { key: "tree_support_wall_count", type: "int", defaultValue: 1 },
 ];
 
-export function defaultOrcaSupportConfig() {
-  return Object.fromEntries(ORCA_SUPPORT_OPTIONS.map((option) => [option.key, option.defaultValue]));
+export function defaultSupportConfig() {
+  return Object.fromEntries(SUPPORT_OPTIONS.map((option) => [option.key, option.defaultValue]));
 }

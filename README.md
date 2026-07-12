@@ -298,9 +298,8 @@ The repository also contains the pinned target-aware Manifold patch, matched
 build scripts, build-profile manifests, and diagnostic benchmark tools under
 `cradlemaker-web/tools/` and `cradlemaker-web/vendor/`.
 
-The experimental real-Orca organic-tree compile probe fetches upstream
-OrcaSlicer source into an ignored local cache. That source is not shipped with
-the web app.
+The support core is CradleMaker-owned code and does not bundle or invoke a
+desktop slicer engine.
 
 ## Repository Layout
 
@@ -332,8 +331,8 @@ STL is included in the Pages artifact.
   undercut toolpaths, G-code, or ShopBot files.
 - Soft-interface printing requires compatible multi-material hardware and
   conservation-appropriate contact materials selected by the user.
-- Real Orca organic-tree generation is still an experimental compile probe. The
-  interface currently exposes the stable `Normal auto` cradle workflow.
+- The interface currently exposes the stable `Normal auto` cradle workflow;
+  CradleMaker's internal organic-tree path is not currently selectable.
 - Generated supports, stability estimates, and tool-access checks must be
   reviewed before fabrication and physically test-fit before object use.
 

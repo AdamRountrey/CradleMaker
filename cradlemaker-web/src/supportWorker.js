@@ -1,4 +1,4 @@
-import { activeWasmBasename, activeWasmInitialMemoryBytes, loadCradlemakerCore } from "./wasmCore.js?v=column-taper-6";
+import { activeWasmBasename, activeWasmInitialMemoryBytes, loadCradlemakerCore } from "./wasmCore.js?v=column-taper-7";
 
 self.postMessage({ type: "ready" });
 

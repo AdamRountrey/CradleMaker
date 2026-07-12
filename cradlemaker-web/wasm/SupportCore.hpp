@@ -9,7 +9,6 @@ namespace Cradlemaker::SupportCore {
 std::string core_status();
 std::string core_version();
 std::string support_option_schema_json();
-std::string support_core_plan_json();
 std::string prepare_support_job_json(const std::string& job_json);
 std::string prepare_support_job_binary_json(const std::string& job_json);
 std::string prepare_support_job_buffered_input_binary_json(const std::string& job_json);
