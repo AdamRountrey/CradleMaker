@@ -270,6 +270,75 @@ input[type="text"] {
   line-height: 1.25;
 }
 
+.resolution-profile-control {
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.resolution-profile-control legend {
+  margin: 0 0 6px;
+  padding: 0;
+  color: var(--panel-ink);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.segmented-control {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  min-height: 36px;
+}
+
+.segmented-control label {
+  position: relative;
+  display: block;
+  min-width: 0;
+}
+
+.segmented-control span {
+  display: grid;
+  min-height: 36px;
+  place-items: center;
+  border: 1px solid rgba(7, 23, 36, 0.22);
+  background: #ffffff;
+  color: var(--panel-ink);
+  font-size: 13px;
+  font-weight: 720;
+  cursor: pointer;
+}
+
+.segmented-control label + label span {
+  border-left: 0;
+}
+
+.segmented-control label:first-child span {
+  border-radius: 6px 0 0 6px;
+}
+
+.segmented-control label:last-child span {
+  border-radius: 0 6px 6px 0;
+}
+
+.segmented-control input:checked + span {
+  border-color: var(--accent-strong);
+  background: var(--accent);
+  color: #ffffff;
+}
+
+.segmented-control input:focus-visible + span {
+  z-index: 1;
+  outline: 2px solid var(--accent-strong);
+  outline-offset: 2px;
+}
+
+.resolution-profile-control > output {
+  min-height: 15px;
+}
+
 button,
 .file-button {
   min-height: 38px;
@@ -316,6 +385,24 @@ button[data-active="true"] {
 
 .button-grid button:first-child {
   grid-column: 1 / -1;
+}
+
+.button-grid #generate-medium-accuracy-supports,
+.button-grid #generate-high-accuracy-supports,
+.button-grid #cancel-cradle-generation,
+.button-grid .progress-note {
+  grid-column: 1 / -1;
+}
+
+#cancel-cradle-generation {
+  border-color: rgba(170, 45, 55, 0.52);
+  background: #fff7f7;
+  color: #9c2632;
+}
+
+#cancel-cradle-generation:hover {
+  border-color: #9c2632;
+  color: #781a24;
 }
 
 .button-grid .progress-shell {
@@ -475,6 +562,12 @@ button[data-active="true"] {
 .progress-shell {
   display: grid;
   gap: 5px;
+}
+
+.progress-detail {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.25;
 }
 
 .progress-shell[hidden] {

@@ -1,0 +1,29 @@
+{
+    "manifold_commit":  "8bffb521010a9852c2270a0ffbb3d3e225c3beab",
+    "source_patch_sha256":  "3ae9d930b48644793b5983c165a71b325f85e6ef3ab475c8c9172a0b54fb761d",
+    "wasm_sha256":  "cdf3463d800d629aba3e78a9d0bd8c66625c1059d8acc88d4c9f437411008a32",
+    "profile":  "simd",
+    "lto":  false,
+    "effective_compile_flags":  "-msimd128 -O3 -DNDEBUG -std=c++17 -fPIC -Wall -Wno-unknown-warning-option -Wno-unused -Wno-shorten-64-to-32 -Wno-sign-compare -Wno-alloc-size-larger-than -O3 -ffp-contract=off -fexcess-precision=standard",
+    "wasm_bytes":  723580,
+    "javascript_sha256":  "f773dd45d84e7f3aecebf9d8d7a7f7da9d93e286c8f844246c41cfb1dc3077e0",
+    "simd":  true,
+    "javascript_bytes":  76975,
+    "emscripten_version":  "6.0.0",
+    "build_type":  "Release",
+    "cmake_version":  "3.29.2",
+    "effective_link_options":  [
+                                   "-msimd128",
+                                   "-O3",
+                                   "-DNDEBUG",
+                                   "-sALLOW_MEMORY_GROWTH=1",
+                                   "-sMAXIMUM_MEMORY=4294967296",
+                                   "--pre-js",
+                                   "--bind",
+                                   "-sALLOW_TABLE_GROWTH=1",
+                                   "-sEXPORTED_RUNTIME_METHODS=addFunction,removeFunction",
+                                   "-sMODULARIZE=1",
+                                   "-sEXPORT_ES6=1",
+                                   "-o"
+                               ]
+}

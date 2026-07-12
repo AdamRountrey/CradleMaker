@@ -1,4 +1,7 @@
 .work/
+.codex-build-temp/
 *.log
+*_PLAN.md
+run-server.cmd
 src/wasm/cradlemaker-core-pthread.js
 src/wasm/cradlemaker-core-pthread.wasm

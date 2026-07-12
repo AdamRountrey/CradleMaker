@@ -1,4 +1,4 @@
-import { activeWasmBasename, loadCradlemakerCore } from "./wasmCore.js?v=cradle-hires-1";
+import { activeWasmBasename, activeWasmInitialMemoryBytes, loadCradlemakerCore } from "./wasmCore.js?v=column-taper-6";
 
 self.postMessage({ type: "ready" });
 
@@ -6,6 +6,11 @@ self.onmessage = async (event) => {
   const message = event.data ?? {};
 
   try {
+    if (Array.isArray(message.initialMemoryCandidates)) {
+      self.__CRADLEMAKER_WASM_MEMORY_CANDIDATES__ = message.initialMemoryCandidates
+        .map(Number)
+        .filter((value) => Number.isFinite(value) && value > 0);
+    }
     const core = await loadCradlemakerCore();
     if (message.type === "supportOptionSchema") {
       self.postMessage({
@@ -16,6 +21,7 @@ self.onmessage = async (event) => {
           worker: true,
           crossOriginIsolated: Boolean(self.crossOriginIsolated),
           wasmBuild: activeWasmBasename(),
+          wasmInitialMemoryBytes: activeWasmInitialMemoryBytes(),
         },
       });
       return;
@@ -67,6 +73,7 @@ self.onmessage = async (event) => {
         worker: true,
         crossOriginIsolated: Boolean(self.crossOriginIsolated),
         wasmBuild: activeWasmBasename(),
+        wasmInitialMemoryBytes: activeWasmInitialMemoryBytes(),
         workerTimings,
       },
     }, transfer);

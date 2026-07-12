@@ -2,6 +2,8 @@
 
 CradleMaker is a standalone Three.js app for building independently printable support cradles and CNC foam cradles for physical objects. It can import an STL, orient/elevate the object with an interactive rotation helper, create automatic cradle supports, paint support enforcer/blocker regions on the model surface, preview the result, and export generated meshes.
 
+**Live app:** [Open CradleMaker on GitHub Pages](https://adamrountrey.github.io/CradleMaker/)
+
 Large models use a browser-side mesh BVH for faster picking, painting, model-intersection QA, and CNC foam relief sampling.
 
 The split-for-printing controls can preview a chunk layout against a selected build volume and export per-chunk STL files plus a JSON manifest. Split chunks are produced with Manifold WASM booleans so cut faces are planar, printable solids instead of cell-by-cell walls. The current connector pass adds split-face Z-slide dovetail hardware with boolean-cut trapezoid sockets, sloped pocket/key roofs for support-free printing, adjustable clearance, and adjustable size.
@@ -16,6 +18,11 @@ Serve the repository root and open `cradlemaker-web/`.
 node cradlemaker-web/server.mjs
 ```
 
+The bundled Node server sends the cross-origin isolation headers required for
+threaded WebAssembly. A browser without those headers uses the checked-in
+serial support core instead; cradle geometry and High Accuracy certification
+remain available.
+
 If the Windows `node` app alias is unavailable, use any Python 3 install from the repository root:
 
 ```powershell
@@ -27,6 +34,85 @@ Then open:
 ```text
 http://127.0.0.1:5177/cradlemaker-web/
 ```
+
+## High Accuracy Defaults
+
+`Generate high accuracy cradle` uses the certified target-aware serial
+Manifold O3 build, the circumscribed analytic clearance kernel, and adaptive
+streaming subtraction by default. Million-face models start with 4,000 retained
+model faces per batch and automatically halve a failed batch down to 250.
+
+These query parameters are retained for diagnostics and rollback:
+
+- `targeted-minkowski=0` uses the bounded global serial repair path.
+- `analytic-kernel=0` uses the legacy clearance kernel.
+- `targeted-build=size|o3|simd|lto` selects a matched serial build profile.
+- `targeted-batch=250..8000` overrides the adaptive initial batch size.
+
+Fast generation does not inherit the high-accuracy targeted or analytic
+defaults. Every high-accuracy result must still pass the independent continuous
+clearance certificate before STL/PLY export is enabled.
+
+`Cradle resolution` provides three memory-bounded profiles for both Fast and
+High Accuracy generation:
+
+- Low: 1.2 mm target cell size with a 600,000-cell grid limit.
+- Medium: 0.8 mm target cell size with a 1.2-million-cell grid limit. This is
+  the default and preserves the previous cradle resolution.
+- High: 0.5 mm target cell size with a 2.4-million-cell grid limit.
+
+The target controls feature sampling while the cell limit bounds grid memory.
+On models too large for the selected target, CradleMaker increases the effective
+cell size and reports the actual resolution in the QA dashboard. Resolution
+recommendations advance to the next finer profile rather than creating a hidden
+custom setting.
+
+The High Accuracy lifecycle is deliberately single-job and fail-closed:
+
+- A matching Fast cradle is cached by model revision and complete support/cradle
+  configuration, then reused as the High Accuracy draft.
+- Only one cradle generation can be active. Cancellation terminates the active
+  support and model-trim workers, invalidates their generation token, and rejects
+  partial output.
+- Exact repair runs in an isolated worker. A diagnostic parallel backend is
+  selected before work starts; any serial retry begins only after the failed
+  worker is terminated. High Accuracy never launches the UI-blocking in-page
+  fallback after a worker failure.
+- Target-aware streaming bounds intermediate Manifold geometry. Very large
+  source meshes do not automatically enter the bounded-global fallback when a
+  targeted result cannot be certified.
+- Stage-aware progress distinguishes draft generation, candidate filtering,
+  streamed subtraction, localized witness repair, and final certification.
+- STL/PLY export is enabled only after the final continuous ellipsoidal
+  clearance certificate passes.
+
+The Advanced Cradle `Upright taper` control strengthens tall support columns by
+widening them toward the base while preserving their sampled contact tops. Its
+3-degree default lets neighboring supports join gradually without filling the
+entire empty space between them to contact height. Taper-touched mesh corners
+use the lowest adjacent safe model ceiling plus a conservative side guard, while
+contact-only corners retain their intended fit surface. The base footprint is
+grown after tapering, with grid perimeter reserved for the taper radius and
+configured base margin, so widened uprights remain inside the base apron.
+Taper/base shoulder fans stay inside taper cells; surrounding apron cells remain
+flat instead of inheriting triangular ramps from taller neighbors.
+Setting 0 degrees disables tapering.
+
+## Validation
+
+Run the complete geometry and worker suite from the repository root:
+
+```powershell
+Get-ChildItem cradlemaker-web/tools/test-*.mjs | Sort-Object Name | ForEach-Object {
+  node $_.FullName
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
+```
+
+The suite covers centered-mesh inradius, the continuous clearance certificate,
+the circumscribed kernel, adaptive taper and base containment, worker
+certificate integration, target filtering, and differential targeted
+Minkowski behavior.
 
 ## Build Native Core
 

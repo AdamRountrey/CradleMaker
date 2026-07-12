@@ -31,6 +31,8 @@ emcc "%ROOT%\cradlemaker-web\wasm\CradlemakerCore.cpp" ^
   -s EXPORT_NAME=createCradlemakerCore ^
   -s ENVIRONMENT=web,worker ^
   -s ALLOW_MEMORY_GROWTH=1 ^
+  -s INITIAL_MEMORY=3221225472 ^
+  -s MAXIMUM_MEMORY=4294967296 ^
   -o "%OUTPUT_JS%"
 
 if errorlevel 1 exit /b %errorlevel%
@@ -41,8 +43,11 @@ if errorlevel 1 exit /b %errorlevel%
 
 if errorlevel 1 exit /b %errorlevel%
 
+if "%CRADLEMAKER_SKIP_ICACLS%"=="1" goto build_complete
+
 icacls "%OUTPUT_JS%" /inheritance:e >NUL
 
 if errorlevel 1 exit /b %errorlevel%
 
+:build_complete
 endlocal

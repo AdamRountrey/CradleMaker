@@ -115,6 +115,8 @@ target_link_options(cradlemaker_wasm PRIVATE
     -sEXPORT_NAME=createCradlemakerCore
     -sENVIRONMENT=web,worker
     -sALLOW_MEMORY_GROWTH=1
+    -sINITIAL_MEMORY=3221225472
+    -sMAXIMUM_MEMORY=4294967296
 )
 
 if(CRADLEMAKER_ENABLE_PTHREADS)

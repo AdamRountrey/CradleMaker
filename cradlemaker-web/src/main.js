@@ -4,8 +4,17 @@ import { STLLoader } from "three/addons/loaders/STLLoader.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
 import { CENTER, acceleratedRaycast, computeBoundsTree, disposeBoundsTree } from "three-mesh-bvh";
 import createManifoldModule from "../vendor/manifold/manifold.js";
-import { getSupportOptionSchema, prepareSupportJob, prewarmSupportCore } from "./wasmCore.js?v=resolution-prompt-2";
+import { getSupportOptionSchema, prepareSupportJob, prepareSupportJobInIsolatedWorker, prewarmSupportCore, resetSupportCoreRuntime } from "./wasmCore.js?v=column-taper-6";
 import { defaultOrcaSupportConfig } from "./orcaSupportOptions.js?v=organic-voxel-1";
+import {
+  buildClearanceKernel,
+  CIRCUMSCRIBED_CLEARANCE_KERNEL_MODE,
+  normalizeClearanceKernelMode,
+} from "./clearanceKernel.js?v=clearance-kernel-1";
+import {
+  certifyContinuousClearance,
+  continuousClearanceCertificateSettings,
+} from "./clearanceCertificate.js?v=continuous-clearance-3";
 
 THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
 THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
@@ -39,10 +48,104 @@ const CNC_MIN_FLOOR_THICKNESS_MM = 6;
 const CNC_MAX_GRID_CELLS = 900000;
 const CNC_FINGER_HOLE_SUPPORT_INSET_MM = 1;
 const ENABLE_MODEL_MANIFOLD_PREWARM = false;
+const ENABLE_MODEL_TRIM_WORKER_PREWARM = true;
+const MODEL_TRIM_WORKER_VERSION = "object-clearance-worker-38";
+const APP_BUNDLE_VERSION = "high-accuracy-targeted-36";
+const DEFAULT_TARGETED_MANIFOLD_BUILD = "o3";
+const DEFAULT_HIGH_ACCURACY_TARGETED_MINKOWSKI = true;
+const DEFAULT_HIGH_ACCURACY_ANALYTIC_KERNEL = true;
+const VOXEL_BOOLEAN_WORKER_VERSION = APP_BUNDLE_VERSION;
+const ENABLE_EXPERIMENTAL_TILED_HIGH_ACCURACY_SUPPORT_GENERATION = false;
+const CRADLE_RESOLUTION_PROFILES = Object.freeze({
+  low: Object.freeze({ label: "Low", cellSizeMm: 1.2, gridBudgetCells: 600000 }),
+  medium: Object.freeze({ label: "Medium", cellSizeMm: 0.8, gridBudgetCells: 1200000 }),
+  high: Object.freeze({ label: "High", cellSizeMm: 0.5, gridBudgetCells: 2400000 }),
+});
+const DEFAULT_CRADLE_RESOLUTION_PROFILE = "medium";
+const DEFAULT_SUPPORT_GRID_BUDGET_CELLS = CRADLE_RESOLUTION_PROFILES[DEFAULT_CRADLE_RESOLUTION_PROFILE].gridBudgetCells;
+const WASM_INITIAL_MEMORY_BYTES = 536870912;
+const WASM_MAXIMUM_MEMORY_BYTES = 4294967296;
+const GRID_SCALAR_BYTES = 8;
+const TILED_SUPPORT_WORKER_MEMORY_CANDIDATES = [
+  2147483648,
+  1610612736,
+  1073741824,
+  536870912,
+];
+const TILED_SUPPORT_MAX_CONCURRENCY = 2;
+const TILED_SUPPORT_TARGET_CELLS = 5000000;
+const TILED_SUPPORT_TILE_MAX_CELLS = 9000000;
+const MEDIUM_SUPPORT_GRID_BUDGET_CELLS = 6000000;
+const MEDIUM_CLEARANCE_MAX_COLUMNS = 3000000;
+const MEDIUM_CLEARANCE_MAX_RECONSTRUCTED_TRIANGLES = 4000000;
+const MEDIUM_VOXEL_TARGET_TILE_COUNT = 384;
+const MEDIUM_VOXEL_MAX_TILE_COUNT = 900;
+const MEDIUM_VOXEL_MAX_TILE_MEMORY_BUDGET_BYTES = 2684354560;
+const MEDIUM_VOXEL_ESTIMATED_BYTES_PER_LOCAL_VOXEL = 4;
+const WEBGPU_CLEARANCE_WORKGROUP_SIZE = 64;
+const WEBGPU_CLEARANCE_MAX_JOBS_PER_PASS = 1200000;
+const WEBGPU_CLEARANCE_CPU_FALLBACK_MAX_COLUMNS = 2000000;
+const LARGE_MESH_NONINDEXED_DISPLAY_TRIANGLES = 250000;
+const PARALLEL_MANIFOLD_PREPARE_TIMEOUT_MS = 45000;
+const PARALLEL_MANIFOLD_TRIM_TIMEOUT_MS = 600000;
+const SERIAL_MANIFOLD_PREPARE_TIMEOUT_MS = 240000;
+const SERIAL_MANIFOLD_TRIM_TIMEOUT_MS = 600000;
+const MODEL_TRIM_ESTIMATE_STORAGE_KEY = "cradlemaker.modelTrimEstimate.v3";
+const MODEL_TRIM_DEBUG_SETTINGS = Object.freeze(readModelTrimDebugSettings());
+const FAST_MODEL_TRIM_SETTINGS = Object.freeze({
+  ...MODEL_TRIM_DEBUG_SETTINGS,
+  targeted_minkowski: false,
+  kernel_mode: "legacy",
+  targeted_batch_size: 0,
+});
 let manifoldCorePromise = null;
 let qaWorker = null;
 let nextQaWorkerRequestId = 1;
 const qaWorkerRequests = new Map();
+let modelTrimWorker = null;
+let modelTrimWorkerFailed = false;
+let nextModelTrimWorkerRequestId = 1;
+const modelTrimWorkerRequests = new Map();
+
+window.__CRADLEMAKER_DEBUG__ = {
+  appBundleVersion: APP_BUNDLE_VERSION,
+  modelTrimWorkerVersion: MODEL_TRIM_WORKER_VERSION,
+  modelTrim: MODEL_TRIM_DEBUG_SETTINGS,
+};
+document.documentElement.dataset.cradlemakerBundle = APP_BUNDLE_VERSION;
+document.documentElement.dataset.cradlemakerModelTrimWorker = MODEL_TRIM_WORKER_VERSION;
+document.documentElement.dataset.cradlemakerTargetedMinkowski = String(
+  MODEL_TRIM_DEBUG_SETTINGS.targeted_minkowski
+);
+document.documentElement.dataset.cradlemakerKernelMode = MODEL_TRIM_DEBUG_SETTINGS.kernel_mode;
+document.documentElement.dataset.cradlemakerTargetedBatch = String(
+  MODEL_TRIM_DEBUG_SETTINGS.targeted_batch_size || 0
+);
+document.documentElement.dataset.cradlemakerTargetedBuild =
+  MODEL_TRIM_DEBUG_SETTINGS.targeted_build;
+
+class ParallelManifoldTimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "ParallelManifoldTimeoutError";
+    this.parallelManifoldTimeout = true;
+    this.modelTrimTimeout = true;
+  }
+}
+
+class ModelTrimTimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "ModelTrimTimeoutError";
+    this.modelTrimTimeout = true;
+  }
+}
+
+function isModelTrimTimeoutError(error) {
+  return Boolean(error?.modelTrimTimeout) ||
+    error instanceof ParallelManifoldTimeoutError ||
+    error instanceof ModelTrimTimeoutError;
+}
 
 const viewport = document.querySelector("#viewport");
 const modelStatus = document.querySelector("#model-status");
@@ -75,6 +178,7 @@ const controlsEl = {
   supportTopZDistance: document.querySelector("#support-top-z-distance"),
   supportObjectXYDistance: document.querySelector("#support-object-xy-distance"),
   supportEdgeClearance: document.querySelector("#support-edge-clearance"),
+  cradleResolutionProfiles: [...document.querySelectorAll('input[name="cradle-resolution-profile"]')],
   supportBasePatternSpacing: document.querySelector("#support-base-pattern-spacing"),
   interfaceEnabled: document.querySelector("#interface-enabled"),
   interfaceOptions: document.querySelector("#interface-options"),
@@ -92,7 +196,11 @@ const controlsEl = {
   baseJoinUprights: document.querySelector("#base-join-uprights"),
   baseMargin: document.querySelector("#base-margin"),
   baseThickness: document.querySelector("#base-thickness"),
+  columnTaperAngle: document.querySelector("#column-taper-angle"),
   generateSupports: document.querySelector("#generate-supports"),
+  generateMediumAccuracySupports: document.querySelector("#generate-medium-accuracy-supports"),
+  generateHighAccuracySupports: document.querySelector("#generate-high-accuracy-supports"),
+  cancelCradleGeneration: document.querySelector("#cancel-cradle-generation"),
   toggleCoverage: document.querySelector("#toggle-coverage"),
   clearManual: document.querySelector("#clear-manual"),
   supportDisplayMode: document.querySelector("#support-display-mode"),
@@ -119,6 +227,7 @@ const controlsEl = {
   splitStatus: document.querySelector("#split-status"),
   jobProgress: document.querySelector("#job-progress"),
   jobProgressShell: document.querySelector("#job-progress-shell"),
+  jobProgressDetail: document.querySelector("#job-progress-detail"),
   splitProgress: document.querySelector("#split-progress"),
   splitProgressShell: document.querySelector("#split-progress-shell"),
   resolutionPrompt: document.querySelector("#resolution-prompt"),
@@ -161,10 +270,12 @@ const outputs = {
   supportTopZDistance: document.querySelector("#support-top-z-distance-value"),
   supportObjectXYDistance: document.querySelector("#support-object-xy-distance-value"),
   supportEdgeClearance: document.querySelector("#support-edge-clearance-value"),
+  cradleResolutionProfile: document.querySelector("#cradle-resolution-profile-value"),
   treeSupportBranchDistance: document.querySelector("#tree-support-branch-distance-value"),
   treeSupportBranchAngle: document.querySelector("#tree-support-branch-angle-value"),
   baseMargin: document.querySelector("#base-margin-value"),
   baseThickness: document.querySelector("#base-thickness-value"),
+  columnTaperAngle: document.querySelector("#column-taper-angle-value"),
   splitBuildMargin: document.querySelector("#split-build-margin-value"),
   splitConnectorClearance: document.querySelector("#split-connector-clearance-value"),
   splitConnectorSize: document.querySelector("#split-connector-size-value"),
@@ -217,7 +328,19 @@ const state = {
   modelCenterOfMassCache: null,
   modelManifoldPrewarmToken: 0,
   modelManifoldPrewarmTimer: null,
+  modelTrimPrewarmToken: 0,
+  modelTrimPrewarmTimer: null,
+  modelTrimPrewarmPromise: null,
+  modelTrimPrewarmKey: "",
+  draftSupportCache: null,
+  modelRevision: 0,
+  generationBusy: false,
+  generationToken: 0,
   resolutionSuggestion: null,
+  printCradleSafety: {
+    exportable: false,
+    reason: "High accuracy has not been run for this cradle.",
+  },
 };
 
 const scene = new THREE.Scene();
@@ -474,15 +597,18 @@ function bindControls() {
   controlsEl.orientModel.addEventListener("click", () => toggleOrientationHelper());
   controlsEl.resetOrientation.addEventListener("click", () => resetOrientation());
   controlsEl.generateSupports.addEventListener("click", () => {
-    state.supportPaintMode = "off";
-    if (controlsEl.supportPaintMode) controlsEl.supportPaintMode.value = "off";
-    state.paintStrokeActive = false;
-    state.paintStrokePointerId = null;
-    state.pendingPaintEvent = null;
-    state.lastPaintWorldPoint = null;
-    updateManualMarkers();
-    void showWasmPending();
+    preparePrintCradleGeneration();
+    void showWasmPending({ accuracy: "fast" });
   });
+  controlsEl.generateMediumAccuracySupports?.addEventListener("click", () => {
+    preparePrintCradleGeneration();
+    void showWasmPending({ accuracy: "medium" });
+  });
+  controlsEl.generateHighAccuracySupports?.addEventListener("click", () => {
+    preparePrintCradleGeneration();
+    void showWasmPending({ accuracy: "high" });
+  });
+  controlsEl.cancelCradleGeneration?.addEventListener("click", cancelCradleGeneration);
   controlsEl.toggleCoverage?.addEventListener("click", () => toggleCoverageOverlay());
   controlsEl.clearManual?.addEventListener("click", () => {
     state.manualSupports = state.manualSupports.filter((support) => support.source === "paint_enforce" || support.source === "paint_block");
@@ -562,17 +688,24 @@ function bindControls() {
   controlsEl.splitPlatePreset?.addEventListener("change", () => applySplitPlatePreset());
   controlsEl.applyResolutionSuggestion?.addEventListener("click", () => applyResolutionSuggestion());
   controlsEl.dismissResolutionSuggestion?.addEventListener("click", () => clearResolutionPrompt());
+  for (const input of controlsEl.cradleResolutionProfiles) {
+    input.addEventListener("change", () => {
+      if (input.checked) applyCradleResolutionProfile(input.value);
+    });
+  }
   controlsEl.interfaceEnabled?.addEventListener("change", () => {
     if (controlsEl.interfaceEnabled.checked && Number(controlsEl.supportInterfaceTopLayers.value) <= 0) {
       controlsEl.supportInterfaceTopLayers.value = "2";
     }
     syncOptionPanels();
     clearGeneratedSupport();
+    scheduleModelTrimWorkerPrewarm();
     updateButtons();
   });
   controlsEl.foamGapEnabled?.addEventListener("change", () => {
     syncOptionPanels();
     clearGeneratedSupport();
+    scheduleModelTrimWorkerPrewarm();
     updateButtons();
   });
 
@@ -582,7 +715,6 @@ function bindControls() {
     controlsEl.supportTopZDistance,
     controlsEl.supportObjectXYDistance,
     controlsEl.supportEdgeClearance,
-    controlsEl.supportBasePatternSpacing,
     controlsEl.supportInterfaceTopLayers,
     controlsEl.supportInterfaceSpacing,
     controlsEl.foamGapZ,
@@ -593,6 +725,7 @@ function bindControls() {
     controlsEl.treeSupportBranchAngle,
     controlsEl.baseMargin,
     controlsEl.baseThickness,
+    controlsEl.columnTaperAngle,
     controlsEl.splitBuildWidth,
     controlsEl.splitBuildDepth,
     controlsEl.splitBuildHeight,
@@ -617,7 +750,6 @@ function bindControls() {
     controlsEl.cncDowelClearance,
   ].filter(Boolean)) {
     input.addEventListener("input", () => {
-      if (input === controlsEl.supportBasePatternSpacing) clearResolutionPrompt();
       if (
         input === controlsEl.splitBuildWidth ||
         input === controlsEl.splitBuildDepth ||
@@ -655,6 +787,7 @@ function bindControls() {
       }
       updateOutputs();
       applyModelTransform();
+      if (isPrintTrimClearanceInput(input)) scheduleModelTrimWorkerPrewarm();
       updateManualMarkers();
       updateButtons();
     });
@@ -823,6 +956,7 @@ function loadStlGeometry(geometry, label) {
   geometry.computeBoundingSphere();
 
   state.sourceGeometry = geometry.clone();
+  state.modelRevision += 1;
   invalidateModelPayloadCache();
   state.modelMesh = new THREE.Mesh(geometry, materialModel);
   state.modelMesh.name = label;
@@ -846,29 +980,36 @@ function loadStlGeometry(geometry, label) {
   updateOutputs();
   updateButtons();
   scheduleModelManifoldPrewarm();
+  scheduleModelTrimWorkerPrewarm();
   modelStatus.textContent = `${label} loaded`;
 }
 
 function clearSceneModel() {
   disposeModelBoundsTree();
   modelGroup.clear();
-  supportGroup.clear();
-  cncGroup.clear();
-  splitGroup.clear();
-  coverageGroup.clear();
+  clearMeshGroup(supportGroup);
+  clearMeshGroup(cncGroup);
+  clearMeshGroup(splitGroup);
+  clearMeshGroup(coverageGroup);
   markerGroup.clear();
   state.modelMesh = null;
+  state.modelRevision += 1;
   state.modelVisible = true;
   state.modelDisplayMode = "solid";
   state.sourceGeometry = null;
   state.supportMesh = null;
   state.interfaceMesh = null;
+  state.printCradleSafety = {
+    exportable: false,
+    reason: "High accuracy has not been run for this cradle.",
+  };
   state.cncMesh = null;
   state.cncQa = null;
   state.cncSlabs = [];
   state.cncSlabPlan = null;
   clearCncFingerHoleMarks();
   invalidateModelPayloadCache();
+  clearModelTrimWorkerCache();
   state.coverage = null;
   state.splitChunks = [];
   state.splitPlan = null;
@@ -922,7 +1063,10 @@ function applyModelTransform() {
   } else {
     changed = applyElevation();
   }
-  if (changed) scheduleModelManifoldPrewarm();
+  if (changed) {
+    scheduleModelManifoldPrewarm();
+    scheduleModelTrimWorkerPrewarm();
+  }
   return changed;
 }
 
@@ -1062,6 +1206,15 @@ function onPointerDown(event) {
   clearGeneratedSupport();
   addManualMarker(support);
   updateButtons();
+}
+
+function isPrintTrimClearanceInput(input) {
+  return input === controlsEl.supportTopZDistance ||
+    input === controlsEl.supportObjectXYDistance ||
+    input === controlsEl.supportInterfaceTopLayers ||
+    input === controlsEl.supportInterfaceSpacing ||
+    input === controlsEl.foamGapZ ||
+    input === controlsEl.foamGapXY;
 }
 
 function onPointerMove(event) {
@@ -1223,10 +1376,628 @@ function supportBrushRadiusMm() {
   return supportBrushDiameterMm() * 0.5;
 }
 
-async function showWasmPending() {
-  if (!state.modelMesh) return;
+function preparePrintCradleGeneration() {
+  state.supportPaintMode = "off";
+  if (controlsEl.supportPaintMode) controlsEl.supportPaintMode.value = "off";
+  state.paintStrokeActive = false;
+  state.paintStrokePointerId = null;
+  state.pendingPaintEvent = null;
+  state.lastPaintWorldPoint = null;
+  updateManualMarkers();
+}
 
-  setJobStatus("Preparing Orca support job...", "working");
+function markPrintCradleStale(reason) {
+  state.printCradleSafety = {
+    exportable: false,
+    reason,
+  };
+  updateButtons();
+}
+
+function assertGenerationCurrent(token, revision) {
+  if (token !== state.generationToken) {
+    throw new Error("A newer cradle generation started; this result was discarded.");
+  }
+  if (revision !== state.modelRevision) {
+    throw new Error("The model changed during cradle generation; please generate again.");
+  }
+}
+
+function cancelCradleGeneration() {
+  if (!state.generationBusy) return;
+  state.generationToken += 1;
+  state.generationBusy = false;
+  cancelRunningModelTrimPrewarm();
+  resetSupportCoreRuntime();
+  markPrintCradleStale("Cradle generation was cancelled; no new output was accepted.");
+  modelStatus.textContent = state.modelMesh ? "Ready" : "Load or import";
+  supportStatus.textContent = "Generation cancelled";
+  setJobStatus("Cradle generation cancelled.", "pending");
+  setProgressDetail("The active worker was terminated; no partial result was used.");
+  setJobProgress(0);
+  controlsEl.generateSupports.textContent = "Generate cradle";
+  if (controlsEl.generateMediumAccuracySupports) {
+    controlsEl.generateMediumAccuracySupports.textContent = "Generate WebGPU clearance cradle";
+  }
+  if (controlsEl.generateHighAccuracySupports) {
+    controlsEl.generateHighAccuracySupports.textContent = "Generate high accuracy cradle";
+  }
+  updateButtons();
+}
+
+function estimateSupportGridMemory(job, budgetOverride = null) {
+  const bounds = job?.model?.bounds_mm ?? {};
+  const size = bounds.size ?? [];
+  const supportConfig = job?.support_config ?? {};
+  const cradleConfig = job?.cradle_config ?? {};
+  const requestedCellSize = Math.max(0.001, Number(supportConfig.contact_cell_size_mm) || Number(controlsEl.supportBasePatternSpacing?.value) || 0.8);
+  const taperAngleDeg = cradleConfig.column_taper_enabled === false
+    ? 0
+    : Math.max(0, Math.min(12, Number(cradleConfig.column_taper_angle_deg) || 0));
+  const baseTop = cradleConfig.base_enabled === false ? 0 : Math.max(0, Number(cradleConfig.base_thickness_mm) || 0);
+  const modelMaxZ = Number(bounds.max?.[2]);
+  const taperRise = Math.max(0, (Number.isFinite(modelMaxZ) ? modelMaxZ : Number(size[2]) || 0) - baseTop);
+  const taperReach = taperAngleDeg > 0
+    ? taperRise * Math.tan(taperAngleDeg * Math.PI / 180)
+    : 0;
+  const taperGridReserve = taperReach > 0
+    ? Math.ceil(taperReach / requestedCellSize) * requestedCellSize
+    : 0;
+  const margin =
+    Math.max(0, Number(supportConfig.xy_distance_mm) || 0) +
+    Math.max(0, Number(cradleConfig.base_margin_mm) || 0) +
+    taperGridReserve +
+    requestedCellSize;
+  const width = Math.max(requestedCellSize, Number(size[0]) + margin * 2);
+  const depth = Math.max(requestedCellSize, Number(size[1]) + margin * 2);
+  const requestedCols = Math.max(1, Math.ceil(width / requestedCellSize));
+  const requestedRows = Math.max(1, Math.ceil(depth / requestedCellSize));
+  const requestedCells = requestedCols * requestedRows;
+  const budget = Math.max(1, Number(budgetOverride ?? cradleConfig.max_contact_grid_cells ?? DEFAULT_SUPPORT_GRID_BUDGET_CELLS) || DEFAULT_SUPPORT_GRID_BUDGET_CELLS);
+  let effectiveCellSize = requestedCellSize;
+  if (requestedCells > budget) {
+    effectiveCellSize = Math.sqrt(Math.max(1, width * depth) / budget);
+  }
+  const effectiveCols = Math.max(1, Math.ceil(width / effectiveCellSize));
+  const effectiveRows = Math.max(1, Math.ceil(depth / effectiveCellSize));
+  const effectiveCells = effectiveCols * effectiveRows;
+  const triangleCount = Math.max(0, Number(job?.mesh?.triangle_count ?? job?.model?.triangle_count) || 0);
+  const workerCount = estimateSupportWorkerCount(triangleCount, effectiveCells);
+  const persistentGridBytes = effectiveCells * GRID_SCALAR_BYTES * 3;
+  const temporaryGridBytes = effectiveCells * GRID_SCALAR_BYTES * Math.max(workerCount, workerCount * 2);
+  const peakGridBytes = persistentGridBytes + temporaryGridBytes;
+  const estimatedPeakBytes = Math.ceil(peakGridBytes * 1.25);
+  return {
+    budget,
+    requestedCellSize,
+    taperReach,
+    taperGridReserve,
+    effectiveCellSize,
+    requestedCols,
+    requestedRows,
+    effectiveCols,
+    effectiveRows,
+    requestedCells,
+    effectiveCells,
+    triangleCount,
+    workerCount,
+    persistentGridBytes,
+    temporaryGridBytes,
+    peakGridBytes,
+    estimatedPeakBytes,
+    heapInitialBytes: WASM_INITIAL_MEMORY_BYTES,
+    heapMaximumBytes: WASM_MAXIMUM_MEMORY_BYTES,
+  };
+}
+
+function estimateSupportWorkerCount(triangleCount, gridCellCount) {
+  if (!globalThis.crossOriginIsolated || triangleCount < 8000) return 1;
+  const hardware = Math.max(1, Number(navigator.hardwareConcurrency) || 1);
+  const byWork = Math.max(1, Math.floor(triangleCount / 8000));
+  let byMemory = 8;
+  if (gridCellCount >= 16000000) byMemory = 2;
+  else if (gridCellCount >= 10000000) byMemory = 3;
+  else if (gridCellCount >= 6000000) byMemory = 4;
+  return Math.min(hardware, byWork, byMemory, 8);
+}
+
+function formatBytes(bytes) {
+  const value = Math.max(0, Number(bytes) || 0);
+  if (value >= 1024 * 1024 * 1024) return `${formatStatusNumber(value / (1024 * 1024 * 1024))} GB`;
+  if (value >= 1024 * 1024) return `${formatStatusNumber(value / (1024 * 1024))} MB`;
+  if (value >= 1024) return `${formatStatusNumber(value / 1024)} KB`;
+  return `${formatStatusNumber(value)} B`;
+}
+
+function formatGridMemoryEstimate(plan, prefix = "Grid memory estimate") {
+  if (!plan) return "";
+  const effectiveText = Math.abs(plan.effectiveCellSize - plan.requestedCellSize) > 0.001
+    ? `${formatStatusNumber(plan.effectiveCellSize)} mm effective from ${formatStatusNumber(plan.requestedCellSize)} mm requested`
+    : `${formatStatusNumber(plan.effectiveCellSize)} mm`;
+  const taperReserveText = plan.taperGridReserve > 0
+    ? `, ${formatStatusNumber(plan.taperGridReserve)} mm taper/base perimeter reserve`
+    : "";
+  return `${prefix}: ${plan.effectiveCells.toLocaleString()} cells (${plan.effectiveCols.toLocaleString()} x ${plan.effectiveRows.toLocaleString()}) at ${effectiveText}${taperReserveText}, ${plan.workerCount} WASM worker${plan.workerCount === 1 ? "" : "s"}, about ${formatBytes(plan.estimatedPeakBytes)} peak grid memory inside a ${formatBytes(plan.heapMaximumBytes)} max WASM heap.`;
+}
+
+async function prepareSupportJobWithGridRetry(job, options = {}) {
+  const accuracyMode = options.accuracyMode || "fast";
+  if (accuracyMode !== "medium" && accuracyMode !== "high") {
+    return await prepareSupportJob(job);
+  }
+
+  const requestedBudget = Number(job?.cradle_config?.max_contact_grid_cells) || (accuracyMode === "medium" ? MEDIUM_SUPPORT_GRID_BUDGET_CELLS : DEFAULT_SUPPORT_GRID_BUDGET_CELLS);
+  const requestedPlan = estimateSupportGridMemory(job, requestedBudget);
+  if (
+    accuracyMode === "high" &&
+    ENABLE_EXPERIMENTAL_TILED_HIGH_ACCURACY_SUPPORT_GENERATION &&
+    shouldUseTiledSupportGeneration(job, requestedPlan, accuracyMode)
+  ) {
+    return await prepareTiledSupportJob(job, {
+      ...options,
+      accuracyMode,
+      memoryPlan: requestedPlan,
+    });
+  }
+
+  if (accuracyMode === "high") {
+    return await prepareSupportJob(job);
+  }
+
+  const budgets = [requestedBudget, MEDIUM_SUPPORT_GRID_BUDGET_CELLS, 4000000]
+    .filter((budget, index, list) => Number.isFinite(budget) && budget > 0 && list.indexOf(budget) === index);
+  let lastError = null;
+
+  for (let index = 0; index < budgets.length; index += 1) {
+    const budget = budgets[index];
+    const retryJob = {
+      ...job,
+      cradle_config: {
+        ...(job.cradle_config ?? {}),
+        max_contact_grid_cells: budget,
+      },
+    };
+
+    try {
+      const memoryPlan = estimateSupportGridMemory(retryJob, budget);
+      await options.onAttempt?.(formatGridMemoryEstimate(memoryPlan, "Trying medium grid"));
+      const result = await prepareSupportJob(retryJob);
+      result._grid_memory_estimate = memoryPlan;
+      if (index > 0) {
+        result._medium_grid_retry_warning = `Medium accuracy grid was retried at a safer ${Math.round(budget).toLocaleString()}-cell budget after the larger grid exhausted the WASM runtime. ${formatGridMemoryEstimate(memoryPlan, "Retried grid estimate")}`;
+        await options.onRetry?.(result._medium_grid_retry_warning);
+      }
+      return result;
+    } catch (error) {
+      lastError = error;
+      if (!isRecoverableWasmAbort(error) || index === budgets.length - 1) break;
+      resetSupportCoreRuntime();
+      await options.onRetry?.(
+        `Medium accuracy grid at ${Math.round(budget).toLocaleString()} cells exhausted the WASM runtime; retrying with a safer grid budget...`
+      );
+    }
+  }
+
+  resetSupportCoreRuntime();
+  throw lastError || new Error("Medium accuracy cradle generation failed.");
+}
+
+function reusableDraftSupportJobResult(job, accuracyMode) {
+  if (accuracyMode !== "high") return null;
+  const cache = state.draftSupportCache;
+  if (!cache || cache.key !== draftSupportJobKey(job)) return null;
+  return cloneSupportJobResult(cache.result);
+}
+
+function cacheDraftSupportJobResult(job, accuracyMode, result) {
+  if (accuracyMode === "medium") return;
+  if (!result?.support_mesh?.vertices?.length || !result?.support_mesh?.triangles?.length) return;
+  state.draftSupportCache = {
+    key: draftSupportJobKey(job),
+    result: cloneSupportJobResult(result),
+  };
+}
+
+function draftSupportJobKey(job) {
+  return JSON.stringify(stableCacheValue({
+    modelRevision: state.modelRevision,
+    model: job?.model ?? null,
+    supportConfig: job?.support_config ?? null,
+    cradleConfig: job?.cradle_config ?? null,
+    manualSupports: job?.manual_supports ?? [],
+  }));
+}
+
+function cloneSupportJobResult(result) {
+  if (typeof globalThis.structuredClone === "function") {
+    try {
+      return globalThis.structuredClone(result);
+    } catch {
+      // Fall through for older browser/WASM objects that structuredClone rejects.
+    }
+  }
+  return cloneCacheValue(result);
+}
+
+function cloneCacheValue(value) {
+  if (value === null || typeof value !== "object") return value;
+  if (ArrayBuffer.isView(value)) {
+    return value.slice ? value.slice() : new value.constructor(value);
+  }
+  if (value instanceof ArrayBuffer) return value.slice(0);
+  if (Array.isArray(value)) return value.map(cloneCacheValue);
+  return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, cloneCacheValue(entry)]));
+}
+
+function stableCacheValue(value) {
+  if (value === null || typeof value !== "object") return value;
+  if (ArrayBuffer.isView(value)) return Array.from(value);
+  if (Array.isArray(value)) return value.map(stableCacheValue);
+  return Object.fromEntries(
+    Object.keys(value)
+      .sort()
+      .map((key) => [key, stableCacheValue(value[key])])
+  );
+}
+
+function shouldUseTiledSupportGeneration(job, memoryPlan, accuracyMode) {
+  if (typeof Worker !== "function") return false;
+  if (accuracyMode !== "medium" && accuracyMode !== "high") return false;
+  const requestedCells = Number(memoryPlan?.requestedCells) || 0;
+  const triangleCount = Number(memoryPlan?.triangleCount) || 0;
+  return requestedCells > 10000000 && triangleCount > 0;
+}
+
+async function prepareTiledSupportJob(job, options = {}) {
+  const memoryPlan = options.memoryPlan ?? estimateSupportGridMemory(job, job?.cradle_config?.max_contact_grid_cells);
+  const tiles = buildSupportGenerationTiles(job, memoryPlan);
+  if (tiles.length <= 1) return await prepareSupportJob(job);
+
+  const concurrency = Math.max(1, Math.min(tiles.length, TILED_SUPPORT_MAX_CONCURRENCY));
+  await options.onAttempt?.(
+    `Running tiled ${options.accuracyMode || "medium"} support generation: ${tiles.length.toLocaleString()} independent WASM tile${tiles.length === 1 ? "" : "s"} at ${formatStatusNumber(memoryPlan.requestedCellSize)} mm requested resolution (${concurrency} concurrent).`
+  );
+
+  const startedAt = performance.now();
+  const pieces = [];
+  let completed = 0;
+  let nextTileIndex = 0;
+  const workerTimings = [];
+
+  const runNext = async () => {
+    while (nextTileIndex < tiles.length) {
+      const tile = tiles[nextTileIndex];
+      nextTileIndex += 1;
+      const tileJob = buildSupportTileJob(job, tile);
+      if (!tileJob) {
+        completed += 1;
+        continue;
+      }
+      const result = await prepareSupportJobInIsolatedWorker(tileJob, {
+        timeoutMs: 240000,
+        initialMemoryCandidates: TILED_SUPPORT_WORKER_MEMORY_CANDIDATES,
+      });
+      pieces.push({
+        tile,
+        result: cropSupportTileResult(result, tile, memoryPlan.requestedCellSize),
+      });
+      if (result?._runtime?.workerTimings?.length) workerTimings.push(...result._runtime.workerTimings);
+      completed += 1;
+      await options.onAttempt?.(
+        `Completed tiled support generation ${completed.toLocaleString()} / ${tiles.length.toLocaleString()} (${tile.id}).`
+      );
+    }
+  };
+
+  await Promise.all(Array.from({ length: concurrency }, runNext));
+  if (!pieces.length) throw new Error("Tiled support generation produced no support tiles.");
+
+  const merged = mergeTiledSupportResults(pieces, job, tiles, memoryPlan);
+  merged._grid_memory_estimate = {
+    ...memoryPlan,
+    tiled: true,
+    tile_count: tiles.length,
+    tile_worker_concurrency: concurrency,
+  };
+  merged._runtime = {
+    ...(merged._runtime ?? {}),
+    worker: true,
+    isolatedTiledWorkers: true,
+    tileCount: tiles.length,
+    tileWorkerConcurrency: concurrency,
+    workerTimings,
+    tiledMs: performance.now() - startedAt,
+  };
+  merged._medium_grid_retry_warning = `Used ${tiles.length.toLocaleString()} independent WASM support-generation tiles to keep the requested ${formatStatusNumber(memoryPlan.requestedCellSize)} mm cradle grid out of the single-WASM 4 GB heap limit.`;
+  await options.onRetry?.(merged._medium_grid_retry_warning);
+  return merged;
+}
+
+function buildSupportGenerationTiles(job, memoryPlan) {
+  const domain = supportGridDomain(job);
+  const requestedCells = Math.max(1, Number(memoryPlan?.requestedCells) || 1);
+  const targetCells = TILED_SUPPORT_TARGET_CELLS;
+  const tileCount = Math.max(2, Math.ceil(requestedCells / targetCells));
+  const aspect = Math.max(0.2, Math.min(5, domain.width / Math.max(domain.depth, 0.0001)));
+  const xTiles = Math.max(1, Math.ceil(Math.sqrt(tileCount * aspect)));
+  const yTiles = Math.max(1, Math.ceil(tileCount / xTiles));
+  const halo = Math.max(
+    24,
+    Number(job?.support_config?.xy_distance_mm) || 0,
+    Number(job?.cradle_config?.base_margin_mm) || 0,
+    Number(memoryPlan?.requestedCellSize ?? 0.8) * 10
+  );
+  const tiles = [];
+  const tileWidth = domain.width / xTiles;
+  const tileDepth = domain.depth / yTiles;
+  for (let yIndex = 0; yIndex < yTiles; yIndex += 1) {
+    for (let xIndex = 0; xIndex < xTiles; xIndex += 1) {
+      const core = {
+        minX: domain.minX + xIndex * tileWidth,
+        maxX: xIndex === xTiles - 1 ? domain.maxX : domain.minX + (xIndex + 1) * tileWidth,
+        minY: domain.minY + yIndex * tileDepth,
+        maxY: yIndex === yTiles - 1 ? domain.maxY : domain.minY + (yIndex + 1) * tileDepth,
+      };
+      const haloBounds = {
+        minX: core.minX - halo,
+        maxX: core.maxX + halo,
+        minY: core.minY - halo,
+        maxY: core.maxY + halo,
+      };
+      const requestedCols = Math.max(1, Math.ceil((core.maxX - core.minX) / memoryPlan.requestedCellSize));
+      const requestedRows = Math.max(1, Math.ceil((core.maxY - core.minY) / memoryPlan.requestedCellSize));
+      tiles.push({
+        id: `T${xIndex + 1}-${yIndex + 1}`,
+        xIndex,
+        yIndex,
+        core,
+        halo: haloBounds,
+        requestedCells: requestedCols * requestedRows,
+      });
+    }
+  }
+  return tiles;
+}
+
+function supportGridDomain(job) {
+  const bounds = job?.model?.bounds_mm ?? {};
+  const min = bounds.min ?? [0, 0, 0];
+  const max = bounds.max ?? [0, 0, 0];
+  const supportConfig = job?.support_config ?? {};
+  const cradleConfig = job?.cradle_config ?? {};
+  const cellSize = Math.max(0.001, Number(supportConfig.contact_cell_size_mm) || Number(controlsEl.supportBasePatternSpacing?.value) || 0.8);
+  const margin = Math.max(0, Number(supportConfig.xy_distance_mm) || 0) +
+    Math.max(0, Number(cradleConfig.base_margin_mm) || 0) +
+    cellSize;
+  const minX = Number(min[0]) - margin;
+  const minY = Number(min[1]) - margin;
+  const maxX = Number(max[0]) + margin;
+  const maxY = Number(max[1]) + margin;
+  return {
+    minX,
+    minY,
+    maxX,
+    maxY,
+    width: Math.max(cellSize, maxX - minX),
+    depth: Math.max(cellSize, maxY - minY),
+  };
+}
+
+function buildSupportTileJob(job, tile) {
+  const source = job?.mesh?.vertices ?? new Float32Array(0);
+  const out = [];
+  for (let index = 0; index + 8 < source.length; index += 9) {
+    const minX = Math.min(source[index], source[index + 3], source[index + 6]);
+    const maxX = Math.max(source[index], source[index + 3], source[index + 6]);
+    const minY = Math.min(source[index + 1], source[index + 4], source[index + 7]);
+    const maxY = Math.max(source[index + 1], source[index + 4], source[index + 7]);
+    if (maxX < tile.halo.minX || minX > tile.halo.maxX || maxY < tile.halo.minY || minY > tile.halo.maxY) continue;
+    for (let offset = 0; offset < 9; offset += 1) out.push(source[index + offset]);
+  }
+  if (!out.length) return null;
+  const vertices = new Float32Array(out);
+  const tileCells = Math.max(1200000, Math.min(TILED_SUPPORT_TILE_MAX_CELLS, Math.ceil(tile.requestedCells * 1.8)));
+  return {
+    ...job,
+    mesh: {
+      ...job.mesh,
+      vertices,
+      vertex_count: Math.floor(vertices.length / 3),
+      triangle_count: Math.floor(vertices.length / 9),
+      indexed_mesh: undefined,
+    },
+    manual_supports: (job.manual_supports ?? []).filter((support) =>
+      support?.point?.[0] >= tile.halo.minX &&
+      support?.point?.[0] <= tile.halo.maxX &&
+      support?.point?.[1] >= tile.halo.minY &&
+      support?.point?.[1] <= tile.halo.maxY
+    ),
+    cradle_config: {
+      ...(job.cradle_config ?? {}),
+      max_contact_grid_cells: tileCells,
+    },
+  };
+}
+
+function cropSupportTileResult(result, tile, cellSize) {
+  return {
+    ...result,
+    support_mesh: cropSupportMeshToTileCore(result.support_mesh, tile.core, cellSize),
+    interface_mesh: cropSupportMeshToTileCore(result.interface_mesh, tile.core, cellSize),
+    coverage: cropCoverageToTileCore(result.coverage, tile.core),
+  };
+}
+
+function cropSupportMeshToTileCore(mesh, core, cellSize) {
+  if (!mesh?.vertices?.length || !mesh?.triangles?.length) return null;
+  const vertices = [];
+  const triangles = [];
+  for (let index = 0; index + 2 < mesh.triangles.length; index += 3) {
+    const a = readSupportVertex(mesh.vertices, mesh.triangles[index]);
+    const b = readSupportVertex(mesh.vertices, mesh.triangles[index + 1]);
+    const c = readSupportVertex(mesh.vertices, mesh.triangles[index + 2]);
+    const cx = (a.x + b.x + c.x) / 3;
+    const cy = (a.y + b.y + c.y) / 3;
+    if (cx < core.minX || cx > core.maxX || cy < core.minY || cy > core.maxY) continue;
+    const base = vertices.length / 3;
+    vertices.push(a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z);
+    triangles.push(base, base + 1, base + 2);
+  }
+  return {
+    vertices: new Float32Array(vertices),
+    triangles: new Uint32Array(triangles),
+    vertex_count: Math.floor(vertices.length / 3),
+    triangle_count: Math.floor(triangles.length / 3),
+    cell_size_mm: cellSize,
+  };
+}
+
+function cropCoverageToTileCore(coverage, core) {
+  const cells = (coverage?.cells ?? []).filter((cell) =>
+    Number(cell?.[0]) >= core.minX &&
+    Number(cell?.[0]) <= core.maxX &&
+    Number(cell?.[1]) >= core.minY &&
+    Number(cell?.[1]) <= core.maxY
+  );
+  return {
+    supported_cells: cells.filter((cell) => Boolean(cell?.[3])).length,
+    unsupported_cells: cells.filter((cell) => !cell?.[3]).length,
+    cells,
+  };
+}
+
+function mergeTiledSupportResults(pieces, job, tiles, memoryPlan) {
+  const results = pieces.map((piece) => piece.result).filter(Boolean);
+  const supportMesh = mergeSupportMeshPieces(results.map((result) => result.support_mesh), memoryPlan.requestedCellSize);
+  const interfaceMesh = mergeSupportMeshPieces(results.map((result) => result.interface_mesh), memoryPlan.requestedCellSize);
+  const coverage = mergeTiledCoverage(results.map((result) => result.coverage));
+  const support = mergeTiledSupportStats(results.map((result) => result.support), memoryPlan, tiles);
+  const qa = mergeTiledQa(results.map((result) => result.qa));
+  return {
+    ...results[0],
+    status: "support_mesh_generated",
+    message: "Generated with independent tiled WASM support workers.",
+    support,
+    qa,
+    coverage,
+    support_mesh: supportMesh,
+    interface_mesh: interfaceMesh,
+    tree_layer_disks: { layers: [] },
+  };
+}
+
+function mergeTiledCoverage(coverages) {
+  const cells = [];
+  const seen = new Set();
+  let supported = 0;
+  let unsupported = 0;
+  for (const coverage of coverages) {
+    supported += Number(coverage?.supported_cells) || 0;
+    unsupported += Number(coverage?.unsupported_cells) || 0;
+    for (const cell of coverage?.cells ?? []) {
+      const key = `${Math.round(Number(cell[0]) * 1000)}:${Math.round(Number(cell[1]) * 1000)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (cells.length < 30000) cells.push(cell);
+    }
+  }
+  return { supported_cells: supported, unsupported_cells: unsupported, cells };
+}
+
+function mergeTiledSupportStats(statsList, memoryPlan, tiles) {
+  const out = {};
+  const sumKeys = [
+    "overhang_facets", "contact_cells", "envelope_cells", "pruned_sparse_cells",
+    "pruned_small_island_cells", "closed_gap_cells", "base_cells", "bottom_join_cells",
+    "column_taper_cells", "column_taper_seed_cells", "column_taper_added_volume_mm3", "column_components_before", "column_components_after",
+    "interface_cells", "edge_clearance_removed_cells",
+    "foam_gap_removed_cells", "manual_points", "manual_blocker_points",
+    "manual_blocker_removed_cells", "tree_branches", "tree_tip_contacts",
+    "tree_local_uprights", "tree_waypoint_branches", "tree_slope_reroutes", "tree_model_reroutes"
+  ];
+  for (const stats of statsList) {
+    for (const key of sumKeys) out[key] = (out[key] ?? 0) + (Number(stats?.[key]) || 0);
+  }
+  out.column_taper_max_top_mm = Math.max(
+    0,
+    ...statsList.map((stats) => Number(stats?.column_taper_max_top_mm) || 0)
+  );
+  out.column_taper_step_drop_mm = Math.max(
+    0,
+    ...statsList.map((stats) => Number(stats?.column_taper_step_drop_mm) || 0)
+  );
+  out.column_taper_max_seed_rise_mm = Math.max(
+    0,
+    ...statsList.map((stats) => Number(stats?.column_taper_max_seed_rise_mm) || 0)
+  );
+  out.column_taper_max_theoretical_reach_mm = Math.max(
+    0,
+    ...statsList.map((stats) => Number(stats?.column_taper_max_theoretical_reach_mm) || 0)
+  );
+  out.column_taper_side_guard_mm = Math.max(
+    0,
+    ...statsList.map((stats) => Number(stats?.column_taper_side_guard_mm) || 0)
+  );
+  out.column_taper_grid_reserve_mm = Math.max(
+    0,
+    ...statsList.map((stats) => Number(stats?.column_taper_grid_reserve_mm) || 0)
+  );
+  const first = statsList.find(Boolean) ?? {};
+  Object.assign(out, {
+    ...first,
+    ...out,
+    effective_contact_cell_size_mm: memoryPlan.requestedCellSize,
+    grid_cols: memoryPlan.requestedCols,
+    grid_rows: memoryPlan.requestedRows,
+    max_contact_grid_cells: memoryPlan.requestedCells,
+    tiled_support_generation: true,
+    tile_count: tiles.length,
+  });
+  return out;
+}
+
+function mergeTiledQa(qas) {
+  const out = {};
+  const sumKeys = ["intersection_cells", "downward_cells", "supported_downward_cells", "unsupported_downward_cells"];
+  for (const qa of qas) {
+    for (const key of sumKeys) out[key] = (out[key] ?? 0) + (Number(qa?.[key]) || 0);
+    out.max_penetration_mm = Math.max(Number(out.max_penetration_mm) || 0, Number(qa?.max_penetration_mm) || 0);
+    out.intersects_model = Boolean(out.intersects_model || qa?.intersects_model);
+  }
+  out.supported_downward_percent = out.downward_cells
+    ? 100 * (Number(out.supported_downward_cells) || 0) / out.downward_cells
+    : 0;
+  return out;
+}
+
+function isRecoverableWasmAbort(error) {
+  const message = error?.message || String(error || "");
+  return /Aborted|RuntimeError|memory|out of memory|worker terminated/i.test(message);
+}
+
+async function showWasmPending(options = {}) {
+  if (!state.modelMesh) return;
+  if (state.generationBusy) {
+    setJobStatus("Cradle generation is already running; please wait for it to finish.", "working");
+    return;
+  }
+  const accuracyMode = options.accuracy || "fast";
+  const highAccuracy = accuracyMode === "high";
+  const mediumAccuracy = accuracyMode === "medium";
+  const generationToken = state.generationToken + 1;
+  const generationRevision = state.modelRevision;
+  state.generationToken = generationToken;
+  state.generationBusy = true;
+  markPrintCradleStale("A new cradle generation is running; existing output should be treated as stale.");
+  const activeButton = highAccuracy
+    ? controlsEl.generateHighAccuracySupports
+    : mediumAccuracy
+      ? controlsEl.generateMediumAccuracySupports
+      : controlsEl.generateSupports;
+  const accuracyLabel = highAccuracy ? "high-accuracy" : mediumAccuracy ? "medium-accuracy" : "fast";
+
+  setJobStatus(`Preparing ${accuracyLabel} Orca support job...`, "working");
+  clearResolutionPrompt();
   setQaDashboard([
     { label: "Core", value: "Preparing", detail: "Packaging model", state: "working" },
     { label: "Coverage", value: "--", detail: "Waiting", state: "idle" },
@@ -1236,7 +2007,13 @@ async function showWasmPending() {
   setJobProgress(4);
   supportStatus.textContent = "Checking WASM core";
   controlsEl.generateSupports.disabled = true;
-  controlsEl.generateSupports.textContent = "Checking core";
+  if (controlsEl.generateMediumAccuracySupports) controlsEl.generateMediumAccuracySupports.disabled = true;
+  if (controlsEl.generateHighAccuracySupports) controlsEl.generateHighAccuracySupports.disabled = true;
+  if (controlsEl.cancelCradleGeneration) {
+    controlsEl.cancelCradleGeneration.hidden = false;
+    controlsEl.cancelCradleGeneration.disabled = false;
+  }
+  if (activeButton) activeButton.textContent = "Checking core";
   await nextFrame();
 
   try {
@@ -1253,23 +2030,80 @@ async function showWasmPending() {
     setJobProgress(12);
     resetPhaseTimer();
     const schema = await getSupportOptionSchema();
+    assertGenerationCurrent(generationToken, generationRevision);
     markPhase("schema");
     setJobProgress(22);
     setJobStatus("Packaging model and support settings...", "working");
     await nextFrame();
     resetPhaseTimer();
-    const job = buildSupportJobPayload();
+    const job = buildSupportJobPayload({ accuracyMode });
     markPhase("package");
     const supportConfig = job.support_config;
     const cradleConfig = job.cradle_config;
+    let generationRetryWarning = "";
+    let gridMemoryEstimate = estimateSupportGridMemory(job, cradleConfig.max_contact_grid_cells);
+    if (mediumAccuracy || highAccuracy) {
+      setProgressDetail(formatGridMemoryEstimate(gridMemoryEstimate, `${mediumAccuracy ? "Medium" : "High accuracy"} grid estimate`));
+    }
+    const modelTrimClearance = modelBooleanClearanceSettings(supportConfig);
+    const modelTrimDebug = highAccuracy
+      ? MODEL_TRIM_DEBUG_SETTINGS
+      : FAST_MODEL_TRIM_SETTINGS;
+    let preferParallelManifold = highAccuracy &&
+      !modelTrimDebug.targeted_minkowski &&
+      shouldUseParallelManifoldForTrim();
+    let preparedModelTrimPromise = null;
+    if (
+      highAccuracy &&
+      canUseModelTrimWorker() &&
+      (preferParallelManifold || expandedClearanceNeeded(modelTrimClearance))
+    ) {
+      cancelRunningModelTrimPrewarm();
+    }
+    if (
+      highAccuracy &&
+      canUseModelTrimWorker() &&
+      !preferParallelManifold &&
+      !modelTrimDebug.targeted_minkowski &&
+      !expandedClearanceNeeded(modelTrimClearance)
+    ) {
+      preparedModelTrimPromise = getOrStartModelTrimWorkerPrewarm(modelTrimClearance, false)
+        .catch((error) => {
+          console.warn("High-accuracy model trim prewarm failed; trim will build the clearance solid on demand.", error);
+          return null;
+        });
+    }
     const manualCount = realizedManualSupports().length;
     setJobProgress(34);
-    setJobStatus("Generating solid cradle in WASM...", "working");
-    await nextFrame();
     resetPhaseTimer();
-    const jobResult = await prepareSupportJob(job);
-    markPhase("WASM");
-    if (jobResult.tree_layer_disks?.layers?.length) {
+    let jobResult = reusableDraftSupportJobResult(job, accuracyMode);
+    if (jobResult) {
+      setJobStatus("Reusing matching draft cradle for high-accuracy trim...", "working");
+      setProgressDetail("Draft cradle settings match the current model and controls; skipping WASM regeneration.");
+      markPhase("reuse draft cradle");
+      await nextFrame();
+    } else {
+      setJobStatus("Generating solid cradle in WASM...", "working");
+      await nextFrame();
+      jobResult = await prepareSupportJobWithGridRetry(job, {
+        accuracyMode,
+        onAttempt: async (message) => {
+          setProgressDetail(message);
+          await nextFrame();
+        },
+        onRetry: async (message) => {
+          generationRetryWarning = message;
+          setProgressDetail(message);
+          setJobStatus(message, "working");
+          await nextFrame();
+        },
+      });
+      assertGenerationCurrent(generationToken, generationRevision);
+      cacheDraftSupportJobResult(job, accuracyMode, jobResult);
+      markPhase("WASM");
+    }
+    gridMemoryEstimate = jobResult._grid_memory_estimate ?? gridMemoryEstimate;
+    if (jobResult.tree_layer_disks?.layers?.length && !jobResult._tree_union_complete) {
       setJobProgress(58);
       setJobStatus("Unioning organic tree support layers...", "working");
       await nextFrame();
@@ -1286,44 +2120,164 @@ async function showWasmPending() {
         jobResult.support_mesh?.cell_size_mm ?? supportConfig.contact_cell_size_mm,
         treeProgress
       );
+      assertGenerationCurrent(generationToken, generationRevision);
       if (jobResult.support) jobResult.support.tree_layered_solid = true;
+      jobResult._tree_union_complete = true;
       markPhase("tree union");
     }
+    cacheDraftSupportJobResult(job, accuracyMode, jobResult);
     setJobProgress(70);
     setJobStatus("Checking cradle clearance against object model...", "working");
     await nextFrame();
     let modelMeshQa = null;
     const hasInterfaceMesh = Boolean(jobResult.interface_mesh?.vertices?.length && jobResult.interface_mesh?.triangles?.length);
-    const canConsiderSkippingTrim =
+    const hasSupportMesh = Boolean(jobResult.support_mesh?.vertices?.length && jobResult.support_mesh?.triangles?.length);
+    const canRunPretrimQa =
       !jobResult.qa?.intersects_model &&
       !Number(jobResult.qa?.clearance_violation_cells ?? 0) &&
       !hasInterfaceMesh &&
-      Boolean(jobResult.support_mesh?.vertices?.length && jobResult.support_mesh?.triangles?.length);
+      hasSupportMesh;
     resetPhaseTimer();
-    if (canConsiderSkippingTrim) {
+    if (canRunPretrimQa) {
       modelMeshQa = evaluateGeneratedModelIntersectionQa(jobResult.support_mesh, { phase: "pretrim" });
       markPhase("pretrim QA");
     }
 
-    const shouldRunExactTrim = !canConsiderSkippingTrim || Boolean(modelMeshQa?.needs_exact_trim);
+    const trimGateQa = hasSupportMesh
+      ? evaluateExactTrimGateQa(jobResult.support_mesh, modelTrimClearance, {
+          phase: highAccuracy ? "high" : mediumAccuracy ? "medium" : "fast",
+        })
+      : null;
+    if (trimGateQa?.sampled_points) markPhase("BVH trim gate");
+    let voxelClearanceQa = null;
+    if (mediumAccuracy && hasSupportMesh) {
+      setJobProgress(74);
+      setJobStatus("Building medium interval-clearance cradle mesh...", "working");
+      await nextFrame();
+      resetPhaseTimer();
+      const voxelResult = await buildVoxelBooleanCradleMesh(jobResult.support_mesh, modelTrimClearance, {
+        phase: "medium",
+        onProgress: async (progress, message) => {
+          setJobProgress(74 + progress * 6);
+          setJobStatus(message, "working");
+          await nextFrame();
+        },
+      });
+      assertGenerationCurrent(generationToken, generationRevision);
+      jobResult.support_mesh = voxelResult.mesh;
+      voxelClearanceQa = voxelResult.qa;
+      modelMeshQa = null;
+      setJobProgress(80);
+      setJobStatus("Checking medium interval-clearance cradle mesh...", "working");
+      await nextFrame();
+      const surfaceVoxelClearanceQa = await evaluateVoxelClearanceQa(jobResult.support_mesh, modelTrimClearance, {
+        onProgress: async (progress, message) => {
+          setJobProgress(80 + progress * 4);
+          setJobStatus(message, "working");
+          await nextFrame();
+        },
+      });
+      voxelClearanceQa = {
+        ...voxelClearanceQa,
+        surface_qa: surfaceVoxelClearanceQa,
+        surface_inside_samples: surfaceVoxelClearanceQa.inside_samples,
+        surface_clearance_violation_samples: surfaceVoxelClearanceQa.clearance_violation_samples,
+        surface_min_distance_mm: surfaceVoxelClearanceQa.min_distance_mm,
+      };
+      markPhase("interval clearance mesh");
+    }
+    const shouldRunExactTrim = highAccuracy
+      ? hasSupportMesh
+      : mediumAccuracy
+        ? false
+        : Boolean(
+          hasSupportMesh &&
+          (!canRunPretrimQa || modelMeshQa?.needs_exact_trim)
+        );
+    const trimSkipReason = !hasSupportMesh
+      ? "no generated cradle mesh was available for exact object trimming"
+      : highAccuracy
+        ? "no high-accuracy trim was requested"
+        : mediumAccuracy
+          ? "medium mode replaced the generator mesh with an interval-column clearance cradle; exact Manifold trim was not requested"
+        : modelMeshQa?.intersects_model
+          ? "sampled mesh QA found a possible object intersection but it did not require exact trim"
+          : "fast mode kept the generator clearance because sampled mesh QA found no material object intersection";
     setJobProgress(76);
-    setJobStatus(shouldRunExactTrim ? "Trimming cradle away from object model..." : "Using generator clearance; exact trim not needed...", "working");
-    await nextFrame();
-    resetPhaseTimer();
-    const trimmedMeshes = await trimGeneratedMeshesAgainstModel(
-      jobResult.support_mesh,
-      jobResult.interface_mesh,
-      supportConfig,
-      {
-        skipExactTrim: !shouldRunExactTrim,
-        skipReason: modelMeshQa?.intersects_model
-          ? "generator clearance was clean and sampled hits were shallow/rare enough to treat as near-surface QA"
-          : "generator clearance and sampled mesh QA found no material object intersection",
-      }
+    setJobStatus(
+      shouldRunExactTrim
+        ? "Verifying object clearance and repairing if needed..."
+        : mediumAccuracy && hasSupportMesh
+          ? "Using medium interval-clearance cradle; exact object trim was not requested..."
+        : hasSupportMesh
+          ? "Using generator clearance; exact object trim not needed in fast mode..."
+          : "No cradle mesh available for object trim...",
+      "working"
     );
+    await nextFrame();
+    // Parallel Manifold is tested in the real trim request. A separate prepare
+    // request can time out before the trim gets a fair chance to use it.
+    const trimProgressTracker = shouldRunExactTrim
+      ? createHighAccuracyTrimProgressTracker({
+          startProgress: 76,
+          endProgress: 87,
+          clearance: modelTrimClearance,
+          supportMesh: jobResult.support_mesh,
+          preferParallelManifold,
+          debug: modelTrimDebug,
+          preparedClearanceKey: preparedModelTrimPromise ? state.modelTrimPrewarmKey : "",
+        })
+      : null;
+    trimProgressTracker?.update(preparedModelTrimPromise
+      ? "waiting for object clearance precompute"
+      : "starting exact object clearance trim");
+    const preparedModelTrim = shouldRunExactTrim && preparedModelTrimPromise
+      ? await preparedModelTrimPromise
+      : null;
+    if (preparedModelTrim) trimProgressTracker?.update("cached model clearance solid");
+    resetPhaseTimer();
+    let trimmedMeshes = null;
+    let exactTrimCompleted = false;
+    try {
+      trimmedMeshes = await trimGeneratedMeshesAgainstModel(
+        jobResult.support_mesh,
+        jobResult.interface_mesh,
+        supportConfig,
+        {
+          skipExactTrim: !shouldRunExactTrim,
+          skipReason: trimSkipReason,
+          preparedClearanceKey: preparedModelTrim?.clearanceKey || "",
+          preferParallelManifold,
+          debug: modelTrimDebug,
+          requireExactTrim: highAccuracy,
+          onProgress: async (message) => {
+            trimProgressTracker?.update(message);
+            setJobStatus(`High accuracy object clearance: ${trimProgressTracker?.statusText(message) || `${message}...`}`, "working");
+            await nextFrame();
+          },
+        }
+      );
+      assertGenerationCurrent(generationToken, generationRevision);
+      exactTrimCompleted = shouldRunExactTrim
+        ? Boolean(trimmedMeshes.trimmed || trimmedMeshes.certified || trimmedMeshes.certificate?.passed)
+        : true;
+      recordModelTrimEstimate(modelTrimClearance, preferParallelManifold, trimmedMeshes.timings);
+    } finally {
+      trimProgressTracker?.finish(exactTrimCompleted);
+    }
+    if (preparedModelTrim?.timings?.length) {
+      trimmedMeshes.timings = [
+        ...preparedModelTrim.timings.map((phase) => ({
+          ...phase,
+          label: `prepare ${phase.label}`,
+        })),
+        ...(trimmedMeshes.timings ?? []),
+      ];
+    }
     markPhase(shouldRunExactTrim ? "model trim" : "trim decision");
     setJobStatus("Rendering generated cradle...", "working");
     await nextFrame();
+    assertGenerationCurrent(generationToken, generationRevision);
     resetPhaseTimer();
     renderGeneratedMeshes(trimmedMeshes.support_mesh, trimmedMeshes.interface_mesh);
     markPhase("render");
@@ -1333,12 +2287,47 @@ async function showWasmPending() {
     resetPhaseTimer();
     renderCoverageOverlay(jobResult.coverage);
     const meshAndStabilityQaPromise = evaluateCradleMeshAndStabilityQa(trimmedMeshes.support_mesh, jobResult.coverage);
-    if (!modelMeshQa || trimmedMeshes.trimmed) {
-      modelMeshQa = evaluateGeneratedModelIntersectionQa(trimmedMeshes.support_mesh, { phase: "final" });
+    if (!modelMeshQa || trimmedMeshes.trimmed || trimmedMeshes.certified || trimmedMeshes.certificate?.passed) {
+      try {
+        modelMeshQa = evaluateGeneratedModelIntersectionQa(trimmedMeshes.support_mesh, { phase: "final" });
+      } catch (error) {
+        console.warn("Model intersection QA failed after cradle generation.", error);
+        modelMeshQa = failedModelIntersectionQa(error);
+      }
     }
-    const meshAndStabilityQa = await meshAndStabilityQaPromise;
-    const meshQa = meshAndStabilityQa.meshQa;
+    state.printCradleSafety = printCradleSafetyForGeneration({
+      highAccuracy,
+      mediumAccuracy,
+      hasSupportMesh,
+      trimmedMeshes,
+      modelMeshQa,
+      meshQa: null,
+      voxelClearanceQa,
+    });
+    let meshAndStabilityQa;
+    try {
+      meshAndStabilityQa = await meshAndStabilityQaPromise;
+    } catch (error) {
+      console.warn("Cradle mesh/stability QA failed after cradle generation.", error);
+      meshAndStabilityQa = {
+        meshQa: failedMeshReachQa(error),
+        stabilityQa: failedStabilityQa(error),
+        timings: [],
+        worker: false,
+      };
+    }
+    let meshQa = meshAndStabilityQa.meshQa;
+    if (mediumAccuracy) meshQa = adjustMediumIntervalMeshReachQa(meshQa, voxelClearanceQa);
     const stabilityQa = meshAndStabilityQa.stabilityQa;
+    state.printCradleSafety = printCradleSafetyForGeneration({
+      highAccuracy,
+      mediumAccuracy,
+      hasSupportMesh,
+      trimmedMeshes,
+      modelMeshQa,
+      meshQa,
+      voxelClearanceQa,
+    });
     const qaWorkerTimings = meshAndStabilityQa.worker ? meshAndStabilityQa.timings : [];
     markPhase("QA");
 
@@ -1353,7 +2342,14 @@ async function showWasmPending() {
     const closedGapCount = jobResult.support?.closed_gap_cells ?? 0;
     const baseCellCount = jobResult.support?.base_cells ?? 0;
     const bottomJoinCellCount = jobResult.support?.bottom_join_cells ?? 0;
-    const columnMergeCellCount = jobResult.support?.column_merge_cells ?? 0;
+    const columnTaperCellCount = jobResult.support?.column_taper_cells ?? 0;
+    const columnTaperSeedCellCount = jobResult.support?.column_taper_seed_cells ?? 0;
+    const columnTaperAngleDeg = Number(jobResult.support?.column_taper_angle_deg) || 0;
+    const columnTaperStepDropMm = Number(jobResult.support?.column_taper_step_drop_mm) || 0;
+    const columnTaperMaxReachMm = Number(jobResult.support?.column_taper_max_theoretical_reach_mm) || 0;
+    const columnTaperSideGuardMm = Number(jobResult.support?.column_taper_side_guard_mm) || 0;
+    const columnTaperGridReserveMm = Number(jobResult.support?.column_taper_grid_reserve_mm) || 0;
+    const columnTaperAddedVolumeCm3 = (Number(jobResult.support?.column_taper_added_volume_mm3) || 0) / 1000;
     const columnComponentsBefore = jobResult.support?.column_components_before ?? 0;
     const columnComponentsAfter = jobResult.support?.column_components_after ?? 0;
     const interfaceCellCount = jobResult.support?.interface_cells ?? 0;
@@ -1392,8 +2388,12 @@ async function showWasmPending() {
       ? `QA warning: ${Number(qa.intersection_cells ?? 0).toLocaleString()} possible model-intersection cells, max penetration ${formatStatusNumber(qa.max_penetration_mm ?? 0)} mm.`
       : "QA: no model intersections detected.";
     const qaCoverageText = `Approx. ${formatStatusNumber(supportedDownwardPercent)}% of lower/downward-facing sampled cells are supported (${Number(qa.supported_downward_cells ?? 0).toLocaleString()}/${Number(qa.downward_cells ?? 0).toLocaleString()}).`;
-    const meshQaText = meshQa.sampled_cells
-      ? (meshQa.unsupported_cells
+    const meshQaText = meshQa.failed
+      ? `Mesh QA warning: ${meshQa.reason || "mesh support reach QA could not complete"}.`
+      : meshQa.sampled_cells
+      ? (meshQa.clearance_adjusted
+          ? `Mesh QA: interval clearance surface is intentionally below sampled underside targets; max clearance gap ${formatStatusNumber(meshQa.max_gap_mm)} mm is within the medium tolerance ${formatStatusNumber(meshQa.clearance_adjusted_tolerance_mm)} mm.`
+          : meshQa.unsupported_cells
           ? `Mesh QA warning: printable cradle surface reaches only ${formatStatusNumber(meshQa.supported_percent)}% of sampled underside targets (${meshQa.supported_cells.toLocaleString()}/${meshQa.sampled_cells.toLocaleString()}); max support gap ${formatStatusNumber(meshQa.max_gap_mm)} mm.`
           : `Mesh QA: printable cradle surface reaches ${formatStatusNumber(meshQa.supported_percent)}% of sampled underside targets (${meshQa.supported_cells.toLocaleString()}/${meshQa.sampled_cells.toLocaleString()}); max support gap ${formatStatusNumber(meshQa.max_gap_mm)} mm.`)
       : "Mesh QA skipped because no underside target samples were available.";
@@ -1401,13 +2401,70 @@ async function showWasmPending() {
       ? `${Number(qa.clearance_violation_cells ?? 0).toLocaleString()} cells are inside the requested clearance by up to ${formatStatusNumber(qa.max_clearance_violation_mm ?? 0)} mm.`
       : "Requested clearance is respected within grid tolerance.";
     const modelMeshQaText = formatGeneratedModelIntersectionQaStatus(modelMeshQa);
+    const trimGateQaText = formatExactTrimGateQaStatus(trimGateQa);
+    const voxelClearanceQaText = formatVoxelClearanceQaStatus(voxelClearanceQa);
+    const trimClearanceText = `${formatStatusNumber(trimmedMeshes.clearance?.xy_mm ?? 0)} mm XY, ${formatStatusNumber(trimmedMeshes.clearance?.z_mm ?? 0)} mm Z requested`;
+    const trimSafetyText = Number(trimmedMeshes.clearance?.safety_margin_mm ?? 0) > 0
+      ? ` with ${formatStatusNumber(trimmedMeshes.clearance.safety_margin_mm)} mm conservative offset safety margin`
+      : "";
+    const certificatePassed = Boolean(trimmedMeshes.certified || trimmedMeshes.certificate?.passed);
+    const postCertificatePassed = Boolean(trimmedMeshes.post_certificate?.passed);
+    const highAccuracyVerified = Boolean(trimmedMeshes.trimmed || certificatePassed);
+    const certificateGuardText = Number(trimmedMeshes.certificate?.axis_guard_mm ?? 0) > 0
+      ? ` with ${formatStatusNumber(trimmedMeshes.certificate.axis_guard_mm)} mm numerical axis guard`
+      : "";
+    const finalCertificateText = trimmedMeshes.post_certificate?.attempted
+      ? postCertificatePassed
+        ? " Final continuous ellipsoidal clearance certificate passed."
+        : ` Final continuous clearance diagnostic did not certify the repair (${trimmedMeshes.post_certificate.reason || "unknown reason"}).`
+      : "";
+    const kernelText = trimmedMeshes.kernel?.mode === CIRCUMSCRIBED_CLEARANCE_KERNEL_MODE
+      ? ` Corrected circumscribed kernel used ${trimmedMeshes.kernel.actual_triangles?.toLocaleString?.() || trimmedMeshes.kernel.actual_triangles || 0} faces at ${formatStatusNumber(trimmedMeshes.kernel.circumscription_scale)}x radial scale.`
+      : "";
+    const candidateText = trimmedMeshes.repair?.targeted_applied
+      ? ` Target filtering retained ${Number(trimmedMeshes.repair.candidate_faces || 0).toLocaleString()} of ${Number(trimmedMeshes.repair.source_faces || 0).toLocaleString()} bounded model faces after ${Number(trimmedMeshes.repair.aabb_candidate_faces || trimmedMeshes.repair.candidate_faces || 0).toLocaleString()} AABB candidates.`
+      : "";
+    const targetedFallbackText = trimmedMeshes.repair?.targeted_requested &&
+      !trimmedMeshes.repair?.targeted_applied &&
+      trimmedMeshes.repair?.targeted_fallback_reason
+      ? ` Target-aware repair fell back because ${trimmedMeshes.repair.targeted_fallback_reason}.`
+      : "";
     const modelTrimText = trimmedMeshes.warning
       ? `Boolean model trim warning: ${trimmedMeshes.warning}`
+      : certificatePassed
+        ? `Continuous ellipsoidal object clearance certified (${trimClearanceText}${certificateGuardText}); the matching draft mesh was preserved unchanged.`
       : (trimmedMeshes.trimmed
-          ? `Exact object boolean trim applied after generator clearance (${formatStatusNumber(trimmedMeshes.clearance?.xy_mm ?? 0)} mm XY, ${formatStatusNumber(trimmedMeshes.clearance?.z_mm ?? 0)} mm Z requested).`
+          ? (trimmedMeshes.repair?.targeted_applied
+              ? `Target-aware expanded object-clearance repair applied (${trimClearanceText}).${candidateText}${kernelText}${finalCertificateText}`
+              : trimmedMeshes.clearance?.expanded
+                ? `Expanded object-clearance boolean trim applied after generator clearance (${trimClearanceText}${trimSafetyText}).${targetedFallbackText}${kernelText}${finalCertificateText}`
+                : `Exact object boolean trim applied after generator clearance (${trimClearanceText}; no expanded clearance volume was needed).${finalCertificateText}`)
           : trimmedMeshes.skipped
             ? `Exact object boolean trim skipped: ${trimmedMeshes.skip_reason}.`
             : "");
+    const manifoldTrimRuntimeText = trimmedMeshes.runtime?.build
+      ? ` Manifold trim runtime: ${trimmedMeshes.runtime.build}${trimmedMeshes.runtime.selected_parallel ? "." : trimmedMeshes.runtime.load_error ? `; parallel backend unavailable (${trimmedMeshes.runtime.load_error}) so exact trim used the serial worker backend.` : "; exact trim is isolated in a worker but this Manifold build is not internally parallel."}`
+      : "";
+    const generationAccuracyText = highAccuracy
+      ? (certificatePassed
+          ? " High accuracy mode proved continuous ellipsoidal object clearance without changing the draft; sampled BVH proximity remains diagnostic only."
+          : postCertificatePassed
+          ? " High accuracy mode repaired and then proved continuous ellipsoidal object clearance; sampled BVH proximity remains diagnostic only."
+          : highAccuracyVerified
+          ? (trimmedMeshes.kernel?.mode === CIRCUMSCRIBED_CLEARANCE_KERNEL_MODE
+              ? " High accuracy mode ran the corrected-kernel repair, but the final continuous certificate remained diagnostic and did not pass."
+              : " High accuracy mode ran object-clearance boolean trimming; the final continuous certificate remains diagnostic while the legacy kernel is the default.")
+          : " High accuracy object-clearance verification did not complete because no cradle mesh was available.")
+      : mediumAccuracy
+        ? " Medium accuracy generated a WebGPU/interval clearance cradle by subtracting inflated model/lift-lock intervals; exact object-clearance boolean trimming was not run."
+      : " Fast mode used generator clearance with sampled mesh QA; run high accuracy before final printing.";
+    const generationRetryText = generationRetryWarning ? ` ${generationRetryWarning}` : "";
+    const gridMemoryText = gridMemoryEstimate
+      ? ` ${formatGridMemoryEstimate(gridMemoryEstimate, "Grid memory estimate")}`
+      : "";
+    const printSafetyText = state.printCradleSafety.exportable
+      ? ` Print export gate: ready for final STL/PLY export (${state.printCradleSafety.reason})`
+      : ` Print export warning: ${state.printCradleSafety.reason} Export will ask for confirmation.`;
     const stabilityQaText = formatStabilityQaStatus(stabilityQa);
     const orcaTreeText = treeMode && originalOrganicTree
       ? "Generated original organic tree cradle geometry in CradleMaker; no Orca source is bundled in this path."
@@ -1421,7 +2478,10 @@ async function showWasmPending() {
       : "";
     const runtime = jobResult._runtime ?? {};
     const wasmBuildText = runtime.wasmBuild ? `, ${runtime.wasmBuild}` : "";
-    const runtimeText = ` Runtime: support generation ${runtime.worker ? "worker" : "main thread"}${wasmBuildText}${runtime.crossOriginIsolated ? ", pthread-ready page" : ", pthreads unavailable until server restart/headers are active"}.`;
+    const wasmHeapText = runtime.wasmInitialMemoryBytes
+      ? `, ${formatBytes(runtime.wasmInitialMemoryBytes)} initial WASM heap`
+      : "";
+    const runtimeText = ` Runtime: support generation ${runtime.worker ? "worker" : "main thread"}${wasmBuildText}${wasmHeapText}${runtime.crossOriginIsolated ? ", pthread-ready page" : ", pthreads unavailable until server restart/headers are active"}.`;
     const wasmTimingText = formatWasmTimingText(jobResult.support?.timings_ms);
     const wasmOutputTimingText = formatWasmOutputTimingText(jobResult.top_level_timings_ms);
     const workerTimingText = formatWorkerTimingText(runtime.workerTimings);
@@ -1432,10 +2492,12 @@ async function showWasmPending() {
       : "";
     const totalTriangleCount = supportTriangleCount + interfaceTriangleCount;
     const resolutionRecommendation = resolutionAdjustmentRecommendation({
+      accuracyMode,
       requestedCellSize,
       effectiveCellSize,
       gridCols,
       gridRows,
+      gridBudgetCells: Number(jobResult.support?.max_contact_grid_cells ?? cradleConfig.max_contact_grid_cells ?? 0),
       totalTriangleCount,
       contactCellCount,
       envelopeCellCount,
@@ -1467,28 +2529,48 @@ async function showWasmPending() {
     const cradleArticle = cradleLabel.startsWith("original") ? "an" : "a";
     setJobStatus(
       totalTriangleCount
-        ? `Generated ${cradleArticle} ${cradleLabel} from ${contactCellCount.toLocaleString()} contact cells, including ${envelopeCellCount.toLocaleString()} underside-envelope cells, ${prunedSparseCellCount.toLocaleString()} sparse side/contact cells pruned, ${prunedSmallIslandCellCount.toLocaleString()} tiny island cells removed, ${baseCellCount.toLocaleString()} footprint base cells, ${bottomJoinCellCount.toLocaleString()} bottom-join cells, ${columnMergeCellCount.toLocaleString()} safe column-merge cells, column components ${columnComponentsBefore.toLocaleString()} -> ${columnComponentsAfter.toLocaleString()}, ${closedGapCount.toLocaleString()} closed gaps, ${unsupportedCellCount.toLocaleString()} unsupported coverage cells, ${overhangFacetCount.toLocaleString()} overhang facets, ${nativeManualCount.toLocaleString()} manual/enforce marks, ${nativeBlockerCount.toLocaleString()} no-support marks removing ${nativeBlockerRemovedCells.toLocaleString()} cells, ${treeMode ? `${treeBranchCount.toLocaleString()} organic branches, ` : ""}${interfaceCellCount.toLocaleString()} soft-interface cells from ${interfaceLayers.toLocaleString()} interface layers, ${edgeRemovedCells.toLocaleString()} cells removed for a ${edgeClearance.toLocaleString()} mm support-free edge, and ${foamRemovedCells.toLocaleString()} cells removed for a ${foamGapZ.toLocaleString()} mm Z / ${foamGapXY.toLocaleString()} mm XY foam gap.${resolutionText} ${orcaTreeText} ${treeRoutingText} ${qaIntersectionText} ${qaCoverageText} ${meshQaText} ${modelTrimText} ${modelMeshQaText} ${stabilityQaText} ${qaClearanceText} Prepared ${Object.keys(supportConfig).length}/${schema.length} Orca support settings and ${Object.keys(cradleConfig).length} cradle settings.${runtimeText}${timingText}`
+        ? `Generated ${cradleArticle} ${cradleLabel} from ${contactCellCount.toLocaleString()} contact cells, including ${envelopeCellCount.toLocaleString()} underside-envelope cells, ${prunedSparseCellCount.toLocaleString()} sparse side/contact cells pruned, ${prunedSmallIslandCellCount.toLocaleString()} tiny island cells removed, ${baseCellCount.toLocaleString()} footprint base cells, ${bottomJoinCellCount.toLocaleString()} bottom-join cells, ${columnTaperCellCount.toLocaleString()} tapered structural cells from ${columnTaperSeedCellCount.toLocaleString()} contact-boundary seeds at ${columnTaperAngleDeg.toFixed(1)} deg (${columnTaperStepDropMm.toFixed(2)} mm lower per outward grid step, up to ${columnTaperMaxReachMm.toFixed(2)} mm theoretical base reach, ${columnTaperGridReserveMm.toFixed(2)} mm perimeter reserved for taper plus base, ${columnTaperSideGuardMm.toFixed(2)} mm conservative side guard, ${columnTaperAddedVolumeCm3.toFixed(2)} cm3 added), column components ${columnComponentsBefore.toLocaleString()} -> ${columnComponentsAfter.toLocaleString()}, ${closedGapCount.toLocaleString()} closed gaps, ${unsupportedCellCount.toLocaleString()} unsupported coverage cells, ${overhangFacetCount.toLocaleString()} overhang facets, ${nativeManualCount.toLocaleString()} manual/enforce marks, ${nativeBlockerCount.toLocaleString()} no-support marks removing ${nativeBlockerRemovedCells.toLocaleString()} cells, ${treeMode ? `${treeBranchCount.toLocaleString()} organic branches, ` : ""}${interfaceCellCount.toLocaleString()} soft-interface cells from ${interfaceLayers.toLocaleString()} interface layers, ${edgeRemovedCells.toLocaleString()} cells removed for a ${edgeClearance.toLocaleString()} mm support-free edge, and ${foamRemovedCells.toLocaleString()} cells removed for a ${foamGapZ.toLocaleString()} mm Z / ${foamGapXY.toLocaleString()} mm XY foam gap.${resolutionText} ${orcaTreeText} ${treeRoutingText} ${qaIntersectionText} ${qaCoverageText} ${meshQaText} ${modelTrimText}${generationAccuracyText}${generationRetryText}${manifoldTrimRuntimeText} ${trimGateQaText} ${voxelClearanceQaText} ${modelMeshQaText} ${stabilityQaText} ${qaClearanceText} ${printSafetyText} Prepared ${Object.keys(supportConfig).length}/${schema.length} Orca support settings and ${Object.keys(cradleConfig).length} cradle settings.${gridMemoryText}${runtimeText}${timingText}`
         : `No support regions found. Prepared ${Object.keys(supportConfig).length}/${schema.length} Orca support settings and ${Object.keys(cradleConfig).length} cradle settings.`,
-      qa.intersects_model || meshQa.unsupported_cells || modelMeshQa.needs_exact_trim || stabilityQa.severity === "error" ? "error" : "pending"
+      qa.intersects_model || meshQa.unsupported_cells || modelMeshQa.needs_exact_trim || meshQa.failed || modelMeshQa.failed || stabilityQa.severity === "error" || (highAccuracy && !state.printCradleSafety.exportable) ? "error" : "pending"
     );
     setJobProgress(100);
   } catch (error) {
-    modelStatus.textContent = "CradleMaker WASM core not loaded";
-    supportStatus.textContent = "Core load failed";
-    setJobStatus(`WASM load failed: ${error.message}`, "error");
-    setJobProgress(100);
+    if (generationToken !== state.generationToken) return;
+    console.error("Cradle generation failed.", error);
+    if (isRecoverableWasmAbort(error)) resetSupportCoreRuntime();
+    if (generationToken === state.generationToken) {
+      markPrintCradleStale(`Last cradle generation failed: ${error.message || error}`);
+    }
+    modelStatus.textContent = "Cradle generation failed";
+    supportStatus.textContent = "Generation failed";
+    setJobStatus(`Cradle generation failed: ${error.message}`, "error");
+    setProgressDetail(`Generation stopped before completion: ${error.message || error}`);
+    setJobProgress(0);
   } finally {
-    controlsEl.generateSupports.textContent = "Generate supports";
-    updateButtons();
+    if (generationToken === state.generationToken) {
+      state.generationBusy = false;
+      controlsEl.generateSupports.textContent = "Generate cradle";
+      if (controlsEl.generateMediumAccuracySupports) {
+        controlsEl.generateMediumAccuracySupports.textContent = "Generate WebGPU clearance cradle";
+      }
+      if (controlsEl.generateHighAccuracySupports) {
+        controlsEl.generateHighAccuracySupports.textContent = "Generate high accuracy cradle";
+      }
+      updateButtons();
+    }
   }
 }
 
 function renderGeneratedMeshes(supportMesh, interfaceMesh) {
-  supportGroup.clear();
-  cncGroup.clear();
+  clearMeshGroup(supportGroup);
+  clearMeshGroup(cncGroup);
   clearSplitPreview();
   state.supportMesh = null;
   state.interfaceMesh = null;
+  state.printCradleSafety = {
+    exportable: false,
+    reason: "Generation is still being verified.",
+  };
   state.cncMesh = null;
   state.cncQa = null;
 
@@ -1499,12 +2581,303 @@ function renderGeneratedMeshes(supportMesh, interfaceMesh) {
   updateButtons();
 }
 
+function createHighAccuracyTrimProgressTracker({
+  startProgress = 76,
+  endProgress = 87,
+  clearance = {},
+  supportMesh = null,
+  preferParallelManifold = false,
+  debug = MODEL_TRIM_DEBUG_SETTINGS,
+  preparedClearanceKey = "",
+} = {}) {
+  const startedAt = performance.now();
+  const estimateHadHistory = Boolean(readModelTrimEstimate(
+    modelTrimClearanceKey(null, clearance, preferParallelManifold, debug)
+  ));
+  const clearanceEstimateSource = estimateHadHistory ? "previous run" : "rough estimate";
+  const stages = {
+    start: { label: "Starting high accuracy clearance", from: 0.00, to: 0.05, estimateMs: 2500 },
+    wait: { label: "Finishing object clearance precompute", from: 0.05, to: 0.74, estimateMs: modelTrimEstimateMs(clearance, preferParallelManifold, supportMesh, debug), estimateSource: clearanceEstimateSource },
+    load: { label: "Loading Manifold", from: 0.05, to: 0.10, estimateMs: 4500 },
+    certificate: { label: "Checking continuous object clearance", from: 0.10, to: 0.22, estimateMs: 1500 },
+    filter: { label: "Filtering model faces near the cradle", from: 0.22, to: 0.34, estimateMs: 1200 },
+    clearance: {
+      label: debug?.targeted_minkowski
+        ? "Applying streamed object clearance"
+        : "Building expanded object clearance solid",
+      from: 0.34,
+      to: 0.74,
+      estimateMs: modelTrimEstimateMs(clearance, preferParallelManifold, supportMesh, debug),
+      estimateSource: clearanceEstimateSource,
+    },
+    cached: { label: "Using cached object clearance solid", from: 0.70, to: 0.76, estimateMs: 600 },
+    trim: { label: "Trimming cradle mesh", from: 0.74, to: 0.90, estimateMs: trimMeshEstimateMs(supportMesh) },
+    finalCertificate: { label: "Certifying repaired clearance", from: 0.90, to: 0.97, estimateMs: trimMeshEstimateMs(supportMesh) },
+    witnessRepair: { label: "Repairing localized clearance witnesses", from: 0.92, to: 0.985, estimateMs: 0 },
+    pack: { label: "Packing trimmed mesh", from: 0.97, to: 0.99, estimateMs: 1200 },
+    done: { label: "High accuracy clearance complete", from: 0.99, to: 1.00, estimateMs: 200 },
+  };
+  let stageName = preparedClearanceKey ? "wait" : "start";
+  let stageStartedAt = startedAt;
+  let lastMessage = "";
+  let lastProgressValue = startProgress;
+  let reportedStageFraction = 0;
+  let projectedStageDurationMs = 0;
+  let active = true;
+
+  const setStage = (nextStageName, message = "") => {
+    if (!stages[nextStageName] || stageName === nextStageName) return;
+    stageName = nextStageName;
+    stageStartedAt = performance.now();
+    reportedStageFraction = 0;
+    projectedStageDurationMs = 0;
+    lastMessage = message || lastMessage;
+    tick();
+  };
+
+  const messageToStage = (message = "") => {
+    const text = String(message).toLowerCase();
+    if (text.includes("cached model clearance solid")) return "cached";
+    if (text.includes("localized") && (text.includes("witness") || text.includes("repair clearance"))) return "witnessRepair";
+    if (text.includes("final continuous") || text.includes("after global fallback")) return "finalCertificate";
+    if (text.includes("filtering model faces") || text.includes("target aabb")) return "filter";
+    if (text.includes("building target-aware clearance") || text.includes("streaming target-aware")) return "clearance";
+    if (text.includes("certificate") || text.includes("continuous ellipsoidal")) return "certificate";
+    if (text.includes("precomputing") || text.includes("expanded object clearance") || text.includes("building object model solid")) return "clearance";
+    if (text.includes("loading") || text.includes("instantiating") || text.includes("setting up") || text.includes("ready")) return "load";
+    if (text.includes("trimming generated cradle") || text.includes("generated cradle")) return "trim";
+    if (text.includes("packing") || text.includes("pack transfer")) return "pack";
+    if (text.includes("waiting for object clearance precompute")) return "wait";
+    if (text.includes("serial fallback")) return "load";
+    return stageName;
+  };
+
+  const tick = () => {
+    if (!active) return;
+    const stage = stages[stageName] || stages.start;
+    const elapsed = performance.now() - stageStartedAt;
+    const estimate = Math.max(1000, Number(stage.estimateMs) || 0);
+    const timeFraction = estimate > 0 ? Math.min(0.965, elapsed / estimate) : 0.35;
+    const fraction = reportedStageFraction > 0
+      ? Math.min(0.965, reportedStageFraction)
+      : timeFraction;
+    const overall = stage.from + (stage.to - stage.from) * fraction;
+    const targetProgress = startProgress + (endProgress - startProgress) * overall;
+    lastProgressValue = Math.max(lastProgressValue, Math.min(endProgress - 0.15, targetProgress));
+    setProgress(controlsEl.jobProgressShell, controlsEl.jobProgress, lastProgressValue);
+    const observedRateEstimate = stageName === "clearance" && projectedStageDurationMs > elapsed
+      ? projectedStageDurationMs
+      : 0;
+    setProgressDetail(progressDetailText(
+      stage,
+      elapsed,
+      observedRateEstimate || estimate,
+      lastMessage,
+      observedRateEstimate ? "observed stream rate" : (stage.estimateSource || "rough estimate")
+    ));
+  };
+
+  const timer = window.setInterval(tick, 1000);
+  tick();
+
+  return {
+    update(message = "") {
+      lastMessage = String(message || "");
+      setStage(messageToStage(lastMessage), lastMessage);
+      const streamedMatch = lastMessage.match(
+        /(\d[\d,]*) of (\d[\d,]*) candidate faces/i
+      );
+      if (streamedMatch) {
+        const completed = Number(streamedMatch[1].replaceAll(",", ""));
+        const total = Number(streamedMatch[2].replaceAll(",", ""));
+        if (Number.isFinite(completed) && Number.isFinite(total) && total > 0) {
+          reportedStageFraction = Math.max(0, Math.min(1, completed / total));
+          if (reportedStageFraction >= 0.05 && reportedStageFraction < 1) {
+            const elapsed = Math.max(1, performance.now() - stageStartedAt);
+            projectedStageDurationMs = Math.max(elapsed, elapsed / reportedStageFraction);
+          }
+        }
+      }
+      tick();
+    },
+    statusText(message = "") {
+      const stage = stages[messageToStage(message)] || stages[stageName] || stages.start;
+      return progressStatusText(stage);
+    },
+    finish(completed = true) {
+      if (!active) return;
+      active = false;
+      window.clearInterval(timer);
+      if (completed) {
+        setProgress(controlsEl.jobProgressShell, controlsEl.jobProgress, endProgress);
+        setProgressDetail("High accuracy object-clearance verification complete.");
+      } else {
+        setProgressDetail("High accuracy object-clearance verification stopped before completion.");
+      }
+    },
+  };
+}
+
+function progressStatusText(stage) {
+  return `${stage.label}...`;
+}
+
+function progressDetailText(stage, elapsedMs, estimateMs, message = "", estimateSource = "rough estimate") {
+  const prefix = message ? `${humanizeProgressMessage(message)}. ` : "";
+  if (stage === undefined) return prefix;
+  const elapsed = formatCompactDuration(elapsedMs);
+  if (estimateMs > 1500) {
+    const remaining = Math.max(0, estimateMs - elapsedMs);
+    const confidence = estimateSource === "previous run"
+      ? "based on previous run"
+      : estimateSource === "observed stream rate"
+        ? "from current stream rate"
+        : "rough estimate";
+    const estimateLabel = estimateSource === "previous run"
+      ? "previous-run estimate"
+      : estimateSource === "observed stream rate"
+        ? "current stream-rate estimate"
+        : "rough estimate";
+    return remaining > 0
+      ? `${prefix}${stage.label}: elapsed ${elapsed}, about ${formatCompactDuration(remaining)} remaining (${confidence}).`
+      : `${prefix}${stage.label}: elapsed ${elapsed}; still working beyond the ${estimateLabel}.`;
+  }
+  return `${prefix}${stage.label}: elapsed ${elapsed}.`;
+}
+
+function humanizeProgressMessage(message = "") {
+  const text = String(message || "").trim();
+  if (!text) return "";
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+function setProgressDetail(message = "") {
+  if (!controlsEl.jobProgressDetail) return;
+  controlsEl.jobProgressDetail.textContent = message;
+}
+
+function formatCompactDuration(ms) {
+  const seconds = Math.max(0, Math.round(Number(ms) / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return `${minutes}m ${String(remainder).padStart(2, "0")}s`;
+}
+
+function modelTrimEstimateMs(
+  clearance = {},
+  preferParallelManifold = false,
+  supportMesh = null,
+  debug = MODEL_TRIM_DEBUG_SETTINGS
+) {
+  const key = modelTrimClearanceKey(null, clearance, preferParallelManifold, debug);
+  const stored = readModelTrimEstimate(key);
+  if (stored?.clearance_ms > 500) return stored.clearance_ms;
+  if (stored?.total_ms > 1000) return Math.max(1000, stored.total_ms * 0.92);
+
+  const modelTriangles = currentModelTriangleCount();
+  const supportTriangles = Math.floor((supportMesh?.triangles?.length ?? 0) / 3);
+  const complexity = Math.max(modelTriangles, modelTriangles * Math.max(1, Math.log10(Math.max(10, supportTriangles))));
+  if (complexity > 600000) return 180000;
+  if (complexity > 250000) return 120000;
+  if (complexity > 100000) return 75000;
+  if (complexity > 35000) return 35000;
+  return 18000;
+}
+
+function trimMeshEstimateMs(supportMesh = null) {
+  const triangles = Math.floor((supportMesh?.triangles?.length ?? 0) / 3);
+  if (triangles > 1000000) return 12000;
+  if (triangles > 400000) return 8000;
+  if (triangles > 100000) return 4500;
+  return 2500;
+}
+
+function currentModelTriangleCount() {
+  const cached = state.modelPayloadCache?.indexed_mesh?.triangle_count;
+  if (Number.isFinite(Number(cached)) && Number(cached) > 0) return Number(cached);
+  const geometry = state.modelMesh?.geometry;
+  if (!geometry) return 0;
+  if (geometry.index) return Math.floor(geometry.index.count / 3);
+  return Math.floor((geometry.attributes?.position?.count ?? 0) / 3);
+}
+
+function recordModelTrimEstimate(
+  clearance = {},
+  preferParallelManifold = false,
+  timings = [],
+  debug = MODEL_TRIM_DEBUG_SETTINGS
+) {
+  if (!Array.isArray(timings) || !timings.length) return;
+  const key = modelTrimClearanceKey(null, clearance, preferParallelManifold, debug);
+  const clearanceMs = debug?.targeted_minkowski
+    ? sumTimingLabels(timings, [
+        "clip object model",
+        "target AABB candidate filter",
+        "target distance candidate filter",
+        "targeted cradle streaming subtraction",
+        "targeted interface streaming subtraction",
+      ])
+    : sumTimingLabels(timings, ["model clearance solid", "model solid"]);
+  const totalMs = Math.max(
+    sumTimingLabels(timings, ["worker trim round trip"]),
+    timings.reduce((sum, phase) => sum + Math.max(0, Number(phase?.ms) || 0), 0)
+  );
+  if (totalMs < 500) return;
+  const history = readModelTrimEstimateStore();
+  history[key] = {
+    clearance_ms: clearanceMs > 500 ? Math.round(clearanceMs) : Math.round(totalMs * 0.85),
+    total_ms: Math.round(totalMs),
+    updated_at: Date.now(),
+  };
+  const entries = Object.entries(history)
+    .sort((a, b) => Number(b[1]?.updated_at ?? 0) - Number(a[1]?.updated_at ?? 0))
+    .slice(0, 40);
+  writeModelTrimEstimateStore(Object.fromEntries(entries));
+}
+
+function sumTimingLabels(timings, labels) {
+  return timings.reduce((sum, phase) => {
+    const label = String(phase?.label ?? "");
+    return labels.some((needle) => label.includes(needle))
+      ? sum + Math.max(0, Number(phase?.ms) || 0)
+      : sum;
+  }, 0);
+}
+
+function readModelTrimEstimate(key) {
+  const history = readModelTrimEstimateStore();
+  return history[key] ?? null;
+}
+
+function readModelTrimEstimateStore() {
+  try {
+    return JSON.parse(window.localStorage.getItem(MODEL_TRIM_ESTIMATE_STORAGE_KEY) || "{}") || {};
+  } catch {
+    return {};
+  }
+}
+
+function writeModelTrimEstimateStore(history) {
+  try {
+    window.localStorage.setItem(MODEL_TRIM_ESTIMATE_STORAGE_KEY, JSON.stringify(history));
+  } catch {
+    // Estimate history is only a UI nicety.
+  }
+}
+
 async function trimGeneratedMeshesAgainstModel(supportMesh, interfaceMesh, supportConfig = {}, options = {}) {
   const clearance = modelBooleanClearanceSettings(supportConfig);
   const result = {
     support_mesh: supportMesh,
     interface_mesh: interfaceMesh,
     trimmed: false,
+    certified: false,
+    certificate: null,
+    pre_certificate: null,
+    post_certificate: null,
+    kernel: null,
+    repair: null,
     skipped: false,
     skip_reason: "",
     warning: "",
@@ -1518,6 +2891,69 @@ async function trimGeneratedMeshesAgainstModel(supportMesh, interfaceMesh, suppo
     return result;
   }
 
+  if (!canUseModelTrimWorker() && options.requireExactTrim) {
+    throw new Error(
+      "High accuracy requires the isolated model-trim worker. The worker is unavailable, and the UI-blocking in-page Manifold fallback was not started. Reload the page to recreate the worker."
+    );
+  }
+
+  if (canUseModelTrimWorker()) {
+    try {
+      const workerResult = await trimGeneratedMeshesAgainstModelInWorker(
+        supportMesh,
+        interfaceMesh,
+        clearance,
+        options
+      );
+      if (options.debug?.targeted_minkowski) terminateModelTrimWorker();
+      return workerResult;
+    } catch (error) {
+      if (isModelTrimTimeoutError(error)) {
+        terminateModelTrimWorker();
+        throw error;
+      }
+      if (options.preferParallelManifold) {
+        console.warn("Parallel model trim worker failed; retrying with the serial worker backend.", error);
+        terminateModelTrimWorker();
+        try {
+          const serialResult = await trimGeneratedMeshesAgainstModelInWorker(
+            supportMesh,
+            interfaceMesh,
+            clearance,
+            {
+              ...options,
+              preferParallelManifold: false,
+              preparedClearanceKey: "",
+              onProgress: async (message) => {
+                options.onProgress?.(`serial fallback ${message}`);
+              },
+            }
+          );
+          serialResult.warning = `Parallel Manifold trim failed; serial worker exact trim was used instead (${error?.message || error}).`;
+          return serialResult;
+        } catch (serialError) {
+          if (isModelTrimTimeoutError(serialError)) {
+            terminateModelTrimWorker();
+            throw serialError;
+          }
+          console.warn("Serial model trim worker also failed; falling back to in-page Manifold trim.", serialError);
+          error = serialError;
+        }
+      }
+      if (options.requireExactTrim) {
+        console.error("High-accuracy model trim worker failed; in-page fallback suppressed.", error);
+        terminateModelTrimWorker();
+        throw new Error(
+          `High accuracy model-trim worker failed; the UI-blocking in-page Manifold fallback was not started (${error?.message || error}). Reload and retry to create a fresh worker.`
+        );
+      }
+      console.warn("Model trim worker failed; falling back to in-page Manifold trim.", error);
+      modelTrimWorkerFailed = true;
+      terminateModelTrimWorker();
+      result.warning = `Model trim worker failed; in-page exact trim was used instead (${error?.message || error}).`;
+    }
+  }
+
   let core = null;
   let clearanceSolid = null;
   let trimPhaseStart = performance.now();
@@ -1527,16 +2963,57 @@ async function trimGeneratedMeshesAgainstModel(supportMesh, interfaceMesh, suppo
     trimPhaseStart = now;
   };
   try {
+    await options.onProgress?.("loading in-page Manifold fallback");
     core = await loadManifoldCore();
     markTrimPhase("load manifold");
-    clearanceSolid = modelMeshToManifold(core);
-    markTrimPhase("model solid");
+    await options.onProgress?.(expandedClearanceNeeded(clearance)
+      ? "building bounded expanded object clearance solid"
+      : "building object model solid");
+    const clearanceResult = modelClearanceSolidToManifold(
+      core,
+      clearance,
+      [supportMesh, interfaceMesh],
+      options.debug?.kernel_mode
+    );
+    clearanceSolid = clearanceResult.solid;
+    result.kernel = clearanceResult.kernel ?? null;
+    result.repair = {
+      strategy: clearanceResult.expanded
+        ? "bounded_global_minkowski"
+        : "exact_model_difference",
+      targeted_requested: Boolean(options.debug?.targeted_minkowski),
+      targeted_applied: false,
+      targeted_fallback_reason: options.debug?.targeted_minkowski
+        ? "target-aware repair is unavailable in the in-page fallback"
+        : "",
+    };
+    result.clearance = {
+      ...clearance,
+      expanded: clearanceResult.expanded,
+      analytic_certified: false,
+      safety_margin_mm: clearanceResult.safety_margin_mm || 0,
+    };
+    markTrimPhase(clearanceResult.expanded ? "model clearance solid" : "model solid");
+    await options.onProgress?.("trimming generated cradle mesh");
     result.support_mesh = trimSupportMeshAgainstModelSolid(core, supportMesh, clearanceSolid, "generated cradle", result.timings);
     if (interfaceMesh?.vertices?.length && interfaceMesh?.triangles?.length) {
+      await options.onProgress?.("trimming generated interface mesh");
       result.interface_mesh = trimSupportMeshAgainstModelSolid(core, interfaceMesh, clearanceSolid, "generated interface", result.timings);
+    }
+    if (continuousClearanceCertificateSettings(clearance).supported) {
+      await options.onProgress?.("checking final continuous ellipsoidal clearance in-page");
+      result.post_certificate = certifyInPageRepairedMeshesContinuousClearance(
+        core,
+        result.support_mesh,
+        result.interface_mesh,
+        clearance,
+        result.timings
+      );
+      result.clearance.analytic_certified = Boolean(result.post_certificate?.passed);
     }
     result.trimmed = true;
   } catch (error) {
+    if (options.requireExactTrim) throw error;
     result.warning = error?.message || String(error);
   } finally {
     if (clearanceSolid && clearanceSolid !== state.modelManifoldCache?.solid) {
@@ -1545,6 +3022,536 @@ async function trimGeneratedMeshesAgainstModel(supportMesh, interfaceMesh, suppo
   }
 
   return result;
+}
+
+function canUseModelTrimWorker() {
+  return typeof Worker === "function" && !modelTrimWorkerFailed;
+}
+
+function readModelTrimDebugSettings() {
+  return {
+    targeted_minkowski: queryFlagEnabled(
+      "targeted-minkowski",
+      DEFAULT_HIGH_ACCURACY_TARGETED_MINKOWSKI
+    ),
+    kernel_mode: queryFlagEnabled(
+      "analytic-kernel",
+      DEFAULT_HIGH_ACCURACY_ANALYTIC_KERNEL
+    )
+      ? CIRCUMSCRIBED_CLEARANCE_KERNEL_MODE
+      : "legacy",
+    targeted_batch_size: queryBoundedInteger("targeted-batch", 250, 8000),
+    targeted_build: queryAllowedValue(
+      "targeted-build",
+      ["size", "o3", "simd", "lto"],
+      DEFAULT_TARGETED_MANIFOLD_BUILD
+    ),
+    post_repair_analytic: true,
+  };
+}
+
+function queryAllowedValue(name, allowed, fallback) {
+  const value = String(
+    new URLSearchParams(window.location.search).get(name) || ""
+  ).trim().toLowerCase();
+  return allowed.includes(value) ? value : fallback;
+}
+
+function queryBoundedInteger(name, minimum, maximum) {
+  const value = Number.parseInt(
+    new URLSearchParams(window.location.search).get(name) || "",
+    10
+  );
+  return Number.isFinite(value) && value > 0
+    ? Math.max(minimum, Math.min(maximum, value))
+    : 0;
+}
+
+function queryFlagEnabled(name, fallback = false) {
+  const value = new URLSearchParams(window.location.search).get(name);
+  if (value === null) return Boolean(fallback);
+  const mode = (value || "").trim().toLowerCase();
+  if (
+    mode === "1" || mode === "true" || mode === "on" ||
+    mode === "debug" || mode === "force"
+  ) return true;
+  if (
+    mode === "0" || mode === "false" || mode === "off" ||
+    mode === "disable" || mode === "disabled" || mode === "legacy"
+  ) return false;
+  return Boolean(fallback);
+}
+
+function shouldUseParallelManifoldForTrim() {
+  if (MODEL_TRIM_DEBUG_SETTINGS.targeted_minkowski) return false;
+  const value = new URLSearchParams(window.location.search).get("manifold-par");
+  const mode = (value || "").trim().toLowerCase();
+  if (!mode || mode === "0" || mode === "false" || mode === "off") return false;
+  const requested = mode === "1" || mode === "true" || mode === "on" || mode === "debug" || mode === "force";
+  return requested && Boolean(window.crossOriginIsolated) && typeof SharedArrayBuffer === "function";
+}
+
+function ensureModelTrimWorker() {
+  if (modelTrimWorker) return modelTrimWorker;
+
+  modelTrimWorker = new Worker(new URL(`./modelTrimWorker.js?v=${MODEL_TRIM_WORKER_VERSION}`, import.meta.url), { type: "module" });
+  modelTrimWorker.onmessage = (event) => {
+    const message = event.data ?? {};
+    const request = modelTrimWorkerRequests.get(message.id);
+    if (!request) return;
+
+    if (message.type === "progress") {
+      request.lastProgressAt = performance.now();
+      request.onProgress?.(message.message || "working");
+      return;
+    }
+
+    modelTrimWorkerRequests.delete(message.id);
+    if (request.timeoutId) window.clearTimeout(request.timeoutId);
+    if (message.type === "clearResult") {
+      request.resolve({ cleared: true, timings: message.timings ?? [] });
+    } else if (message.type === "prepareResult") {
+      request.resolve({
+        clearanceKey: message.clearanceKey,
+        clearance: message.clearance,
+        timings: message.timings ?? [],
+        runtime: message.runtime ?? null,
+        worker: true,
+      });
+    } else if (message.type === "trimResult") {
+      request.resolve({
+        support_mesh: message.support_mesh,
+        interface_mesh: message.interface_mesh,
+        trimmed: message.trimmed === undefined ? true : Boolean(message.trimmed),
+        certified: Boolean(message.certified || message.certificate?.passed),
+        certificate: message.certificate ?? null,
+        pre_certificate: message.pre_certificate ?? message.certificate ?? null,
+        post_certificate: message.post_certificate ?? null,
+        targeted_post_certificate: message.targeted_post_certificate ?? null,
+        kernel: message.kernel ?? null,
+        repair: message.repair ?? null,
+        skipped: Boolean(message.skipped),
+        skip_reason: message.skip_reason || "",
+        warning: "",
+        clearance: message.clearance,
+        timings: message.timings ?? [],
+        runtime: message.runtime ?? null,
+        worker: true,
+      });
+    } else {
+      request.reject(new Error(message.error || "Model trim worker failed"));
+    }
+  };
+  modelTrimWorker.onerror = (event) => {
+    const error = new Error(event.message || "Model trim worker error");
+    for (const request of modelTrimWorkerRequests.values()) {
+      if (request.timeoutId) window.clearTimeout(request.timeoutId);
+      request.reject(error);
+    }
+    modelTrimWorkerRequests.clear();
+    modelTrimWorkerFailed = true;
+    terminateModelTrimWorker();
+  };
+
+  return modelTrimWorker;
+}
+
+function terminateModelTrimWorker() {
+  modelTrimWorker?.terminate();
+  modelTrimWorker = null;
+  for (const request of modelTrimWorkerRequests.values()) {
+    if (request.timeoutId) window.clearTimeout(request.timeoutId);
+    request.reject(new Error("Model trim worker terminated"));
+  }
+  modelTrimWorkerRequests.clear();
+}
+
+function cancelRunningModelTrimPrewarm() {
+  state.modelTrimPrewarmToken += 1;
+  state.modelTrimPrewarmPromise = null;
+  state.modelTrimPrewarmKey = "";
+  cancelModelTrimWorkerPrewarm();
+  if (modelTrimWorkerRequests.size > 0) {
+    terminateModelTrimWorker();
+  }
+}
+
+function trimGeneratedMeshesAgainstModelInWorker(supportMesh, interfaceMesh, clearance, options = {}) {
+  const startedAt = performance.now();
+  const { payload, transfer } = buildModelTrimWorkerPayload(
+    supportMesh,
+    interfaceMesh,
+    clearance,
+    options.preparedClearanceKey,
+    Boolean(options.preferParallelManifold),
+    options.debug || MODEL_TRIM_DEBUG_SETTINGS
+  );
+  const payloadMs = performance.now() - startedAt;
+  const postedAt = performance.now();
+  return requestModelTrimWorker("trimGeneratedMeshes", payload, transfer, options.onProgress)
+    .then((result) => ({
+      ...result,
+      timings: [
+        { label: "main trim payload clone", ms: payloadMs },
+        { label: "worker trim round trip", ms: performance.now() - postedAt },
+        ...(result.timings ?? []),
+      ],
+    }));
+}
+
+function prepareModelTrimWorkerClearance(clearance, preferParallelManifold = false) {
+  const startedAt = performance.now();
+  const transfer = [];
+  const workerModelMesh = cloneTransferModelMesh(transfer);
+  const clearanceKey = modelTrimClearanceKey(
+    workerModelMesh,
+    clearance,
+    preferParallelManifold,
+    MODEL_TRIM_DEBUG_SETTINGS
+  );
+  const payloadMs = performance.now() - startedAt;
+  const postedAt = performance.now();
+  return requestModelTrimWorker(
+    "prepareModelClearance",
+    {
+      modelMesh: workerModelMesh,
+      clearance,
+      clearanceKey,
+      preferParallelManifold,
+      debug: MODEL_TRIM_DEBUG_SETTINGS,
+    },
+    transfer,
+    null
+  ).then((result) => ({
+    ...result,
+    timings: [
+      { label: "main prepare payload clone", ms: payloadMs },
+      { label: "worker prepare round trip", ms: performance.now() - postedAt },
+      ...(result.timings ?? []),
+    ],
+  }));
+}
+
+function getOrStartModelTrimWorkerPrewarm(clearance, preferParallelManifold = false) {
+  if (!state.modelMesh || !canUseModelTrimWorker()) return null;
+  if (MODEL_TRIM_DEBUG_SETTINGS.targeted_minkowski) return null;
+  if (expandedClearanceNeeded(clearance)) return null;
+  cancelModelTrimWorkerPrewarm();
+  const clearanceKey = modelTrimClearanceKey(
+    null,
+    clearance,
+    preferParallelManifold,
+    MODEL_TRIM_DEBUG_SETTINGS
+  );
+  if (state.modelTrimPrewarmKey === clearanceKey && state.modelTrimPrewarmPromise) {
+    return state.modelTrimPrewarmPromise;
+  }
+  state.modelTrimPrewarmToken += 1;
+  state.modelTrimPrewarmKey = clearanceKey;
+  state.modelTrimPrewarmPromise = prepareModelTrimWorkerClearance(clearance, preferParallelManifold)
+    .catch((error) => {
+      state.modelTrimPrewarmKey = "";
+      state.modelTrimPrewarmPromise = null;
+      throw error;
+    });
+  return state.modelTrimPrewarmPromise;
+}
+
+function clearModelTrimWorkerCache() {
+  state.modelTrimPrewarmToken += 1;
+  state.modelTrimPrewarmPromise = null;
+  state.modelTrimPrewarmKey = "";
+  cancelModelTrimWorkerPrewarm();
+  if (!modelTrimWorker) return;
+  requestModelTrimWorker("clearModelClearanceCache").catch((error) => {
+    console.warn("Model trim cache clear failed.", error);
+  });
+}
+
+function cancelModelTrimWorkerPrewarm() {
+  if (state.modelTrimPrewarmTimer === null) return;
+  if (typeof window.cancelIdleCallback === "function") {
+    window.cancelIdleCallback(state.modelTrimPrewarmTimer);
+  } else {
+    window.clearTimeout(state.modelTrimPrewarmTimer);
+  }
+  state.modelTrimPrewarmTimer = null;
+}
+
+function scheduleModelTrimWorkerPrewarm(clearance = currentModelBooleanClearanceSettings()) {
+  if (!ENABLE_MODEL_TRIM_WORKER_PREWARM || !state.modelMesh || !canUseModelTrimWorker()) return null;
+  if (MODEL_TRIM_DEBUG_SETTINGS.targeted_minkowski) return null;
+  if (shouldUseParallelManifoldForTrim()) return null;
+  if (expandedClearanceNeeded(clearance)) {
+    state.modelTrimPrewarmToken += 1;
+    cancelModelTrimWorkerPrewarm();
+    return null;
+  }
+  const token = state.modelTrimPrewarmToken + 1;
+  state.modelTrimPrewarmToken = token;
+  cancelModelTrimWorkerPrewarm();
+
+  const run = () => {
+    state.modelTrimPrewarmTimer = null;
+    if (!state.modelMesh || token !== state.modelTrimPrewarmToken || !canUseModelTrimWorker()) return;
+    const predictedKey = modelTrimClearanceKey(
+      null,
+      clearance,
+      false,
+      MODEL_TRIM_DEBUG_SETTINGS
+    );
+    if (state.modelTrimPrewarmKey === predictedKey && state.modelTrimPrewarmPromise) return;
+    state.modelTrimPrewarmKey = predictedKey;
+    state.modelTrimPrewarmPromise = prepareModelTrimWorkerClearance(clearance, false)
+      .catch((error) => {
+        if (token === state.modelTrimPrewarmToken) {
+          state.modelTrimPrewarmKey = "";
+          state.modelTrimPrewarmPromise = null;
+        }
+        console.warn("Model trim worker prewarm failed.", error);
+        return null;
+      });
+  };
+
+  state.modelTrimPrewarmTimer = typeof window.requestIdleCallback === "function"
+    ? window.requestIdleCallback(run, { timeout: 3000 })
+    : window.setTimeout(run, 900);
+  return state.modelTrimPrewarmPromise;
+}
+
+function currentModelBooleanClearanceSettings() {
+  return modelBooleanClearanceSettings(collectSupportConfig());
+}
+
+function requestModelTrimWorker(type, payload = {}, transfer = [], onProgress = null) {
+  const worker = ensureModelTrimWorker();
+  const id = nextModelTrimWorkerRequestId;
+  nextModelTrimWorkerRequestId += 1;
+
+  return new Promise((resolve, reject) => {
+    const preferParallel = Boolean(payload.preferParallelManifold);
+    const timeoutMs = preferParallel
+      ? (type === "prepareModelClearance" ? PARALLEL_MANIFOLD_PREPARE_TIMEOUT_MS : PARALLEL_MANIFOLD_TRIM_TIMEOUT_MS)
+      : (type === "prepareModelClearance" ? SERIAL_MANIFOLD_PREPARE_TIMEOUT_MS : SERIAL_MANIFOLD_TRIM_TIMEOUT_MS);
+    const request = {
+      resolve,
+      reject,
+      onProgress,
+      timeoutId: null,
+      lastProgressAt: performance.now(),
+    };
+    request.timeoutId = window.setTimeout(() => {
+      if (!modelTrimWorkerRequests.has(id)) return;
+      modelTrimWorkerRequests.delete(id);
+      const ErrorType = preferParallel ? ParallelManifoldTimeoutError : ModelTrimTimeoutError;
+      request.reject(new ErrorType(
+        `${preferParallel ? "Parallel Manifold" : "Model trim"} worker did not complete ${type} within ${Math.round(timeoutMs / 1000)} seconds`
+      ));
+      terminateModelTrimWorker();
+    }, timeoutMs);
+    modelTrimWorkerRequests.set(id, request);
+    try {
+      worker.postMessage({ id, type, ...payload }, transfer);
+    } catch (error) {
+      modelTrimWorkerRequests.delete(id);
+      if (request.timeoutId) window.clearTimeout(request.timeoutId);
+      reject(error);
+    }
+  });
+}
+
+function buildModelTrimWorkerPayload(
+  supportMesh,
+  interfaceMesh,
+  clearance,
+  preparedClearanceKey = "",
+  preferParallelManifold = false,
+  debug = MODEL_TRIM_DEBUG_SETTINGS
+) {
+  const transfer = [];
+  const workerSupportMesh = cloneTransferMesh(supportMesh, transfer);
+  const workerInterfaceMesh = cloneTransferMesh(interfaceMesh, transfer);
+  const workerModelMesh = preparedClearanceKey ? null : cloneTransferModelMesh(transfer);
+  const normalizedDebug = {
+    targeted_minkowski: Boolean(debug?.targeted_minkowski),
+    kernel_mode: normalizeClearanceKernelMode(debug?.kernel_mode),
+    targeted_batch_size: Math.max(0, Number(debug?.targeted_batch_size) || 0),
+    targeted_build: String(
+      debug?.targeted_build || DEFAULT_TARGETED_MANIFOLD_BUILD
+    ),
+    post_repair_analytic: true,
+  };
+  const clearanceKey = preparedClearanceKey || modelTrimClearanceKey(
+    workerModelMesh,
+    clearance,
+    preferParallelManifold,
+    normalizedDebug
+  );
+  return {
+    payload: {
+      supportMesh: workerSupportMesh,
+      interfaceMesh: workerInterfaceMesh,
+      modelMesh: workerModelMesh,
+      clearance,
+      clearanceKey,
+      preferParallelManifold,
+      debug: normalizedDebug,
+    },
+    transfer,
+  };
+}
+
+function modelTrimClearanceKey(
+  modelMesh,
+  clearance = {},
+  preferParallelManifold = false,
+  debug = MODEL_TRIM_DEBUG_SETTINGS
+) {
+  const modelName = state.modelMesh?.name || "model";
+  const cachedPayload = modelMesh || state.modelPayloadCache || (state.modelMesh ? buildMeshPayload() : null);
+  const vertexCount = modelMesh?.vertex_count ?? cachedPayload?.indexed_mesh?.vertex_count ?? 0;
+  const triangleCount = modelMesh?.triangle_count ?? cachedPayload?.indexed_mesh?.triangle_count ?? 0;
+  const xy = Math.round((Number(clearance?.xy_mm) || 0) * 1000);
+  const z = Math.round((Number(clearance?.z_mm) || 0) * 1000);
+  const position = state.modelMesh?.position;
+  const rotation = state.modelMesh?.rotation;
+  const transformKey = [
+    position?.x ?? 0,
+    position?.y ?? 0,
+    position?.z ?? 0,
+    rotation?.x ?? 0,
+    rotation?.y ?? 0,
+    rotation?.z ?? 0,
+  ].map((value) => Math.round(value * 100000)).join(":");
+  const backend = debug?.targeted_minkowski
+    ? "targeted-serial"
+    : preferParallelManifold
+      ? "parallel"
+      : "serial";
+  const kernelMode = normalizeClearanceKernelMode(debug?.kernel_mode);
+  const targetedBatchSize = Math.max(0, Number(debug?.targeted_batch_size) || 0);
+  const targetedBuild = String(
+    debug?.targeted_build || DEFAULT_TARGETED_MANIFOLD_BUILD
+  );
+  return `${state.modelRevision}:${modelName}:${vertexCount}:${triangleCount}:${xy}:${z}:${transformKey}:${backend}:${kernelMode}:build-${targetedBuild}:batch-${targetedBatchSize}:${MODEL_TRIM_WORKER_VERSION}`;
+}
+
+function cloneTransferMesh(mesh, transfer) {
+  if (!mesh?.vertices?.length || !mesh?.triangles?.length) return mesh;
+  const vertices = mesh.vertices instanceof Float32Array
+    ? new Float32Array(mesh.vertices)
+    : new Float32Array(mesh.vertices ?? []);
+  const triangles = mesh.triangles instanceof Uint32Array
+    ? new Uint32Array(mesh.triangles)
+    : new Uint32Array(mesh.triangles ?? []);
+  transfer.push(vertices.buffer, triangles.buffer);
+  return {
+    ...mesh,
+    vertices,
+    triangles,
+    vertex_count: Math.floor(vertices.length / 3),
+    triangle_count: Math.floor(triangles.length / 3),
+  };
+}
+
+function cloneTransferModelMesh(transfer) {
+  const payload = buildMeshPayload();
+  const indexed = payload.indexed_mesh ?? {};
+  const vertices = indexed.vertices instanceof Float32Array
+    ? new Float32Array(indexed.vertices)
+    : new Float32Array(indexed.vertices ?? []);
+  const triangles = indexed.triangles instanceof Uint32Array
+    ? new Uint32Array(indexed.triangles)
+    : new Uint32Array(indexed.triangles ?? []);
+  transfer.push(vertices.buffer, triangles.buffer);
+  return {
+    vertices,
+    triangles,
+    vertex_count: Math.floor(vertices.length / 3),
+    triangle_count: Math.floor(triangles.length / 3),
+  };
+}
+
+function modelClearanceSolidToManifold(
+  core,
+  clearance = {},
+  clipMeshes = [],
+  kernelMode = "legacy"
+) {
+  const exactSolid = modelMeshToManifold(core);
+  const xy = Math.max(0, Number(clearance?.xy_mm) || 0);
+  const z = Math.max(0, Number(clearance?.z_mm) || 0);
+  const maxClearance = Math.max(xy, z);
+  if (maxClearance <= 0.001) {
+    return { solid: exactSolid, expanded: false };
+  }
+
+  let kernel = null;
+  let clipSolid = null;
+  let boundedSolid = null;
+  try {
+    const kernelResult = buildClearanceKernel(core, clearance, kernelMode);
+    kernel = kernelResult.solid;
+    const kernelMetadata = kernelResult.metadata;
+    const clipBounds = clearanceClipBoundsForMeshes(
+      clipMeshes,
+      kernelMetadata.extent_xy_mm,
+      kernelMetadata.extent_z_mm
+    );
+    if (!clipBounds) {
+      throw new Error("Expanded object-clearance trim requires generated cradle bounds.");
+    }
+    clipSolid = boxToManifold(core, clipBounds.min, clipBounds.max, "object clearance clip bounds");
+    boundedSolid = assertManifoldOk(
+      core.Manifold.intersection(exactSolid, clipSolid),
+      "bounded object model clearance source"
+    );
+    const clearanceSolid = assertManifoldOk(
+      boundedSolid.minkowskiSum(kernel),
+      "bounded object model expanded clearance solid"
+    );
+    return {
+      solid: clearanceSolid,
+      expanded: true,
+      bounded: true,
+      safety_margin_mm: kernelMetadata.safety_margin_mm || 0,
+      kernel: kernelMetadata,
+    };
+  } finally {
+    kernel?.delete?.();
+    boundedSolid?.delete?.();
+    clipSolid?.delete?.();
+  }
+}
+
+function clearanceClipBoundsForMeshes(meshes, xyPadding = 0, zPadding = 0) {
+  const candidates = (Array.isArray(meshes) ? meshes : [meshes])
+    .filter((mesh) => mesh?.vertices?.length);
+  if (!candidates.length) return null;
+
+  const min = { x: Infinity, y: Infinity, z: Infinity };
+  const max = { x: -Infinity, y: -Infinity, z: -Infinity };
+  let cellPadding = 0.25;
+  for (const mesh of candidates) {
+    const bounds = supportMeshBounds(mesh);
+    min.x = Math.min(min.x, bounds.min.x);
+    min.y = Math.min(min.y, bounds.min.y);
+    min.z = Math.min(min.z, bounds.min.z);
+    max.x = Math.max(max.x, bounds.max.x);
+    max.y = Math.max(max.y, bounds.max.y);
+    max.z = Math.max(max.z, bounds.max.z);
+    cellPadding = Math.max(cellPadding, Number(mesh.cell_size_mm) || 0);
+  }
+  const padXy = Math.max(0, Number(xyPadding) || 0) + cellPadding;
+  const padZ = Math.max(0, Number(zPadding) || 0) + cellPadding;
+  return {
+    min: { x: min.x - padXy, y: min.y - padXy, z: min.z - padZ },
+    max: { x: max.x + padXy, y: max.y + padXy, z: max.z + padZ },
+  };
+}
+
+function expandedClearanceNeeded(clearance = {}) {
+  return Math.max(Number(clearance?.xy_mm) || 0, Number(clearance?.z_mm) || 0) > 0.001;
 }
 
 function modelBooleanClearanceSettings(supportConfig) {
@@ -1563,6 +3570,60 @@ function modelBooleanClearanceSettings(supportConfig) {
     xy_mm: roundedCoordinate(xy),
     z_mm: roundedCoordinate(z),
   };
+}
+
+function certifyInPageRepairedMeshesContinuousClearance(
+  core,
+  supportMesh,
+  interfaceMesh,
+  clearance,
+  timings = []
+) {
+  let supportSolid = null;
+  let interfaceSolid = null;
+  const measure = (label, operation) => {
+    const startedAt = performance.now();
+    try {
+      return operation();
+    } finally {
+      timings.push({ label, ms: performance.now() - startedAt });
+    }
+  };
+
+  try {
+    const modelSolid = modelMeshToManifold(core);
+    supportSolid = measure(
+      "in-page final certificate cradle solid",
+      () => supportMeshToManifold(core, supportMesh, "in-page final certificate cradle", { fast: true })
+    );
+    if (interfaceMesh?.vertices?.length && interfaceMesh?.triangles?.length) {
+      interfaceSolid = measure(
+        "in-page final certificate interface solid",
+        () => supportMeshToManifold(core, interfaceMesh, "in-page final certificate interface", { fast: true })
+      );
+    }
+    const certificate = certifyContinuousClearance(
+      modelSolid,
+      [
+        { label: "cradle", solid: supportSolid },
+        { label: "interface", solid: interfaceSolid },
+      ],
+      clearance
+    );
+    timings.push(...(certificate.timings ?? []).map((timing) => ({
+      ...timing,
+      label: `in-page final ${timing.label}`,
+    })));
+    delete certificate.timings;
+    return certificate;
+  } catch (error) {
+    const unavailable = certifyContinuousClearance(null, [], clearance);
+    unavailable.reason = error?.message || String(error);
+    return unavailable;
+  } finally {
+    interfaceSolid?.delete?.();
+    supportSolid?.delete?.();
+  }
 }
 
 function trimSupportMeshAgainstModelSolid(core, mesh, modelSolid, label, timings = null) {
@@ -1586,6 +3647,82 @@ function trimSupportMeshAgainstModelSolid(core, mesh, modelSolid, label, timings
   return trimmedMesh;
 }
 
+function printCradleSafetyForGeneration({ highAccuracy, mediumAccuracy, hasSupportMesh, trimmedMeshes, modelMeshQa, meshQa, voxelClearanceQa }) {
+  if (!hasSupportMesh || !trimmedMeshes?.support_mesh?.vertices?.length || !trimmedMeshes?.support_mesh?.triangles?.length) {
+    return {
+      exportable: false,
+      reason: "No cradle mesh is available.",
+    };
+  }
+
+  if (!highAccuracy) {
+    if (mediumAccuracy && voxelClearanceQa?.available) {
+      return {
+        exportable: false,
+        reason: voxelClearanceQa.removed_voxels
+          ? "Medium interval clearance generated a modified cradle mesh, but high accuracy exact boolean has not been run."
+          : "Medium interval clearance generated a cradle mesh, but high accuracy exact boolean has not been run.",
+      };
+    }
+    return {
+      exportable: false,
+      reason: "High accuracy has not been run for this cradle.",
+    };
+  }
+
+  const certificatePassed = Boolean(trimmedMeshes.certified || trimmedMeshes.certificate?.passed);
+  if (!trimmedMeshes.trimmed && !certificatePassed) {
+    return {
+      exportable: false,
+      reason: "High accuracy did not complete an object-clearance trim or certificate.",
+    };
+  }
+
+  const clearance = trimmedMeshes.clearance ?? {};
+  const requestedClearance = Math.max(Number(clearance.xy_mm) || 0, Number(clearance.z_mm) || 0);
+  if (requestedClearance > 0.001 && !clearance.expanded && !certificatePassed) {
+    return {
+      exportable: false,
+      reason: "High accuracy removed model intersections but did not preserve the requested clearance offset.",
+    };
+  }
+
+  if (modelMeshQa?.intersects_model) {
+    return {
+      exportable: false,
+      reason: "Post-trim model QA still found sampled cradle points inside the model.",
+    };
+  }
+
+  if (modelMeshQa?.failed || modelMeshQa?.available === false) {
+    return {
+      exportable: false,
+      reason: modelMeshQa?.reason || "Post-trim model-intersection QA did not complete.",
+    };
+  }
+
+  if (meshQa?.failed) {
+    return {
+      exportable: false,
+      reason: meshQa.reason || "Cradle support-reach QA did not complete.",
+    };
+  }
+
+  if (Number(meshQa?.unsupported_cells ?? 0) > 0) {
+    return {
+      exportable: false,
+      reason: "Cradle mesh QA found unsupported underside targets after generation.",
+    };
+  }
+
+  return {
+    exportable: true,
+    reason: certificatePassed
+      ? "High accuracy continuous ellipsoidal clearance certificate passed."
+      : "High accuracy object-clearance boolean trim completed.",
+  };
+}
+
 function renderMeshPart(supportMesh, material, name) {
   if (!supportMesh?.vertices?.length || !supportMesh?.triangles?.length) {
     return null;
@@ -1595,7 +3732,8 @@ function renderMeshPart(supportMesh, material, name) {
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute("position", new THREE.BufferAttribute(supportMesh.vertices, 3));
   geometry.setIndex(new THREE.BufferAttribute(supportMesh.triangles, 1));
-  const displayGeometry = material.flatShading ? geometry.toNonIndexed() : geometry;
+  const displayGeometry = shouldUseNonIndexedDisplay(supportMesh, material) ? geometry.toNonIndexed() : geometry;
+  if (displayGeometry !== geometry) geometry.dispose();
   displayGeometry.computeVertexNormals();
   displayGeometry.computeBoundingBox();
   displayGeometry.computeBoundingSphere();
@@ -1605,6 +3743,11 @@ function renderMeshPart(supportMesh, material, name) {
   supportGroup.add(mesh);
 
   return supportMesh;
+}
+
+function shouldUseNonIndexedDisplay(supportMesh, material) {
+  const triangleCount = Number(supportMesh?.triangle_count) || Math.floor((supportMesh?.triangles?.length ?? 0) / 3);
+  return Boolean(material?.flatShading && triangleCount <= LARGE_MESH_NONINDEXED_DISPLAY_TRIANGLES);
 }
 
 function normalizeSupportMeshArrays(mesh) {
@@ -1627,7 +3770,7 @@ function toUint32Array(values) {
 }
 
 function renderCoverageOverlay(coverage) {
-  coverageGroup.clear();
+  clearMeshGroup(coverageGroup);
   state.coverage = coverage ?? null;
 
   if (!coverage?.cells?.length) {
@@ -1725,7 +3868,7 @@ async function previewSplitPlan() {
 }
 
 function clearSplitPreview() {
-  splitGroup.clear();
+  clearMeshGroup(splitGroup);
   state.splitChunks = [];
   state.splitPlan = null;
   state.splitPreviewVisible = false;
@@ -1736,7 +3879,7 @@ function clearSplitPreview() {
 }
 
 function restoreOriginalCradleAfterSplitFailure() {
-  splitGroup.clear();
+  clearMeshGroup(splitGroup);
   state.splitChunks = [];
   state.splitPlan = null;
   state.splitPreviewVisible = false;
@@ -2825,6 +4968,129 @@ function supportTopAtXY(mesh, x, y, sampler = null) {
   return top;
 }
 
+function supportZIntervalsAtXY(mesh, x, y, sampler = null) {
+  const vertices = sampler?.vertices ?? mesh?.vertices ?? [];
+  const triangles = sampler?.triangles ?? mesh?.triangles ?? [];
+  const triangleStarts = sampler ? sampler.bins.get(sampler.binKey(x, y)) ?? [] : null;
+  const hits = [];
+  const scanCount = triangleStarts ? triangleStarts.length : Math.floor(triangles.length / 3);
+
+  for (let scanIndex = 0; scanIndex < scanCount; scanIndex += 1) {
+    const index = triangleStarts ? triangleStarts[scanIndex] : scanIndex * 3;
+    const a = readSupportVertex(vertices, triangles[index]);
+    const b = readSupportVertex(vertices, triangles[index + 1]);
+    const c = readSupportVertex(vertices, triangles[index + 2]);
+    const z = triangleZAtXY(a, b, c, x, y);
+    if (Number.isFinite(z)) hits.push(roundedCoordinate(z));
+  }
+  if (!hits.length) return [];
+  hits.sort((a, b) => a - b);
+
+  const unique = [];
+  for (const hit of hits) {
+    if (unique.length && Math.abs(hit - unique[unique.length - 1]) <= 0.0001) continue;
+    unique.push(hit);
+  }
+
+  const intervals = [];
+  for (let index = 0; index + 1 < unique.length; index += 2) {
+    if (unique[index + 1] > unique[index] + 0.0001) intervals.push([unique[index], unique[index + 1]]);
+  }
+  return intervals;
+}
+
+function zInsideIntervals(z, intervals) {
+  for (const interval of intervals) {
+    if (z >= interval[0] - 0.0001 && z <= interval[1] + 0.0001) return true;
+  }
+  return false;
+}
+
+function zVoxelOverlapsIntervals(z, pitch, intervals) {
+  const half = Math.max(0.0001, Number(pitch) || 0) * 0.5;
+  const minZ = z - half;
+  const maxZ = z + half;
+  for (const interval of intervals) {
+    if (maxZ >= interval[0] - 0.0001 && minZ <= interval[1] + 0.0001) return true;
+  }
+  return false;
+}
+
+function indexedProjectionMeshFromTriangleVertices(vertices) {
+  const source = vertices instanceof Float32Array ? vertices : new Float32Array(vertices ?? []);
+  const vertexCount = Math.floor(source.length / 3);
+  const triangles = new Uint32Array(vertexCount);
+  for (let index = 0; index < vertexCount; index += 1) triangles[index] = index;
+  return {
+    vertices: source,
+    triangles,
+    triangle_count: Math.floor(vertexCount / 3),
+  };
+}
+
+function voxelClearanceOffsets(effectiveXy, effectiveZ, pitch) {
+  const radius = Math.max(0, Number(effectiveXy) || 0);
+  const zInflate = Math.max(0, Number(effectiveZ) || 0);
+  const offsets = [{ dx: 0, dy: 0, zInflate, distance: 0 }];
+  if (radius <= 0.0001) return offsets;
+
+  const spacing = radius < pitch
+    ? radius
+    : Math.max(Math.max(0.2, pitch), radius / 4);
+  const steps = Math.max(1, Math.ceil(radius / Math.max(0.0001, spacing)));
+  const seen = new Set(["0:0"]);
+  for (let oy = -steps; oy <= steps; oy += 1) {
+    for (let ox = -steps; ox <= steps; ox += 1) {
+      if (ox === 0 && oy === 0) continue;
+      const dx = ox * spacing;
+      const dy = oy * spacing;
+      const distance = Math.sqrt(dx * dx + dy * dy);
+      if (distance > radius + 0.0001) continue;
+      const key = `${roundedCoordinate(dx)}:${roundedCoordinate(dy)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      offsets.push({ dx, dy, zInflate, distance });
+    }
+  }
+  offsets.sort((a, b) => a.distance - b.distance);
+  return offsets;
+}
+
+function modelClearanceIntervalsAtXY(mesh, sampler, x, y, offsets, cache) {
+  const expanded = [];
+  for (const offset of offsets) {
+    const sx = x + offset.dx;
+    const sy = y + offset.dy;
+    const key = `${Math.round(sx * 1000)}:${Math.round(sy * 1000)}`;
+    let intervals = cache.get(key);
+    if (!intervals) {
+      intervals = supportZIntervalsAtXY(mesh, sx, sy, sampler);
+      cache.set(key, intervals);
+    }
+    for (const interval of intervals) {
+      expanded.push([
+        interval[0] - offset.zInflate,
+        interval[1] + offset.zInflate,
+      ]);
+    }
+  }
+  return mergeZIntervals(expanded);
+}
+
+function mergeZIntervals(intervals) {
+  if (!intervals.length) return [];
+  intervals.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const merged = [];
+  for (const interval of intervals) {
+    if (!merged.length || interval[0] > merged[merged.length - 1][1] + 0.0001) {
+      merged.push([interval[0], interval[1]]);
+    } else {
+      merged[merged.length - 1][1] = Math.max(merged[merged.length - 1][1], interval[1]);
+    }
+  }
+  return merged;
+}
+
 function buildSupportTopSampler(mesh, binSize, sampleCells = []) {
   const vertices = mesh?.vertices ?? [];
   const triangles = mesh?.triangles ?? [];
@@ -2932,6 +5198,27 @@ function evaluateCradleMeshSupportQa(mesh, coverage) {
   };
 }
 
+function adjustMediumIntervalMeshReachQa(meshQa, voxelClearanceQa) {
+  if (!meshQa || meshQa.failed || !voxelClearanceQa?.available) return meshQa;
+  if (voxelClearanceQa.method !== "interval-column-boolean") return meshQa;
+  const maxGap = Number(meshQa.max_gap_mm ?? 0);
+  const tolerance = Math.max(
+    Number(meshQa.tolerance_mm ?? 0),
+    Number(voxelClearanceQa.effective_z_mm ?? 0) + Number(voxelClearanceQa.voxel_size_mm ?? 0) * 0.25
+  );
+  if (!Number.isFinite(maxGap) || !Number.isFinite(tolerance) || maxGap > tolerance + 0.0001) return meshQa;
+  return {
+    ...meshQa,
+    unsupported_cells_before_clearance_adjustment: Number(meshQa.unsupported_cells ?? 0),
+    supported_percent_before_clearance_adjustment: Number(meshQa.supported_percent ?? 0),
+    unsupported_cells: 0,
+    supported_cells: Number(meshQa.sampled_cells ?? meshQa.supported_cells ?? 0),
+    supported_percent: meshQa.sampled_cells ? 100 : Number(meshQa.supported_percent ?? 0),
+    clearance_adjusted: true,
+    clearance_adjusted_tolerance_mm: roundedCoordinate(tolerance),
+  };
+}
+
 function meshQaSampleLimit(mesh, targetCount) {
   const triangleCount = Math.floor((mesh?.triangles?.length ?? 0) / 3);
   if (triangleCount > 750000) return Math.min(targetCount, 6000);
@@ -3036,6 +5323,48 @@ function evaluateGeneratedModelIntersectionQa(mesh, options = {}) {
   return qa;
 }
 
+function qaFailureReason(error, fallback) {
+  const message = error?.message || String(error || "");
+  return message ? `${fallback}: ${message}` : fallback;
+}
+
+function failedModelIntersectionQa(error) {
+  return {
+    available: false,
+    failed: true,
+    reason: qaFailureReason(error, "model intersection QA could not complete"),
+    sampled_points: 0,
+    intersection_samples: 0,
+    intersects_model: false,
+    max_penetration_mm: 0,
+    needs_exact_trim: true,
+  };
+}
+
+function failedMeshReachQa(error) {
+  return {
+    available: false,
+    failed: true,
+    reason: qaFailureReason(error, "mesh support reach QA could not complete"),
+    sampled_cells: 0,
+    supported_cells: 0,
+    unsupported_cells: 0,
+    supported_percent: 0,
+    max_gap_mm: 0,
+    max_overreach_mm: 0,
+    tolerance_mm: 0,
+  };
+}
+
+function failedStabilityQa(error) {
+  return {
+    available: false,
+    failed: true,
+    severity: "caution",
+    reason: qaFailureReason(error, "stability QA could not complete"),
+  };
+}
+
 function modelIntersectionQaSampleLimit(mesh, phase = "final") {
   const triangleCount = Math.floor((mesh?.triangles?.length ?? 0) / 3);
   if (triangleCount > 750000) return phase === "pretrim" ? 3500 : 5000;
@@ -3053,6 +5382,9 @@ function materialIntersectionNeedsExactTrim(qa, cellSize) {
 }
 
 function formatGeneratedModelIntersectionQaStatus(qa) {
+  if (qa?.failed) {
+    return `Model mesh QA warning: ${qa.reason || "model intersection QA could not complete"}.`;
+  }
   if (!qa?.sampled_points) {
     return "Model mesh QA skipped because no cradle mesh samples were available.";
   }
@@ -3060,6 +5392,1327 @@ function formatGeneratedModelIntersectionQaStatus(qa) {
     return `Model mesh QA warning: ${qa.intersection_samples.toLocaleString()} / ${qa.sampled_points.toLocaleString()} sampled cradle points appear inside the model, max approximate penetration ${formatStatusNumber(qa.max_penetration_mm)} mm.`;
   }
   return `Model mesh QA: no sampled cradle points are materially inside the model across ${qa.sampled_points.toLocaleString()} samples.`;
+}
+
+function evaluateExactTrimGateQa(mesh, clearance = {}, options = {}) {
+  const cellSize = Number(mesh?.cell_size_mm) || Number(controlsEl.supportBasePatternSpacing?.value) || 0.8;
+  if (!state.modelMesh?.geometry?.boundsTree || !mesh?.vertices?.length || !mesh?.triangles?.length) {
+    return {
+      available: false,
+      reason: state.modelMesh?.geometry?.boundsTree ? "no generated cradle mesh samples were available" : "model BVH is unavailable",
+      sampled_points: 0,
+      near_clearance_samples: 0,
+      needs_exact_trim: true,
+    };
+  }
+
+  const xy = Math.max(0, Number(clearance?.xy_mm) || 0);
+  const z = Math.max(0, Number(clearance?.z_mm) || 0);
+  const clearanceRadius = Math.max(xy, z);
+  const tolerance = Math.max(0.12, cellSize * 0.35);
+  const threshold = clearanceRadius + tolerance;
+  const samples = splitChunkQaSamples(
+    [{ id: "cradle", mesh }],
+    exactTrimGateSampleLimit(mesh, options.phase || "high")
+  );
+  if (!samples.length) {
+    return {
+      available: false,
+      reason: "no generated cradle mesh samples were available",
+      sampled_points: 0,
+      near_clearance_samples: 0,
+      needs_exact_trim: true,
+    };
+  }
+
+  const modelIndex = modelQaIndex({ surfaceTolerance: tolerance });
+  let nearSamples = 0;
+  let minDistance = Infinity;
+  for (const sample of samples) {
+    const distance = closestModelDistance(sample, modelIndex, tolerance);
+    minDistance = Math.min(minDistance, distance);
+    if (distance <= threshold) nearSamples += 1;
+  }
+
+  return {
+    available: true,
+    method: "bvh",
+    sampled_points: samples.length,
+    near_clearance_samples: nearSamples,
+    near_clearance_percent: roundedCoordinate((nearSamples / samples.length) * 100),
+    min_distance_mm: roundedCoordinate(Number.isFinite(minDistance) ? minDistance : 0),
+    threshold_mm: roundedCoordinate(threshold),
+    clearance_xy_mm: roundedCoordinate(xy),
+    clearance_z_mm: roundedCoordinate(z),
+    tolerance_mm: roundedCoordinate(tolerance),
+    needs_exact_trim: nearSamples > 0,
+  };
+}
+
+function exactTrimGateSampleLimit(mesh, phase = "high") {
+  const triangleCount = Math.floor((mesh?.triangles?.length ?? 0) / 3);
+  if (triangleCount > 750000) return phase === "high" ? 9000 : 5000;
+  if (triangleCount > 250000) return phase === "high" ? 12000 : 7000;
+  return phase === "high" ? 16000 : 10000;
+}
+
+function formatExactTrimGateQaStatus(qa) {
+  if (!qa) return "BVH trim gate skipped because no cradle mesh was available.";
+  if (!qa.available) {
+    return `BVH trim gate unavailable (${qa.reason || "unknown reason"}); exact object trim was kept.`;
+  }
+  if (qa.needs_exact_trim) {
+    return `BVH trim diagnostic: ${qa.near_clearance_samples.toLocaleString()} / ${qa.sampled_points.toLocaleString()} sampled cradle points are within the requested clearance band; nearest sampled distance ${formatStatusNumber(qa.min_distance_mm)} mm.`;
+  }
+  return `BVH trim diagnostic: ${qa.sampled_points.toLocaleString()} sampled cradle points were outside the requested clearance band; nearest sampled distance ${formatStatusNumber(qa.min_distance_mm)} mm, gate threshold ${formatStatusNumber(qa.threshold_mm)} mm. Exact trim still ran in high accuracy mode.`;
+}
+
+async function buildVoxelBooleanCradleMesh(mesh, clearance = {}, options = {}) {
+  const bounds = supportMeshBounds(mesh);
+  if (!Number.isFinite(bounds.min.x) || !Number.isFinite(bounds.max.x)) {
+    return {
+      mesh,
+      qa: {
+        available: false,
+        reason: "source cradle bounds were unavailable",
+        sampled_voxels: 0,
+        inside_samples: 0,
+        clearance_violation_samples: 0,
+      },
+    };
+  }
+
+  const cellSize = Number(mesh.cell_size_mm) || Number(controlsEl.supportBasePatternSpacing?.value) || 0.8;
+  const requestedPitch = mediumClearanceVoxelSize(cellSize, clearance);
+  let pitch = requestedPitch;
+  const width = Math.max(pitch, bounds.max.x - bounds.min.x);
+  const depth = Math.max(pitch, bounds.max.y - bounds.min.y);
+  const requestedColumns = Math.max(1, Math.ceil(width / pitch) * Math.ceil(depth / pitch));
+  if (requestedColumns > MEDIUM_CLEARANCE_MAX_COLUMNS) {
+    pitch = Math.max(pitch, Math.sqrt((width * depth) / MEDIUM_CLEARANCE_MAX_COLUMNS));
+  }
+  const nx = Math.max(1, Math.ceil(width / pitch));
+  const ny = Math.max(1, Math.ceil(depth / pitch));
+  const effectiveColumns = nx * ny;
+  const resolutionAdjusted = Math.abs(pitch - requestedPitch) > 0.001;
+
+  const xy = Math.max(0, Number(clearance.xy_mm) || 0);
+  const zClearance = Math.max(0, Number(clearance.z_mm) || 0);
+  const safety = Math.max(0.04, pitch * 0.9);
+  const effectiveXy = xy + safety;
+  const effectiveZ = zClearance + safety;
+  const pad = Math.max(effectiveXy, effectiveZ, pitch * 2);
+  const sampler = buildSupportTopSampler(mesh, Math.max(pitch, cellSize), []);
+  const modelPayload = buildMeshPayload();
+  const modelProjectionMesh = indexedProjectionMeshFromTriangleVertices(modelPayload.vertices ?? []);
+  const modelProjectionSampler = buildSupportTopSampler(modelProjectionMesh, Math.max(0.25, Math.max(pitch, effectiveXy)));
+  const modelBounds = supportMeshBounds(modelProjectionMesh);
+  const modelClearanceOffsets = voxelClearanceOffsets(effectiveXy, effectiveZ, pitch);
+  const modelIntervalCache = new Map();
+  let webGpuClearance = null;
+  try {
+    webGpuClearance = await buildWebGpuClearanceField({
+      bounds,
+      pitch,
+      nx,
+      ny,
+      effectiveXy,
+      effectiveZ,
+      pad,
+      modelProjectionMesh,
+      modelProjectionSampler,
+      modelBounds,
+      modelClearanceOffsets,
+      onProgress: async (progress, message) => {
+        await options.onProgress?.(progress * 0.35, message);
+      },
+    });
+  } catch (error) {
+    console.warn("WebGPU clearance field failed; falling back to CPU interval clearance.", error);
+    webGpuClearance = {
+      available: false,
+      reason: error?.message || String(error),
+    };
+  }
+  if (!webGpuClearance?.available && nx * ny > WEBGPU_CLEARANCE_CPU_FALLBACK_MAX_COLUMNS) {
+    throw new Error(
+      `Medium WebGPU clearance is not available for this ${nx.toLocaleString()} x ${ny.toLocaleString()} column field (${webGpuClearance?.reason || "unknown reason"}). CradleMaker did not run the slow CPU fallback for this large model.`
+    );
+  }
+  const columnIntervals = new Array(nx * ny);
+  let activeColumns = 0;
+  let sourceUnits = 0;
+  let keptUnits = 0;
+  let removedUnits = 0;
+  let liftLockRemovedUnits = 0;
+  let insideSamples = 0;
+  let clearanceSamples = 0;
+  let minDistance = Infinity;
+
+  for (let iy = 0; iy < ny; iy += 1) {
+    const y = bounds.min.y + (iy + 0.5) * pitch;
+    for (let ix = 0; ix < nx; ix += 1) {
+      const x = bounds.min.x + (ix + 0.5) * pitch;
+      const columnIndex = iy * nx + ix;
+      const sourceIntervals = supportZIntervalsAtXY(mesh, x, y, sampler);
+      const sourceTop = sourceIntervals.length ? sourceIntervals[sourceIntervals.length - 1][1] : -Infinity;
+      if (!Number.isFinite(sourceTop) || sourceTop <= bounds.min.z + pitch * 0.2) continue;
+      activeColumns += 1;
+      const nearModelXY =
+        x >= modelBounds.min.x - pad && x <= modelBounds.max.x + pad &&
+        y >= modelBounds.min.y - pad && y <= modelBounds.max.y + pad;
+      const gpuFirstBlockZ = webGpuClearance?.firstBlockZ?.[columnIndex];
+      const useGpuFirstBlock = Number.isFinite(gpuFirstBlockZ);
+      const modelIntervals = !useGpuFirstBlock && nearModelXY
+        ? modelClearanceIntervalsAtXY(
+            modelProjectionMesh,
+            modelProjectionSampler,
+            x,
+            y,
+            modelClearanceOffsets,
+            modelIntervalCache
+          )
+        : [];
+      const firstBlockZ = useGpuFirstBlock
+        ? gpuFirstBlockZ
+        : modelIntervals.length ? modelIntervals[0][0] : Infinity;
+      const clippedIntervals = clipIntervalsBelow(sourceIntervals, firstBlockZ - 0.0001);
+      const sourceLength = zIntervalLength(sourceIntervals);
+      const keptLength = zIntervalLength(clippedIntervals);
+      sourceUnits += Math.ceil(sourceLength / pitch);
+      keptUnits += Math.ceil(keptLength / pitch);
+      const removedLength = Math.max(0, sourceLength - keptLength);
+      if (removedLength > 0) {
+        removedUnits += Math.ceil(removedLength / pitch);
+        liftLockRemovedUnits += Math.ceil(removedLength / pitch);
+        minDistance = Math.min(minDistance, 0);
+        if (useGpuFirstBlock || modelIntervals.length) clearanceSamples += 1;
+      }
+      if (clippedIntervals.length) {
+        columnIntervals[columnIndex] = clippedIntervals;
+      }
+    }
+
+    if (iy > 0 && iy % 12 === 0) {
+      await options.onProgress?.(
+        0.35 + (iy / ny) * 0.65,
+        `Running medium interval clearance (${iy.toLocaleString()} / ${ny.toLocaleString()} rows, ${keptUnits.toLocaleString()} vertical units kept)...`
+      );
+      await nextFrame();
+    }
+  }
+
+  const booleanMesh = intervalColumnsToSupportMesh({
+    bounds,
+    pitch,
+    nx,
+    ny,
+    columns: columnIntervals,
+    cellSize,
+    maxTriangles: MEDIUM_CLEARANCE_MAX_RECONSTRUCTED_TRIANGLES,
+  });
+  await options.onProgress?.(1, "Medium interval clearance mesh complete");
+
+  return {
+    mesh: booleanMesh,
+    qa: {
+      available: true,
+      method: "interval-column-boolean",
+      accelerator: webGpuClearance?.available ? "webgpu-clearance-field" : "cpu-interval",
+      webgpu: webGpuClearance
+        ? {
+            available: Boolean(webGpuClearance.available),
+            reason: webGpuClearance.reason || "",
+            jobs: Number(webGpuClearance.jobs || 0),
+            passes: Number(webGpuClearance.passes || 0),
+          }
+        : { available: false, reason: "WebGPU clearance was not attempted" },
+      sampled_voxels: sourceUnits,
+      source_voxels: sourceUnits,
+      kept_voxels: keptUnits,
+      removed_voxels: removedUnits,
+      lift_lock_removed_voxels: liftLockRemovedUnits,
+      sampled_columns: activeColumns,
+      requested_columns: requestedColumns,
+      effective_columns: effectiveColumns,
+      max_columns: MEDIUM_CLEARANCE_MAX_COLUMNS,
+      grid_voxels: nx * ny,
+      grid: { nx, ny, nz: 0 },
+      inside_samples: insideSamples,
+      clearance_violation_samples: clearanceSamples,
+      voxel_size_mm: roundedCoordinate(pitch),
+      requested_pitch_mm: roundedCoordinate(requestedPitch),
+      resolution_adjusted: resolutionAdjusted,
+      tolerance_mm: roundedCoordinate(safety),
+      requested_xy_mm: roundedCoordinate(xy),
+      requested_z_mm: roundedCoordinate(zClearance),
+      effective_xy_mm: roundedCoordinate(effectiveXy),
+      effective_z_mm: roundedCoordinate(effectiveZ),
+      min_distance_mm: roundedCoordinate(Number.isFinite(minDistance) ? minDistance : 0),
+      triangle_count: booleanMesh.triangle_count,
+    },
+  };
+}
+
+function clipIntervalsBelow(intervals, ceiling) {
+  if (!Number.isFinite(ceiling)) return intervals.map((interval) => [interval[0], interval[1]]);
+  const clipped = [];
+  for (const interval of intervals) {
+    const min = Number(interval[0]);
+    const max = Math.min(Number(interval[1]), ceiling);
+    if (Number.isFinite(min) && Number.isFinite(max) && max > min + 0.0001) {
+      clipped.push([roundedCoordinate(min), roundedCoordinate(max)]);
+    }
+  }
+  return clipped;
+}
+
+async function buildWebGpuClearanceField({
+  bounds,
+  pitch,
+  nx,
+  ny,
+  effectiveXy,
+  effectiveZ,
+  pad,
+  modelProjectionMesh,
+  modelProjectionSampler,
+  modelBounds,
+  modelClearanceOffsets,
+  onProgress = null,
+}) {
+  if (!globalThis.navigator?.gpu) {
+    return { available: false, reason: "WebGPU is not available in this browser" };
+  }
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) {
+    return { available: false, reason: "WebGPU adapter is not available" };
+  }
+  const device = await adapter.requestDevice();
+  const triangleCount = Math.floor((modelProjectionMesh?.triangles?.length ?? 0) / 3);
+  if (!triangleCount) {
+    return { available: false, reason: "no model triangles were available for WebGPU clearance" };
+  }
+
+  await onProgress?.(0, "Preparing WebGPU clearance field...");
+  const vertexBufferData = modelProjectionMesh.vertices instanceof Float32Array
+    ? modelProjectionMesh.vertices
+    : new Float32Array(modelProjectionMesh.vertices ?? []);
+  const outputCount = Math.max(1, nx * ny);
+  const limits = adapter.limits ?? {};
+  const maxStorageBufferBindingSize = Number(limits.maxStorageBufferBindingSize) || 128 * 1024 * 1024;
+  if (vertexBufferData.byteLength > maxStorageBufferBindingSize) {
+    return {
+      available: false,
+      reason: `model vertex buffer ${formatBytes(vertexBufferData.byteLength)} exceeds this WebGPU adapter's ${formatBytes(maxStorageBufferBindingSize)} storage-buffer limit`,
+    };
+  }
+  if (outputCount * Uint32Array.BYTES_PER_ELEMENT > maxStorageBufferBindingSize) {
+    return {
+      available: false,
+      reason: `clearance field ${formatBytes(outputCount * Uint32Array.BYTES_PER_ELEMENT)} exceeds this WebGPU adapter's ${formatBytes(maxStorageBufferBindingSize)} storage-buffer limit`,
+    };
+  }
+  const encodedInfinity = 0xffffffff;
+  const encodedFirstZ = new Uint32Array(outputCount);
+  encodedFirstZ.fill(encodedInfinity);
+  const zOrigin = Math.min(bounds.min.z, modelBounds.min.z) - Math.max(effectiveZ, pitch * 2) - 1;
+  const zScale = 1000;
+
+  const vertexBuffer = device.createBuffer({
+    size: alignGpuBufferSize(vertexBufferData.byteLength),
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(vertexBuffer, 0, vertexBufferData);
+  const outputBuffer = device.createBuffer({
+    size: alignGpuBufferSize(encodedFirstZ.byteLength),
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(outputBuffer, 0, encodedFirstZ);
+  const paramsBuffer = device.createBuffer({
+    size: 16,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+
+  const shader = device.createShaderModule({
+    label: "CradleMaker medium clearance field",
+    code: `
+struct Query {
+  sx: f32,
+  sy: f32,
+  zInflate: f32,
+  pad: f32,
+};
+struct Meta {
+  column: u32,
+  triStart: u32,
+};
+struct Params {
+  jobCount: u32,
+  zOrigin: f32,
+  zScale: f32,
+  epsilon: f32,
+};
+@group(0) @binding(0) var<storage, read> vertices: array<f32>;
+@group(0) @binding(1) var<storage, read> queries: array<Query>;
+@group(0) @binding(2) var<storage, read> meta: array<Meta>;
+@group(0) @binding(3) var<storage, read_write> firstZ: array<atomic<u32>>;
+@group(0) @binding(4) var<uniform> params: Params;
+
+fn vertexAt(vertexIndex: u32) -> vec3f {
+  let offset = vertexIndex * 3u;
+  return vec3f(vertices[offset], vertices[offset + 1u], vertices[offset + 2u]);
+}
+
+@compute @workgroup_size(${WEBGPU_CLEARANCE_WORKGROUP_SIZE})
+fn main(@builtin(global_invocation_id) globalId: vec3u) {
+  let jobIndex = globalId.x;
+  if (jobIndex >= params.jobCount) {
+    return;
+  }
+  let query = queries[jobIndex];
+  let jobMeta = meta[jobIndex];
+  let a = vertexAt(jobMeta.triStart);
+  let b = vertexAt(jobMeta.triStart + 1u);
+  let c = vertexAt(jobMeta.triStart + 2u);
+  let denominator = (b.y - c.y) * (a.x - c.x) + (c.x - b.x) * (a.y - c.y);
+  if (abs(denominator) < 0.000000001) {
+    return;
+  }
+  let u = ((b.y - c.y) * (query.sx - c.x) + (c.x - b.x) * (query.sy - c.y)) / denominator;
+  let v = ((c.y - a.y) * (query.sx - c.x) + (a.x - c.x) * (query.sy - c.y)) / denominator;
+  let w = 1.0 - u - v;
+  if (u < -params.epsilon || v < -params.epsilon || w < -params.epsilon) {
+    return;
+  }
+  let z = a.z * u + b.z * v + c.z * w - query.zInflate;
+  let encodedFloat = clamp(round((z - params.zOrigin) * params.zScale), 0.0, 4294967294.0);
+  atomicMin(&firstZ[jobMeta.column], u32(encodedFloat));
+}
+`,
+  });
+  const bindGroupLayout = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+      { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+    ],
+  });
+  const pipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
+    compute: { module: shader, entryPoint: "main" },
+  });
+
+  let jobs = [];
+  let meta = [];
+  let totalJobs = 0;
+  let passes = 0;
+  const flushJobs = async (forceMessage = "") => {
+    const jobCount = Math.floor(meta.length / 2);
+    if (!jobCount) return;
+    const queryData = new Float32Array(jobs);
+    const metaData = new Uint32Array(meta);
+    const queryBuffer = device.createBuffer({
+      size: alignGpuBufferSize(queryData.byteLength),
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    const metaBuffer = device.createBuffer({
+      size: alignGpuBufferSize(metaData.byteLength),
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    device.queue.writeBuffer(queryBuffer, 0, queryData);
+    device.queue.writeBuffer(metaBuffer, 0, metaData);
+    device.queue.writeBuffer(paramsBuffer, 0, new Uint32Array([jobCount]).buffer);
+    device.queue.writeBuffer(paramsBuffer, 4, new Float32Array([zOrigin, zScale, 0.000001]));
+    const bindGroup = device.createBindGroup({
+      layout: bindGroupLayout,
+      entries: [
+        { binding: 0, resource: { buffer: vertexBuffer } },
+        { binding: 1, resource: { buffer: queryBuffer } },
+        { binding: 2, resource: { buffer: metaBuffer } },
+        { binding: 3, resource: { buffer: outputBuffer } },
+        { binding: 4, resource: { buffer: paramsBuffer } },
+      ],
+    });
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(Math.ceil(jobCount / WEBGPU_CLEARANCE_WORKGROUP_SIZE));
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+    await device.queue.onSubmittedWorkDone();
+    queryBuffer.destroy?.();
+    metaBuffer.destroy?.();
+    passes += 1;
+    totalJobs += jobCount;
+    jobs = [];
+    meta = [];
+    if (forceMessage) await onProgress?.(Math.min(0.95, passes / Math.max(1, passes + 2)), forceMessage);
+  };
+
+  const addJob = (column, sx, sy, zInflate, triStart) => {
+    jobs.push(sx, sy, zInflate, 0);
+    meta.push(column, triStart);
+  };
+
+  const totalRows = Math.max(1, ny);
+  for (let iy = 0; iy < ny; iy += 1) {
+    const y = bounds.min.y + (iy + 0.5) * pitch;
+    for (let ix = 0; ix < nx; ix += 1) {
+      const x = bounds.min.x + (ix + 0.5) * pitch;
+      if (
+        x < modelBounds.min.x - pad || x > modelBounds.max.x + pad ||
+        y < modelBounds.min.y - pad || y > modelBounds.max.y + pad
+      ) {
+        continue;
+      }
+      const column = iy * nx + ix;
+      for (const offset of modelClearanceOffsets) {
+        const sx = x + offset.dx;
+        const sy = y + offset.dy;
+        const triangleStarts = modelProjectionSampler.bins.get(modelProjectionSampler.binKey(sx, sy)) ?? [];
+        for (const triStart of triangleStarts) {
+          addJob(column, sx, sy, offset.zInflate, triStart);
+          if (meta.length / 2 >= WEBGPU_CLEARANCE_MAX_JOBS_PER_PASS) {
+            await flushJobs(`Running WebGPU clearance field (${iy.toLocaleString()} / ${totalRows.toLocaleString()} rows, ${totalJobs.toLocaleString()} triangle tests submitted)...`);
+          }
+        }
+      }
+    }
+    if (iy > 0 && iy % 24 === 0) {
+      await onProgress?.(Math.min(0.9, iy / totalRows), `Preparing WebGPU clearance field (${iy.toLocaleString()} / ${totalRows.toLocaleString()} rows)...`);
+      await nextFrame();
+    }
+  }
+  await flushJobs("Finishing WebGPU clearance field...");
+
+  const readBuffer = device.createBuffer({
+    size: alignGpuBufferSize(encodedFirstZ.byteLength),
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+  });
+  const encoder = device.createCommandEncoder();
+  encoder.copyBufferToBuffer(outputBuffer, 0, readBuffer, 0, encodedFirstZ.byteLength);
+  device.queue.submit([encoder.finish()]);
+  await readBuffer.mapAsync(GPUMapMode.READ);
+  const encoded = new Uint32Array(readBuffer.getMappedRange().slice(0));
+  readBuffer.unmap();
+  vertexBuffer.destroy?.();
+  outputBuffer.destroy?.();
+  paramsBuffer.destroy?.();
+  device.destroy?.();
+
+  const firstBlockZ = new Float32Array(outputCount);
+  firstBlockZ.fill(Infinity);
+  let blockedColumns = 0;
+  for (let index = 0; index < encoded.length; index += 1) {
+    if (encoded[index] === encodedInfinity) continue;
+    firstBlockZ[index] = zOrigin + encoded[index] / zScale;
+    blockedColumns += 1;
+  }
+
+  return {
+    available: true,
+    method: "webgpu-first-block-z",
+    firstBlockZ,
+    jobs: totalJobs,
+    passes,
+    blocked_columns: blockedColumns,
+    pitch_mm: pitch,
+    effective_xy_mm: effectiveXy,
+    effective_z_mm: effectiveZ,
+  };
+}
+
+function alignGpuBufferSize(size) {
+  return Math.max(4, Math.ceil(Math.max(0, Number(size) || 0) / 4) * 4);
+}
+
+function zIntervalLength(intervals) {
+  let length = 0;
+  for (const interval of intervals ?? []) {
+    const min = Number(interval[0]);
+    const max = Number(interval[1]);
+    if (Number.isFinite(min) && Number.isFinite(max) && max > min) length += max - min;
+  }
+  return length;
+}
+
+function subtractZIntervals(interval, blockers) {
+  let remaining = [[interval[0], interval[1]]];
+  for (const blocker of blockers ?? []) {
+    const b0 = Number(blocker[0]);
+    const b1 = Number(blocker[1]);
+    if (!Number.isFinite(b0) || !Number.isFinite(b1) || b1 <= b0) continue;
+    const next = [];
+    for (const segment of remaining) {
+      const s0 = segment[0];
+      const s1 = segment[1];
+      if (b1 <= s0 + 0.0001 || b0 >= s1 - 0.0001) {
+        next.push(segment);
+        continue;
+      }
+      if (b0 > s0 + 0.0001) next.push([s0, Math.min(b0, s1)]);
+      if (b1 < s1 - 0.0001) next.push([Math.max(b1, s0), s1]);
+    }
+    remaining = next;
+    if (!remaining.length) break;
+  }
+  return remaining.filter((segment) => segment[1] > segment[0] + 0.0001);
+}
+
+function intervalColumnsToSupportMesh({ bounds, pitch, nx, ny, columns, cellSize, maxTriangles = Infinity }) {
+  const intervalsAt = (ix, iy) =>
+    ix >= 0 && ix < nx && iy >= 0 && iy < ny
+      ? columns[iy * nx + ix] ?? []
+      : [];
+  let quadCount = 0;
+  for (let iy = 0; iy < ny; iy += 1) {
+    for (let ix = 0; ix < nx; ix += 1) {
+      const intervals = intervalsAt(ix, iy);
+      if (!intervals.length) continue;
+      for (const interval of intervals) {
+        quadCount += 2;
+        quadCount += subtractZIntervals(interval, intervalsAt(ix - 1, iy)).length;
+        quadCount += subtractZIntervals(interval, intervalsAt(ix + 1, iy)).length;
+        quadCount += subtractZIntervals(interval, intervalsAt(ix, iy - 1)).length;
+        quadCount += subtractZIntervals(interval, intervalsAt(ix, iy + 1)).length;
+      }
+    }
+  }
+
+  const triangleCount = quadCount * 2;
+  if (triangleCount > maxTriangles) {
+    throw new Error(
+      `Medium clearance mesh would reconstruct ${triangleCount.toLocaleString()} triangles, above the ${Math.round(maxTriangles).toLocaleString()} triangle browser safety limit. Use a coarser cradle resolution or high accuracy exact trimming for this model.`
+    );
+  }
+
+  const vertices = new Float32Array(quadCount * 12);
+  const triangles = new Uint32Array(quadCount * 6);
+  let vertexValueOffset = 0;
+  let triangleValueOffset = 0;
+  let vertexIndex = 0;
+  const addVertex = (x, y, z) => {
+    const index = vertexIndex;
+    vertices[vertexValueOffset] = roundedCoordinate(x);
+    vertices[vertexValueOffset + 1] = roundedCoordinate(y);
+    vertices[vertexValueOffset + 2] = roundedCoordinate(z);
+    vertexValueOffset += 3;
+    vertexIndex += 1;
+    return index;
+  };
+  const addQuad = (a, b, c, d) => {
+    triangles[triangleValueOffset] = a;
+    triangles[triangleValueOffset + 1] = b;
+    triangles[triangleValueOffset + 2] = c;
+    triangles[triangleValueOffset + 3] = a;
+    triangles[triangleValueOffset + 4] = c;
+    triangles[triangleValueOffset + 5] = d;
+    triangleValueOffset += 6;
+  };
+  const x0For = (ix) => bounds.min.x + ix * pitch;
+  const y0For = (iy) => bounds.min.y + iy * pitch;
+  const x1For = (ix) => Math.min(bounds.max.x, bounds.min.x + (ix + 1) * pitch);
+  const y1For = (iy) => Math.min(bounds.max.y, bounds.min.y + (iy + 1) * pitch);
+  const addHorizontalFace = (x0, x1, y0, y1, z, top) => {
+    if (top) {
+      addQuad(addVertex(x0, y0, z), addVertex(x1, y0, z), addVertex(x1, y1, z), addVertex(x0, y1, z));
+    } else {
+      addQuad(addVertex(x0, y0, z), addVertex(x0, y1, z), addVertex(x1, y1, z), addVertex(x1, y0, z));
+    }
+  };
+  const addSideFace = (x0, x1, y0, y1, z0, z1, face) => {
+    if (face === "-x") {
+      addQuad(addVertex(x0, y0, z0), addVertex(x0, y0, z1), addVertex(x0, y1, z1), addVertex(x0, y1, z0));
+    } else if (face === "+x") {
+      addQuad(addVertex(x1, y0, z0), addVertex(x1, y1, z0), addVertex(x1, y1, z1), addVertex(x1, y0, z1));
+    } else if (face === "-y") {
+      addQuad(addVertex(x0, y0, z0), addVertex(x1, y0, z0), addVertex(x1, y0, z1), addVertex(x0, y0, z1));
+    } else if (face === "+y") {
+      addQuad(addVertex(x0, y1, z0), addVertex(x0, y1, z1), addVertex(x1, y1, z1), addVertex(x1, y1, z0));
+    }
+  };
+
+  for (let iy = 0; iy < ny; iy += 1) {
+    const y0 = y0For(iy);
+    const y1 = y1For(iy);
+    for (let ix = 0; ix < nx; ix += 1) {
+      const intervals = intervalsAt(ix, iy);
+      if (!intervals.length) continue;
+      const x0 = x0For(ix);
+      const x1 = x1For(ix);
+      for (const interval of intervals) {
+        const z0 = interval[0];
+        const z1 = interval[1];
+        addHorizontalFace(x0, x1, y0, y1, z0, false);
+        addHorizontalFace(x0, x1, y0, y1, z1, true);
+        for (const segment of subtractZIntervals(interval, intervalsAt(ix - 1, iy))) {
+          addSideFace(x0, x1, y0, y1, segment[0], segment[1], "-x");
+        }
+        for (const segment of subtractZIntervals(interval, intervalsAt(ix + 1, iy))) {
+          addSideFace(x0, x1, y0, y1, segment[0], segment[1], "+x");
+        }
+        for (const segment of subtractZIntervals(interval, intervalsAt(ix, iy - 1))) {
+          addSideFace(x0, x1, y0, y1, segment[0], segment[1], "-y");
+        }
+        for (const segment of subtractZIntervals(interval, intervalsAt(ix, iy + 1))) {
+          addSideFace(x0, x1, y0, y1, segment[0], segment[1], "+y");
+        }
+      }
+    }
+  }
+
+  return {
+    vertices,
+    triangles,
+    triangle_count: Math.floor(triangleValueOffset / 3),
+    cell_size_mm: cellSize,
+  };
+}
+
+function canUseIndependentVoxelBooleanWorkers() {
+  return typeof Worker === "function";
+}
+
+async function buildVoxelBooleanCradleMeshWithIndependentWorkers(mesh, clearance = {}, options = {}) {
+  const bounds = options.bounds ?? supportMeshBounds(mesh);
+  const cellSize = Number(options.cellSize) || Number(mesh.cell_size_mm) || Number(controlsEl.supportBasePatternSpacing?.value) || 0.8;
+  const requestedPitch = Number(options.requestedPitch) || mediumClearanceVoxelSize(cellSize, clearance);
+  const pitch = Number(options.pitch) || requestedPitch;
+  const nx = Math.max(1, Math.floor(Number(options.nx) || 1));
+  const ny = Math.max(1, Math.floor(Number(options.ny) || 1));
+  const nz = Math.max(1, Math.floor(Number(options.nz) || 1));
+  const gridVoxels = Math.max(1, Number(options.gridVoxels) || nx * ny * nz);
+  const modelPayload = buildMeshPayload();
+  const modelVertices = modelPayload.vertices ?? new Float32Array(0);
+  const workerCount = independentVoxelWorkerCount(mesh, modelVertices, { nx, ny, nz });
+  if (workerCount <= 0) throw new Error("independent voxel workers are unavailable");
+  const tasks = independentVoxelTileTasks({ nx, ny, nz, workerCount });
+  const tileShape = independentVoxelTileShape({ nx, ny, nz, workerCount });
+  const localTileVoxels = Math.max(1, tileShape.localCols) * Math.max(1, tileShape.localRows) * Math.max(1, nz);
+  const tileMemoryBudgetBytes = mediumVoxelLocalVoxelBudget({ nx, ny, nz }) * MEDIUM_VOXEL_ESTIMATED_BYTES_PER_LOCAL_VOXEL;
+  if (tasks.length > MEDIUM_VOXEL_MAX_TILE_COUNT) {
+    throw new Error(
+      `Medium accuracy aborted: voxel clearance would require ${tasks.length.toLocaleString()} worker tiles at ${formatStatusNumber(pitch)} mm pitch. Increase voxel pitch or use high accuracy for this model.`
+    );
+  }
+  const workerInputs = {
+    bounds,
+    pitch,
+    cellSize,
+    nx,
+    ny,
+    nz,
+    clearance: {
+      xy_mm: Math.max(0, Number(clearance.xy_mm) || 0),
+      z_mm: Math.max(0, Number(clearance.z_mm) || 0),
+    },
+    supportVertices: mesh.vertices,
+    supportTriangles: mesh.triangles,
+    modelVertices,
+  };
+  await options.onProgress?.(
+    0,
+    `Starting medium voxel boolean across ${workerCount} independent worker${workerCount === 1 ? "" : "s"} and ${tasks.length.toLocaleString()} tile${tasks.length === 1 ? "" : "s"} (${tileShape.coreCols.toLocaleString()} x ${tileShape.coreRows.toLocaleString()} core XY, ${localTileVoxels.toLocaleString()} local voxels/tile, ${formatBytes(tileMemoryBudgetBytes)} calculated budget)...`
+  );
+  await nextFrame();
+
+  const workers = [];
+  try {
+    for (let index = 0; index < workerCount; index += 1) {
+      workers.push(await createIndependentVoxelWorker(workerInputs, index));
+    }
+
+    const pieces = [];
+    const qa = {
+      source_voxels: 0,
+      kept_voxels: 0,
+      removed_voxels: 0,
+      lift_lock_removed_voxels: 0,
+      sampled_columns: 0,
+      inside_samples: 0,
+      clearance_violation_samples: 0,
+      min_distance_mm: Infinity,
+    };
+    let nextTaskIndex = 0;
+    let completedTasks = 0;
+    const runWorker = async (slot) => {
+      while (nextTaskIndex < tasks.length) {
+        const task = tasks[nextTaskIndex];
+        nextTaskIndex += 1;
+        const result = await slot.requestTile(task);
+        if (result?.mesh?.vertices?.length && result?.mesh?.triangles?.length) {
+          pieces.push(result.mesh);
+        }
+        accumulateIndependentVoxelQa(qa, result?.qa);
+        completedTasks += 1;
+        if (completedTasks === 1 || completedTasks === tasks.length || completedTasks % Math.max(1, Math.floor(tasks.length / 20)) === 0) {
+          await options.onProgress?.(
+            completedTasks / tasks.length,
+            `Running medium voxel boolean (${completedTasks.toLocaleString()} / ${tasks.length.toLocaleString()} tiles, ${qa.kept_voxels.toLocaleString()} voxels kept)...`
+          );
+          await nextFrame();
+        }
+      }
+    };
+
+    await Promise.all(workers.map(runWorker));
+    const booleanMesh = mergeSupportMeshPieces(pieces, cellSize);
+    await options.onProgress?.(1, "Medium voxel boolean mesh complete");
+
+    return {
+      mesh: booleanMesh,
+      qa: {
+        available: true,
+        method: "voxel-boolean",
+        worker_mode: "independent-tiled-workers",
+        worker_count: workerCount,
+        tile_count: tasks.length,
+        sampled_voxels: qa.source_voxels,
+        source_voxels: qa.source_voxels,
+        kept_voxels: qa.kept_voxels,
+        removed_voxels: qa.removed_voxels,
+        lift_lock_removed_voxels: qa.lift_lock_removed_voxels,
+        sampled_columns: qa.sampled_columns,
+        grid_voxels: gridVoxels,
+        grid: { nx, ny, nz },
+        inside_samples: qa.inside_samples,
+        clearance_violation_samples: qa.clearance_violation_samples,
+        voxel_size_mm: roundedCoordinate(pitch),
+        requested_pitch_mm: roundedCoordinate(requestedPitch),
+        tolerance_mm: roundedCoordinate(Math.max(0.04, pitch * 0.9)),
+        requested_xy_mm: roundedCoordinate(workerInputs.clearance.xy_mm),
+        requested_z_mm: roundedCoordinate(workerInputs.clearance.z_mm),
+        effective_xy_mm: roundedCoordinate(workerInputs.clearance.xy_mm + Math.max(0.04, pitch * 0.9)),
+        effective_z_mm: roundedCoordinate(workerInputs.clearance.z_mm + Math.max(0.04, pitch * 0.9)),
+        min_distance_mm: roundedCoordinate(Number.isFinite(qa.min_distance_mm) ? qa.min_distance_mm : 0),
+        triangle_count: booleanMesh.triangle_count,
+      },
+    };
+  } finally {
+    for (const slot of workers) slot.terminate();
+  }
+}
+
+function independentVoxelWorkerCount(mesh, modelVertices, grid) {
+  if (typeof Worker !== "function") return 0;
+  const hardware = Math.max(1, Number(navigator.hardwareConcurrency) || 1);
+  const inputBytes =
+    Number(mesh?.vertices?.byteLength || 0) +
+    Number(mesh?.triangles?.byteLength || 0) +
+    Number(modelVertices?.byteLength || 0);
+  const gridVoxels = Math.max(1, Number(grid.nx) * Number(grid.ny) * Number(grid.nz));
+  let count = Math.min(4, Math.max(1, Math.floor(hardware / 2)));
+  const localTileVoxels = estimatedIndependentVoxelTileVoxels(grid);
+  if (inputBytes > 300 * 1024 * 1024) count = Math.min(count, 2);
+  if (localTileVoxels > mediumVoxelLocalVoxelBudget(grid) * 0.75) count = Math.min(count, 2);
+  if (gridVoxels < 1000000) count = Math.min(count, 2);
+  return Math.max(1, Math.min(count, Number(grid.ny) || 1));
+}
+
+function estimatedIndependentVoxelTileVoxels({ nx, ny, nz }) {
+  const shape = independentVoxelTileShape({ nx, ny, nz, workerCount: 4 });
+  return Math.max(1, shape.localCols) * Math.max(1, shape.localRows) * Math.max(1, Number(nz) || 1);
+}
+
+function mediumVoxelLocalVoxelBudget(grid = {}) {
+  const maxBudget = Math.max(1, Math.floor(MEDIUM_VOXEL_MAX_TILE_MEMORY_BUDGET_BYTES / MEDIUM_VOXEL_ESTIMATED_BYTES_PER_LOCAL_VOXEL));
+  const totalVoxels = Math.max(1, Number(grid.nx) || 1) *
+    Math.max(1, Number(grid.ny) || 1) *
+    Math.max(1, Number(grid.nz) || 1);
+  const targetBudget = Math.ceil((totalVoxels / MEDIUM_VOXEL_TARGET_TILE_COUNT) * 1.15);
+  return Math.max(1, Math.min(maxBudget, targetBudget));
+}
+
+function independentVoxelPlanFits(grid, maxTileCount) {
+  const shape = independentVoxelTileShape({ ...grid, workerCount: 4 });
+  const localVoxels = Math.max(1, shape.localCols) * Math.max(1, shape.localRows) * Math.max(1, Number(grid.nz) || 1);
+  const tileCount = Math.ceil(Math.max(1, Number(grid.nx) || 1) / shape.coreCols) *
+    Math.ceil(Math.max(1, Number(grid.ny) || 1) / shape.coreRows);
+  return !shape.impossible && localVoxels <= mediumVoxelLocalVoxelBudget(grid) && tileCount <= maxTileCount;
+}
+
+function independentVoxelTileShape({ nx, ny, nz, workerCount }) {
+  const safeNx = Math.max(1, Number(nx) || 1);
+  const safeNy = Math.max(1, Number(ny) || 1);
+  const safeNz = Math.max(1, Number(nz) || 1);
+  const haloCols = 1;
+  const haloRows = 1;
+  const maxLocalColumns = Math.max(1, Math.floor(mediumVoxelLocalVoxelBudget({ nx: safeNx, ny: safeNy, nz: safeNz }) / safeNz));
+  const minLocalCols = Math.min(safeNx, 1 + haloCols * 2);
+  const minLocalRows = Math.min(safeNy, 1 + haloRows * 2);
+  if (minLocalCols * minLocalRows > maxLocalColumns) {
+    return {
+      coreCols: 1,
+      coreRows: 1,
+      haloCols,
+      haloRows,
+      localCols: minLocalCols,
+      localRows: minLocalRows,
+      impossible: true,
+    };
+  }
+
+  const aspect = Math.max(0.05, Math.min(20, safeNx / safeNy));
+  const idealLocalCols = Math.max(minLocalCols, Math.min(safeNx, Math.floor(Math.sqrt(maxLocalColumns * aspect))));
+  let best = null;
+  const consider = (candidateCols) => {
+    const localCols = Math.max(minLocalCols, Math.min(safeNx, Math.floor(candidateCols)));
+    if (!Number.isFinite(localCols) || localCols < minLocalCols) return;
+    const localRows = Math.max(minLocalRows, Math.min(safeNy, Math.floor(maxLocalColumns / localCols)));
+    if (localCols * localRows > maxLocalColumns) return;
+    const coreCols = safeNx <= localCols ? safeNx : Math.max(1, localCols - haloCols * 2);
+    const coreRows = safeNy <= localRows ? safeNy : Math.max(1, localRows - haloRows * 2);
+    const tileCount = Math.ceil(safeNx / coreCols) * Math.ceil(safeNy / coreRows);
+    const coreArea = coreCols * coreRows;
+    const localAspect = localCols / Math.max(1, localRows);
+    const aspectPenalty = Math.abs(Math.log(localAspect / aspect));
+    const score = coreArea - tileCount * 0.01 - aspectPenalty;
+    if (!best || score > best.score) {
+      best = { coreCols, coreRows, haloCols, haloRows, localCols, localRows, score, impossible: false };
+    }
+  };
+
+  consider(safeNx);
+  consider(Math.floor(maxLocalColumns / safeNy));
+  for (let delta = -96; delta <= 96; delta += 1) {
+    consider(idealLocalCols + delta);
+  }
+  if (!best) {
+    best = {
+      coreCols: 1,
+      coreRows: 1,
+      haloCols,
+      haloRows,
+      localCols: minLocalCols,
+      localRows: minLocalRows,
+      impossible: false,
+    };
+  }
+  return {
+    coreCols: best.coreCols,
+    coreRows: best.coreRows,
+    haloCols: best.haloCols,
+    haloRows: best.haloRows,
+    localCols: best.localCols,
+    localRows: best.localRows,
+    impossible: false,
+  };
+}
+
+function independentVoxelTileTasks({ nx, ny, nz, workerCount }) {
+  const shape = independentVoxelTileShape({ nx, ny, nz, workerCount });
+  const tasks = [];
+  for (let rowStart = 0; rowStart < ny; rowStart += shape.coreRows) {
+    for (let colStart = 0; colStart < nx; colStart += shape.coreCols) {
+      tasks.push({
+        colStart,
+        colEnd: Math.min(nx, colStart + shape.coreCols),
+        rowStart,
+        rowEnd: Math.min(ny, rowStart + shape.coreRows),
+        haloCols: shape.haloCols,
+        haloRows: shape.haloRows,
+      });
+    }
+  }
+  return tasks;
+}
+
+function createIndependentVoxelWorker(input, workerIndex) {
+  const worker = new Worker(new URL(`./voxelBooleanWorker.js?v=${VOXEL_BOOLEAN_WORKER_VERSION}`, import.meta.url), { type: "module" });
+  let nextId = 1;
+  const pending = new Map();
+  const readyId = nextId;
+  nextId += 1;
+
+  worker.onmessage = (event) => {
+    const message = event.data ?? {};
+    const request = pending.get(message.id);
+    if (!request) return;
+    pending.delete(message.id);
+    if (message.type === "ready") {
+      request.resolve();
+    } else if (message.type === "tileResult") {
+      request.resolve(message.result);
+    } else {
+      const error = new Error(message.error || "independent voxel worker failed");
+      error.stack = message.stack || error.stack;
+      request.reject(error);
+    }
+  };
+
+  worker.onerror = (event) => {
+    const error = new Error(event.message || "independent voxel worker error");
+    for (const request of pending.values()) request.reject(error);
+    pending.clear();
+  };
+
+  const ready = new Promise((resolve, reject) => {
+    pending.set(readyId, { resolve, reject });
+    const supportVertices = new Float32Array(input.supportVertices);
+    const supportTriangles = new Uint32Array(input.supportTriangles);
+    const modelVertices = new Float32Array(input.modelVertices);
+    worker.postMessage({
+      type: "init",
+      id: readyId,
+      workerIndex,
+      bounds: input.bounds,
+      pitch: input.pitch,
+      cellSize: input.cellSize,
+      nx: input.nx,
+      ny: input.ny,
+      nz: input.nz,
+      clearance: input.clearance,
+      supportVertices,
+      supportTriangles,
+      modelVertices,
+    }, [supportVertices.buffer, supportTriangles.buffer, modelVertices.buffer]);
+  });
+
+  return ready.then(() => ({
+    requestTile(tile) {
+      const id = nextId;
+      nextId += 1;
+      return new Promise((resolve, reject) => {
+        pending.set(id, { resolve, reject });
+        worker.postMessage({ type: "tile", id, tile });
+      });
+    },
+    terminate() {
+      worker.terminate();
+      for (const request of pending.values()) request.reject(new Error("independent voxel worker terminated"));
+      pending.clear();
+    },
+  }));
+}
+
+function accumulateIndependentVoxelQa(total, qa) {
+  if (!qa) return;
+  total.source_voxels += Number(qa.source_voxels) || 0;
+  total.kept_voxels += Number(qa.kept_voxels) || 0;
+  total.removed_voxels += Number(qa.removed_voxels) || 0;
+  total.lift_lock_removed_voxels += Number(qa.lift_lock_removed_voxels) || 0;
+  total.sampled_columns += Number(qa.sampled_columns) || 0;
+  total.inside_samples += Number(qa.inside_samples) || 0;
+  total.clearance_violation_samples += Number(qa.clearance_violation_samples) || 0;
+  const distance = Number(qa.min_distance_mm);
+  if (Number.isFinite(distance)) total.min_distance_mm = Math.min(total.min_distance_mm, distance);
+}
+
+function mergeSupportMeshPieces(pieces, cellSize) {
+  const valid = (pieces ?? []).filter((piece) => piece?.vertices?.length && piece?.triangles?.length);
+  const totalVertexValues = valid.reduce((sum, piece) => sum + piece.vertices.length, 0);
+  const totalTriangleValues = valid.reduce((sum, piece) => sum + piece.triangles.length, 0);
+  const vertices = new Float32Array(totalVertexValues);
+  const triangles = new Uint32Array(totalTriangleValues);
+  let vertexValueOffset = 0;
+  let triangleValueOffset = 0;
+  let vertexOffset = 0;
+  for (const piece of valid) {
+    vertices.set(piece.vertices, vertexValueOffset);
+    for (let index = 0; index < piece.triangles.length; index += 1) {
+      triangles[triangleValueOffset + index] = piece.triangles[index] + vertexOffset;
+    }
+    vertexValueOffset += piece.vertices.length;
+    triangleValueOffset += piece.triangles.length;
+    vertexOffset += Math.floor(piece.vertices.length / 3);
+  }
+  return {
+    vertices,
+    triangles,
+    triangle_count: Math.floor(triangles.length / 3),
+    cell_size_mm: cellSize,
+  };
+}
+
+function voxelOccupancyToSupportMesh({ bounds, pitch, nx, ny, nz, occupied, occupiedAt, cellSize }) {
+  const vertices = [];
+  const triangles = [];
+  const addVertex = (x, y, z) => {
+    const index = vertices.length / 3;
+    vertices.push(roundedCoordinate(x), roundedCoordinate(y), roundedCoordinate(z));
+    return index;
+  };
+  const addQuad = (a, b, c, d) => {
+    triangles.push(a, b, c, a, c, d);
+  };
+  const addFace = (ix, iy, iz, face) => {
+    const x0 = bounds.min.x + ix * pitch;
+    const y0 = bounds.min.y + iy * pitch;
+    const z0 = bounds.min.z + iz * pitch;
+    const x1 = x0 + pitch;
+    const y1 = y0 + pitch;
+    const z1 = z0 + pitch;
+    if (face === "-x") {
+      addQuad(addVertex(x0, y0, z0), addVertex(x0, y0, z1), addVertex(x0, y1, z1), addVertex(x0, y1, z0));
+    } else if (face === "+x") {
+      addQuad(addVertex(x1, y0, z0), addVertex(x1, y1, z0), addVertex(x1, y1, z1), addVertex(x1, y0, z1));
+    } else if (face === "-y") {
+      addQuad(addVertex(x0, y0, z0), addVertex(x1, y0, z0), addVertex(x1, y0, z1), addVertex(x0, y0, z1));
+    } else if (face === "+y") {
+      addQuad(addVertex(x0, y1, z0), addVertex(x0, y1, z1), addVertex(x1, y1, z1), addVertex(x1, y1, z0));
+    } else if (face === "-z") {
+      addQuad(addVertex(x0, y0, z0), addVertex(x0, y1, z0), addVertex(x1, y1, z0), addVertex(x1, y0, z0));
+    } else if (face === "+z") {
+      addQuad(addVertex(x0, y0, z1), addVertex(x1, y0, z1), addVertex(x1, y1, z1), addVertex(x0, y1, z1));
+    }
+  };
+
+  for (const key of occupied) {
+    const iz = Math.floor(key / (nx * ny));
+    const rem = key - iz * nx * ny;
+    const iy = Math.floor(rem / nx);
+    const ix = rem - iy * nx;
+    if (!occupiedAt(ix - 1, iy, iz)) addFace(ix, iy, iz, "-x");
+    if (!occupiedAt(ix + 1, iy, iz)) addFace(ix, iy, iz, "+x");
+    if (!occupiedAt(ix, iy - 1, iz)) addFace(ix, iy, iz, "-y");
+    if (!occupiedAt(ix, iy + 1, iz)) addFace(ix, iy, iz, "+y");
+    if (!occupiedAt(ix, iy, iz - 1)) addFace(ix, iy, iz, "-z");
+    if (!occupiedAt(ix, iy, iz + 1)) addFace(ix, iy, iz, "+z");
+  }
+
+  return {
+    vertices: new Float32Array(vertices),
+    triangles: new Uint32Array(triangles),
+    triangle_count: Math.floor(triangles.length / 3),
+    cell_size_mm: cellSize,
+  };
+}
+
+async function evaluateVoxelClearanceQa(mesh, clearance = {}, options = {}) {
+  if (!state.modelMesh || !mesh?.vertices?.length || !mesh?.triangles?.length) {
+    return {
+      available: false,
+      reason: state.modelMesh ? "no generated cradle mesh was available" : "no model mesh was available",
+      sampled_voxels: 0,
+      inside_samples: 0,
+      clearance_violation_samples: 0,
+    };
+  }
+
+  const cellSize = Number(mesh.cell_size_mm) || Number(controlsEl.supportBasePatternSpacing?.value) || 0.8;
+  const voxelSize = mediumClearanceVoxelSize(cellSize, clearance);
+  const samples = voxelizedSupportSurfaceSamples(mesh, voxelSize, mediumVoxelSampleLimit(mesh));
+  if (!samples.length) {
+    return {
+      available: false,
+      reason: "no voxel surface samples were available",
+      sampled_voxels: 0,
+      inside_samples: 0,
+      clearance_violation_samples: 0,
+      voxel_size_mm: roundedCoordinate(voxelSize),
+    };
+  }
+
+  const modelIndex = modelQaIndex({ surfaceTolerance: Math.max(0.08, voxelSize * 0.5) });
+  const xy = Math.max(0, Number(clearance.xy_mm) || 0);
+  const z = Math.max(0, Number(clearance.z_mm) || 0);
+  const voxelTolerance = Math.max(0.04, voxelSize * 0.55);
+  const effectiveXy = Math.max(0, xy - voxelTolerance);
+  const effectiveZ = Math.max(0, z - voxelTolerance);
+  let insideSamples = 0;
+  let violationSamples = 0;
+  let nearSamples = 0;
+  let minDistance = Infinity;
+  let minClearanceMetric = Infinity;
+
+  for (let index = 0; index < samples.length; index += 1) {
+    const sample = samples[index];
+    const inside = pointInsideModel(sample, modelIndex);
+    if (inside) insideSamples += 1;
+    const closest = closestModelVector(sample, modelIndex, voxelTolerance);
+    minDistance = Math.min(minDistance, closest.distance);
+    const clearanceMetric = anisotropicClearanceMetric(closest.delta, effectiveXy, effectiveZ);
+    minClearanceMetric = Math.min(minClearanceMetric, clearanceMetric);
+    if (clearanceMetric <= 1) violationSamples += 1;
+    else if (clearanceMetric <= 1.35) nearSamples += 1;
+
+    if (index > 0 && index % 4000 === 0) {
+      await options.onProgress?.(
+        index / samples.length,
+        `Running medium voxel clearance QA (${index.toLocaleString()} / ${samples.length.toLocaleString()} samples)...`
+      );
+      await nextFrame();
+    }
+  }
+
+  await options.onProgress?.(1, "Medium voxel clearance QA complete");
+  return {
+    available: true,
+    method: "voxel-bvh",
+    sampled_voxels: samples.length,
+    voxel_size_mm: roundedCoordinate(voxelSize),
+    tolerance_mm: roundedCoordinate(voxelTolerance),
+    requested_xy_mm: roundedCoordinate(xy),
+    requested_z_mm: roundedCoordinate(z),
+    effective_xy_mm: roundedCoordinate(effectiveXy),
+    effective_z_mm: roundedCoordinate(effectiveZ),
+    inside_samples: insideSamples,
+    clearance_violation_samples: violationSamples,
+    near_clearance_samples: nearSamples,
+    min_distance_mm: roundedCoordinate(Number.isFinite(minDistance) ? minDistance : 0),
+    min_clearance_metric: roundedCoordinate(Number.isFinite(minClearanceMetric) ? minClearanceMetric : 0),
+  };
+}
+
+function mediumClearanceVoxelSize(cellSize, clearance = {}) {
+  const base = Math.max(0.05, Number(cellSize) || 0.8);
+  return base;
+}
+
+function mediumVoxelSampleLimit(mesh) {
+  const triangleCount = Math.floor((mesh?.triangles?.length ?? 0) / 3);
+  if (triangleCount > 750000) return 90000;
+  if (triangleCount > 250000) return 70000;
+  return 50000;
+}
+
+function voxelizedSupportSurfaceSamples(mesh, voxelSize, maxSamples) {
+  const vertices = mesh?.vertices ?? [];
+  const triangles = mesh?.triangles ?? [];
+  const triangleCount = Math.floor(triangles.length / 3);
+  if (!triangleCount || !vertices.length || maxSamples <= 0) return [];
+
+  const samples = [];
+  const occupied = new Set();
+  const triangleStep = Math.max(1, Math.ceil(triangleCount / Math.max(1, Math.floor(maxSamples / 8))));
+  const addSample = (point) => {
+    if (samples.length >= maxSamples) return;
+    const key = `${Math.floor(point.x / voxelSize)}:${Math.floor(point.y / voxelSize)}:${Math.floor(point.z / voxelSize)}`;
+    if (occupied.has(key)) return;
+    occupied.add(key);
+    samples.push({ x: point.x, y: point.y, z: point.z, chunkId: "cradle" });
+  };
+
+  for (let tri = 0; tri < triangleCount && samples.length < maxSamples; tri += triangleStep) {
+    const index = tri * 3;
+    const a = readSupportVertex(vertices, triangles[index]);
+    const b = readSupportVertex(vertices, triangles[index + 1]);
+    const c = readSupportVertex(vertices, triangles[index + 2]);
+    const maxEdge = Math.max(
+      supportSamplePointDistance(a, b),
+      supportSamplePointDistance(b, c),
+      supportSamplePointDistance(c, a)
+    );
+    const steps = Math.max(1, Math.min(5, Math.ceil(maxEdge / Math.max(0.001, voxelSize * 2))));
+    for (let uStep = 0; uStep <= steps && samples.length < maxSamples; uStep += 1) {
+      for (let vStep = 0; vStep <= steps - uStep && samples.length < maxSamples; vStep += 1) {
+        const u = uStep / steps;
+        const v = vStep / steps;
+        const w = 1 - u - v;
+        addSample({
+          x: a.x * w + b.x * u + c.x * v,
+          y: a.y * w + b.y * u + c.y * v,
+          z: a.z * w + b.z * u + c.z * v,
+        });
+      }
+    }
+  }
+
+  return samples;
+}
+
+function supportSamplePointDistance(a, b) {
+  const dx = a.x - b.x;
+  const dy = a.y - b.y;
+  const dz = a.z - b.z;
+  return Math.sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+function closestModelVector(point, modelIndex, surfaceTolerance = 0.12) {
+  if (modelIndex?.type === "bvh") {
+    modelIndex.localPoint
+      .set(point.x, point.y, point.z)
+      .applyMatrix4(modelIndex.inverseMatrix);
+    const closest = modelIndex.mesh.geometry.boundsTree.closestPointToPoint(
+      modelIndex.localPoint,
+      modelIndex.closestTarget
+    );
+    if (closest?.point) {
+      modelIndex.closestWorldPoint
+        .copy(closest.point)
+        .applyMatrix4(modelIndex.matrixWorld);
+      const target = modelIndex.closestWorldPoint;
+      const delta = {
+        x: point.x - target.x,
+        y: point.y - target.y,
+        z: point.z - target.z,
+      };
+      return {
+        delta,
+        distance: Math.sqrt(delta.x * delta.x + delta.y * delta.y + delta.z * delta.z),
+      };
+    }
+  }
+
+  return {
+    delta: { x: surfaceTolerance * 2, y: 0, z: 0 },
+    distance: closestModelDistance(point, modelIndex, surfaceTolerance),
+  };
+}
+
+function anisotropicClearanceMetric(delta, xy, z) {
+  const dx = delta?.x ?? 0;
+  const dy = delta?.y ?? 0;
+  const dz = delta?.z ?? 0;
+  if (xy <= 0.001 && z <= 0.001) return Infinity;
+  const xyTerm = xy > 0.001 ? ((dx * dx + dy * dy) / (xy * xy)) : (dx * dx + dy * dy > 0.000001 ? Infinity : 0);
+  const zTerm = z > 0.001 ? ((dz * dz) / (z * z)) : (Math.abs(dz) > 0.000001 ? Infinity : 0);
+  return Math.sqrt(xyTerm + zTerm);
+}
+
+function formatVoxelClearanceQaStatus(qa) {
+  if (!qa) return "Medium voxel clearance QA was not run.";
+  if (!qa.available) return `Medium voxel clearance QA unavailable (${qa.reason || "unknown reason"}).`;
+  if (qa.method === "interval-column-boolean") {
+    const pitchText = qa.requested_pitch_mm && Math.abs(qa.requested_pitch_mm - qa.voxel_size_mm) > 0.001
+      ? `${formatStatusNumber(qa.voxel_size_mm)} mm effective pitch (requested ${formatStatusNumber(qa.requested_pitch_mm)} mm)`
+      : `${formatStatusNumber(qa.voxel_size_mm)} mm pitch`;
+    const grid = qa.grid ? ` over ${qa.grid.nx.toLocaleString()} x ${qa.grid.ny.toLocaleString()} XY columns` : "";
+    const webGpu = qa.webgpu ?? {};
+    const acceleratorText = webGpu.available
+      ? ` WebGPU clearance field ran ${Number(webGpu.jobs ?? 0).toLocaleString()} triangle tests in ${Number(webGpu.passes ?? 0).toLocaleString()} pass${Number(webGpu.passes ?? 0) === 1 ? "" : "es"}.`
+      : ` WebGPU clearance field was not used${webGpu.reason ? ` (${webGpu.reason})` : ""}; CPU interval clearance was used.`;
+    const adjustedText = qa.resolution_adjusted
+      ? ` Medium clearance pitch was coarsened from ${formatStatusNumber(qa.requested_pitch_mm)} mm to ${formatStatusNumber(qa.voxel_size_mm)} mm to keep the WebGPU field under ${Number(qa.max_columns ?? 0).toLocaleString()} columns (${Number(qa.requested_columns ?? 0).toLocaleString()} requested, ${Number(qa.effective_columns ?? 0).toLocaleString()} used).`
+      : "";
+    const liftLockRemoved = Number(qa.lift_lock_removed_voxels) || 0;
+    const liftLockText = liftLockRemoved
+      ? `, including about ${liftLockRemoved.toLocaleString()} vertical units removed to preserve straight-up object removal`
+      : "";
+    const surfaceQa = qa.surface_qa;
+    const surfaceQaText = surfaceQa?.available
+      ? surfaceQa.inside_samples || surfaceQa.clearance_violation_samples
+        ? ` Surface QA warning: ${surfaceQa.inside_samples.toLocaleString()} sampled surface points are inside the model and ${surfaceQa.clearance_violation_samples.toLocaleString()} are inside the conservative clearance band; nearest sampled distance ${formatStatusNumber(surfaceQa.min_distance_mm)} mm.`
+        : ` Surface QA: no sampled cradle points were inside the model or conservative clearance band; nearest sampled distance ${formatStatusNumber(surfaceQa.min_distance_mm)} mm.`
+      : "";
+    return `Medium interval clearance: sampled ${qa.sampled_columns.toLocaleString()} source cradle columns at ${pitchText}${grid}, removed about ${qa.removed_voxels.toLocaleString()} model-clearance/lift-lock vertical units${liftLockText}, kept about ${qa.kept_voxels.toLocaleString()} vertical units, and reconstructed ${Number(qa.triangle_count ?? 0).toLocaleString()} triangles.${adjustedText}${acceleratorText}${surfaceQaText}`;
+  }
+  if (qa.method === "voxel-boolean") {
+    const pitchText = qa.requested_pitch_mm && Math.abs(qa.requested_pitch_mm - qa.voxel_size_mm) > 0.001
+      ? `${formatStatusNumber(qa.voxel_size_mm)} mm effective pitch (requested ${formatStatusNumber(qa.requested_pitch_mm)} mm)`
+      : `${formatStatusNumber(qa.voxel_size_mm)} mm pitch`;
+    const grid = qa.grid ? ` on a ${qa.grid.nx.toLocaleString()} x ${qa.grid.ny.toLocaleString()} x ${qa.grid.nz.toLocaleString()} sparse grid` : "";
+    const liftLockRemoved = Number(qa.lift_lock_removed_voxels) || 0;
+    const liftLockText = liftLockRemoved
+      ? `, including ${liftLockRemoved.toLocaleString()} upper voxels removed to preserve straight-up object removal`
+      : "";
+    const surfaceQa = qa.surface_qa;
+    const surfaceQaText = surfaceQa?.available
+      ? surfaceQa.inside_samples || surfaceQa.clearance_violation_samples
+        ? ` Surface QA warning: ${surfaceQa.inside_samples.toLocaleString()} sampled surface points are inside the model and ${surfaceQa.clearance_violation_samples.toLocaleString()} are inside the conservative clearance band; nearest sampled distance ${formatStatusNumber(surfaceQa.min_distance_mm)} mm.`
+        : ` Surface QA: no sampled cradle points were inside the model or conservative clearance band; nearest sampled distance ${formatStatusNumber(surfaceQa.min_distance_mm)} mm.`
+      : "";
+    return `Medium voxel boolean: voxelized ${qa.source_voxels.toLocaleString()} source cradle voxels at ${pitchText}${grid}, subtracted ${qa.removed_voxels.toLocaleString()} model-clearance/lift-lock voxels${liftLockText}, kept ${qa.kept_voxels.toLocaleString()} voxels, and reconstructed ${Number(qa.triangle_count ?? 0).toLocaleString()} triangles.${surfaceQaText}`;
+  }
+  const sampleText = `${qa.sampled_voxels.toLocaleString()} voxelized surface samples at ${formatStatusNumber(qa.voxel_size_mm)} mm pitch`;
+  if (qa.inside_samples || qa.clearance_violation_samples) {
+    return `Medium voxel clearance QA warning: ${qa.inside_samples.toLocaleString()} samples inside the model and ${qa.clearance_violation_samples.toLocaleString()} samples inside the conservative clearance band across ${sampleText}; nearest sampled distance ${formatStatusNumber(qa.min_distance_mm)} mm.`;
+  }
+  return `Medium voxel clearance QA: no sampled cradle points were inside the model or conservative clearance band across ${sampleText}; nearest sampled distance ${formatStatusNumber(qa.min_distance_mm)} mm.`;
 }
 
 function evaluateCradleStabilityQa(mesh, coverage, centerOfMass = estimateModelCenterOfMass()) {
@@ -4501,7 +8154,7 @@ function normalizePolygonCcw(points) {
 }
 
 function renderSplitChunks(plan) {
-  splitGroup.clear();
+    clearMeshGroup(splitGroup);
   for (const [index, chunk] of plan.chunks.entries()) {
     normalizeSupportMeshArrays(chunk.mesh);
     const geometry = new THREE.BufferGeometry();
@@ -4530,6 +8183,9 @@ function renderSplitChunks(plan) {
 
 function updateDebugHandle() {
   window.__CRADLEMAKER_DEBUG__ = {
+    appBundleVersion: APP_BUNDLE_VERSION,
+    modelTrimWorkerVersion: MODEL_TRIM_WORKER_VERSION,
+    modelTrim: MODEL_TRIM_DEBUG_SETTINGS,
     state,
     scene,
     camera,
@@ -6599,12 +10255,16 @@ function cncSlabMaterial(index) {
 }
 
 function renderCncFoamPreview(result) {
-  cncGroup.clear();
-  splitGroup.clear();
-  supportGroup.clear();
-  coverageGroup.clear();
+  clearMeshGroup(cncGroup);
+  clearMeshGroup(splitGroup);
+  clearMeshGroup(supportGroup);
+  clearMeshGroup(coverageGroup);
   state.supportMesh = null;
   state.interfaceMesh = null;
+  state.printCradleSafety = {
+    exportable: false,
+    reason: "High accuracy has not been run for this cradle.",
+  };
   state.coverage = null;
   state.coverageVisible = false;
   state.splitChunks = [];
@@ -6656,7 +10316,8 @@ function renderMeshIntoGroup(group, supportMesh, material, name) {
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute("position", new THREE.BufferAttribute(supportMesh.vertices, 3));
   geometry.setIndex(new THREE.BufferAttribute(supportMesh.triangles, 1));
-  const displayGeometry = material.flatShading ? geometry.toNonIndexed() : geometry;
+  const displayGeometry = shouldUseNonIndexedDisplay(supportMesh, material) ? geometry.toNonIndexed() : geometry;
+  if (displayGeometry !== geometry) geometry.dispose();
   displayGeometry.computeVertexNormals();
   displayGeometry.computeBoundingBox();
   displayGeometry.computeBoundingSphere();
@@ -6667,7 +10328,7 @@ function renderMeshIntoGroup(group, supportMesh, material, name) {
 }
 
 function clearCncPreview(options = {}) {
-  cncGroup.clear();
+  clearMeshGroup(cncGroup);
   state.cncMesh = null;
   state.cncQa = null;
   state.cncSlabs = [];
@@ -6787,11 +10448,12 @@ function updateCncQaDashboard(qa) {
   ]);
 }
 
-function buildSupportJobPayload() {
+function buildSupportJobPayload(options = {}) {
   const bbox = new THREE.Box3().setFromObject(state.modelMesh);
   const size = bbox.getSize(new THREE.Vector3());
   const center = bbox.getCenter(new THREE.Vector3());
   const mesh = buildMeshPayload();
+  const accuracyMode = options.accuracyMode || "fast";
 
   return {
     version: 1,
@@ -6808,7 +10470,7 @@ function buildSupportJobPayload() {
     },
     mesh,
     support_config: collectSupportConfig(),
-    cradle_config: collectCradleConfig(),
+    cradle_config: collectCradleConfig({ accuracyMode }),
     manual_supports: realizedManualSupports().map((support) => ({
       id: support.id,
       source: support.source,
@@ -6888,7 +10550,10 @@ function buildMeshPayload() {
 }
 
 function invalidateModelPayloadCache() {
+  state.modelRevision += 1;
+  state.draftSupportCache = null;
   state.modelManifoldPrewarmToken += 1;
+  state.modelTrimPrewarmToken += 1;
   if (state.modelManifoldPrewarmTimer !== null) {
     if (typeof window.cancelIdleCallback === "function") {
       window.cancelIdleCallback(state.modelManifoldPrewarmTimer);
@@ -6897,6 +10562,9 @@ function invalidateModelPayloadCache() {
     }
     state.modelManifoldPrewarmTimer = null;
   }
+  cancelModelTrimWorkerPrewarm();
+  state.modelTrimPrewarmPromise = null;
+  state.modelTrimPrewarmKey = "";
   state.modelPayloadCache = null;
   state.modelManifoldCache?.solid?.delete?.();
   state.modelManifoldCache = null;
@@ -6991,7 +10659,11 @@ function formatTrimTimingText(timings) {
       label: String(phase?.label ?? ""),
       ms: Number(phase?.ms),
     }))
-    .filter((phase) => phase.label && Number.isFinite(phase.ms) && phase.ms >= 0.05)
+    .filter((phase) =>
+      phase.label &&
+      Number.isFinite(phase.ms) &&
+      (phase.ms >= 0.05 || phase.label === "cached model clearance solid")
+    )
     .map((phase) => `${phase.label} ${formatDurationMs(phase.ms)}`);
   return parts.length ? ` Trim phases: ${parts.join(", ")}.` : "";
 }
@@ -7003,6 +10675,7 @@ function inchesToMm(value) {
 function collectSupportConfig() {
   const interfaceEnabled = Boolean(controlsEl.interfaceEnabled?.checked);
   const foamGapEnabled = Boolean(controlsEl.foamGapEnabled?.checked);
+  const resolutionProfile = selectedCradleResolutionProfile();
 
   return {
     ...DEFAULT_SUPPORT_CONFIG,
@@ -7022,7 +10695,7 @@ function collectSupportConfig() {
     support_bottom_z_distance: Number(controlsEl.supportTopZDistance.value),
     support_object_xy_distance: Number(controlsEl.supportObjectXYDistance.value),
     support_edge_clearance_mm: Number(controlsEl.supportEdgeClearance.value),
-    support_base_pattern_spacing: Number(controlsEl.supportBasePatternSpacing.value),
+    support_base_pattern_spacing: resolutionProfile.cellSizeMm,
     support_interface_top_layers: interfaceEnabled ? Number(controlsEl.supportInterfaceTopLayers.value) : 0,
     support_interface_bottom_layers: 0,
     support_interface_spacing: Number(controlsEl.supportInterfaceSpacing.value),
@@ -7037,14 +10710,60 @@ function collectSupportConfig() {
   };
 }
 
-function collectCradleConfig() {
-  return {
+function collectCradleConfig(options = {}) {
+  const accuracyMode = options.accuracyMode || "fast";
+  const resolutionProfile = selectedCradleResolutionProfile();
+  const config = {
     base_enabled: controlsEl.baseEnabled.checked,
     join_uprights_bottom_enabled: controlsEl.baseJoinUprights.checked,
     support_blocker_cuts_base: Boolean(controlsEl.supportBlockCutsBase?.checked),
     base_margin_mm: Number(controlsEl.baseMargin.value),
     base_thickness_mm: Number(controlsEl.baseThickness.value),
+    column_taper_enabled: Number(controlsEl.columnTaperAngle.value) > 0,
+    column_taper_angle_deg: Number(controlsEl.columnTaperAngle.value),
+    max_contact_grid_cells: resolutionProfile.gridBudgetCells,
   };
+  if (accuracyMode === "medium") {
+    config.max_contact_grid_cells = Math.max(config.max_contact_grid_cells, MEDIUM_SUPPORT_GRID_BUDGET_CELLS);
+  }
+  return config;
+}
+
+function selectedCradleResolutionProfileKey() {
+  const selected = controlsEl.cradleResolutionProfiles.find((input) => input.checked)?.value;
+  return CRADLE_RESOLUTION_PROFILES[selected] ? selected : DEFAULT_CRADLE_RESOLUTION_PROFILE;
+}
+
+function selectedCradleResolutionProfile() {
+  return CRADLE_RESOLUTION_PROFILES[selectedCradleResolutionProfileKey()];
+}
+
+function nextFinerCradleResolutionProfileKey(profileKey = selectedCradleResolutionProfileKey()) {
+  if (profileKey === "low") return "medium";
+  if (profileKey === "medium") return "high";
+  return null;
+}
+
+function applyCradleResolutionProfile(profileKey) {
+  const resolvedKey = CRADLE_RESOLUTION_PROFILES[profileKey]
+    ? profileKey
+    : DEFAULT_CRADLE_RESOLUTION_PROFILE;
+  const profile = CRADLE_RESOLUTION_PROFILES[resolvedKey];
+  for (const input of controlsEl.cradleResolutionProfiles) {
+    input.checked = input.value === resolvedKey;
+  }
+  controlsEl.supportBasePatternSpacing.value = String(profile.cellSizeMm);
+  clearGeneratedSupport();
+  clearResolutionPrompt();
+  updateOutputs();
+  updateButtons();
+}
+
+function formatGridBudget(cellCount) {
+  const cells = Math.max(0, Number(cellCount) || 0);
+  if (cells >= 1000000) return `${formatStatusNumber(cells / 1000000)}M`;
+  if (cells >= 1000) return `${formatStatusNumber(cells / 1000)}K`;
+  return Math.round(cells).toLocaleString();
 }
 
 function updateManualMarkers() {
@@ -7093,13 +10812,17 @@ function addRealizedManualMarker(support) {
 }
 
 function clearGeneratedSupport() {
+  state.printCradleSafety = {
+    exportable: false,
+    reason: "High accuracy has not been run for this cradle.",
+  };
   if (!state.supportMesh && !state.interfaceMesh && !state.coverage && supportGroup.children.length === 0 && splitGroup.children.length === 0 && coverageGroup.children.length === 0) {
     resetQaDashboard();
     return;
   }
-  supportGroup.clear();
-  splitGroup.clear();
-  coverageGroup.clear();
+  clearMeshGroup(supportGroup);
+  clearMeshGroup(splitGroup);
+  clearMeshGroup(coverageGroup);
   state.supportMesh = null;
   state.interfaceMesh = null;
   state.coverage = null;
@@ -7111,6 +10834,16 @@ function clearGeneratedSupport() {
   supportGroup.visible = true;
   setSplitStatus("Generate a cradle to check build-plate fit.", "idle");
   resetQaDashboard();
+}
+
+function clearMeshGroup(group) {
+  if (!group) return;
+  group.traverse((object) => {
+    if (object?.geometry && typeof object.geometry.dispose === "function") {
+      object.geometry.dispose();
+    }
+  });
+  group.clear();
 }
 
 function realizedManualSupports() {
@@ -7130,6 +10863,10 @@ function updateOutputs() {
   outputs.supportTopZDistance.textContent = `${controlsEl.supportTopZDistance.value} mm`;
   outputs.supportObjectXYDistance.textContent = `${controlsEl.supportObjectXYDistance.value} mm`;
   outputs.supportEdgeClearance.textContent = `${controlsEl.supportEdgeClearance.value} mm`;
+  if (outputs.cradleResolutionProfile) {
+    const profile = selectedCradleResolutionProfile();
+    outputs.cradleResolutionProfile.textContent = `${profile.label}: ${formatStatusNumber(profile.cellSizeMm)} mm target, ${formatGridBudget(profile.gridBudgetCells)}-cell limit`;
+  }
   if (outputs.supportOpacity && controlsEl.supportOpacity) {
     outputs.supportOpacity.textContent = `${Math.round(Number(controlsEl.supportOpacity.value) || 100)}%`;
   }
@@ -7140,6 +10877,7 @@ function updateOutputs() {
   outputs.treeSupportBranchAngle.textContent = `${controlsEl.treeSupportBranchAngle.value} deg`;
   outputs.baseMargin.textContent = `${controlsEl.baseMargin.value} mm`;
   outputs.baseThickness.textContent = `${controlsEl.baseThickness.value} mm`;
+  outputs.columnTaperAngle.textContent = `${controlsEl.columnTaperAngle.value} deg`;
   outputs.splitBuildMargin.textContent = `${controlsEl.splitBuildMargin.value} mm`;
   outputs.splitConnectorClearance.textContent = `${controlsEl.splitConnectorClearance.value} mm`;
   outputs.splitConnectorSize.textContent = `${controlsEl.splitConnectorSize.value} mm`;
@@ -7183,7 +10921,9 @@ function updateButtons() {
   const generatedCncTriangles = state.cncMesh?.triangle_count ?? 0;
   const generatedCncSlabs = state.cncSlabs?.length ?? 0;
   const cncBusy = Boolean(state.cncBusy);
+  const printBusy = Boolean(state.generationBusy);
   const cncSlabsEnabled = Boolean(controlsEl.cncSlabsEnabled?.checked);
+  const printExportable = Boolean(state.printCradleSafety?.exportable);
   if (controlsEl.toggleModelVisibility) {
     controlsEl.toggleModelVisibility.disabled = !hasModel;
     controlsEl.toggleModelVisibility.textContent = state.modelVisible ? "Hide model" : "Show model";
@@ -7231,9 +10971,15 @@ function updateButtons() {
   if (controlsEl.clearPaint) {
     controlsEl.clearPaint.disabled = !state.manualSupports.some((support) => support.source === "paint_enforce" || support.source === "paint_block");
   }
-  controlsEl.orientModel.disabled = !hasModel;
-  controlsEl.resetOrientation.disabled = !hasModel;
-  controlsEl.generateSupports.disabled = !hasModel;
+  controlsEl.orientModel.disabled = !hasModel || printBusy;
+  controlsEl.resetOrientation.disabled = !hasModel || printBusy;
+  controlsEl.generateSupports.disabled = !hasModel || printBusy;
+  if (controlsEl.generateMediumAccuracySupports) controlsEl.generateMediumAccuracySupports.disabled = !hasModel || printBusy;
+  if (controlsEl.generateHighAccuracySupports) controlsEl.generateHighAccuracySupports.disabled = !hasModel || printBusy;
+  if (controlsEl.cancelCradleGeneration) {
+    controlsEl.cancelCradleGeneration.hidden = !state.generationBusy;
+    controlsEl.cancelCradleGeneration.disabled = !state.generationBusy;
+  }
   if (controlsEl.cncGenerate) controlsEl.cncGenerate.disabled = !hasModel || cncBusy;
   if (controlsEl.cncAutoFit) controlsEl.cncAutoFit.disabled = !hasModel || cncBusy;
   if (controlsEl.cncClear) controlsEl.cncClear.disabled = generatedCncTriangles === 0 || cncBusy;
@@ -7249,17 +10995,30 @@ function updateButtons() {
   if (controlsEl.clearManual) {
     controlsEl.clearManual.disabled = !state.manualSupports.some((support) => support.source === "manual");
   }
-  controlsEl.exportStl.disabled = generatedSupportTriangles === 0;
-  if (controlsEl.exportPly) controlsEl.exportPly.disabled = generatedSupportTriangles === 0;
-  if (controlsEl.exportInterfaceStl) controlsEl.exportInterfaceStl.disabled = generatedInterfaceTriangles === 0;
-  if (controlsEl.exportInterfacePly) controlsEl.exportInterfacePly.disabled = generatedInterfaceTriangles === 0;
+  controlsEl.exportStl.disabled = generatedSupportTriangles === 0 || printBusy;
+  controlsEl.exportStl.title = generatedSupportTriangles && !printExportable ? `${state.printCradleSafety.reason} Export will ask for confirmation.` : "";
+  if (controlsEl.exportPly) {
+    controlsEl.exportPly.disabled = generatedSupportTriangles === 0 || printBusy;
+    controlsEl.exportPly.title = generatedSupportTriangles && !printExportable ? `${state.printCradleSafety.reason} Export will ask for confirmation.` : "";
+  }
+  if (controlsEl.exportInterfaceStl) {
+    controlsEl.exportInterfaceStl.disabled = generatedInterfaceTriangles === 0 || printBusy;
+    controlsEl.exportInterfaceStl.title = generatedInterfaceTriangles && !printExportable ? `${state.printCradleSafety.reason} Export will ask for confirmation.` : "";
+  }
+  if (controlsEl.exportInterfacePly) {
+    controlsEl.exportInterfacePly.disabled = generatedInterfaceTriangles === 0 || printBusy;
+    controlsEl.exportInterfacePly.title = generatedInterfaceTriangles && !printExportable ? `${state.printCradleSafety.reason} Export will ask for confirmation.` : "";
+  }
   if (controlsEl.exportCncStl) controlsEl.exportCncStl.disabled = generatedCncTriangles === 0 || cncBusy;
   if (controlsEl.exportCncSlabStls) controlsEl.exportCncSlabStls.disabled = generatedCncSlabs === 0 || cncBusy;
   if (controlsEl.exportCncSlabManifest) controlsEl.exportCncSlabManifest.disabled = !state.cncSlabPlan || cncBusy;
-  if (controlsEl.previewSplit) controlsEl.previewSplit.disabled = generatedSupportTriangles === 0;
-  if (controlsEl.clearSplit) controlsEl.clearSplit.disabled = !state.splitPreviewVisible;
-  if (controlsEl.exportSplitStls) controlsEl.exportSplitStls.disabled = !state.splitChunks.length;
-  if (controlsEl.exportSplitManifest) controlsEl.exportSplitManifest.disabled = !state.splitChunks.length;
+  if (controlsEl.previewSplit) controlsEl.previewSplit.disabled = generatedSupportTriangles === 0 || printBusy;
+  if (controlsEl.clearSplit) controlsEl.clearSplit.disabled = !state.splitPreviewVisible || printBusy;
+  if (controlsEl.exportSplitStls) {
+    controlsEl.exportSplitStls.disabled = !state.splitChunks.length || printBusy;
+    controlsEl.exportSplitStls.title = state.splitChunks.length && !printExportable ? `${state.printCradleSafety.reason} Export will ask for confirmation.` : "";
+  }
+  if (controlsEl.exportSplitManifest) controlsEl.exportSplitManifest.disabled = !state.splitChunks.length || printBusy;
   const totalGeneratedTriangles = generatedSupportTriangles + generatedInterfaceTriangles;
   if (state.workflowMode === "cnc") {
     supportStatus.textContent = generatedCncTriangles
@@ -7319,7 +11078,11 @@ function updateGeneratedQaDashboard(summary) {
     : Number(summary.supportedDownwardPercent) >= 95
       ? "caution"
       : "error";
-  const meshState = summary.meshQa?.unsupported_cells ? "error" : "ok";
+  const meshState = summary.meshQa?.failed
+    ? "caution"
+    : summary.meshQa?.unsupported_cells
+      ? "error"
+      : "ok";
   const gridIntersectionCount = Number(summary.qa?.intersection_cells ?? 0);
   const meshIntersectionCount = Number(summary.modelMeshQa?.intersection_samples ?? 0);
   const intersectionCount = gridIntersectionCount + meshIntersectionCount;
@@ -7327,7 +11090,11 @@ function updateGeneratedQaDashboard(summary) {
     Number(summary.qa?.max_penetration_mm ?? 0),
     Number(summary.modelMeshQa?.max_penetration_mm ?? 0)
   );
-  const intersectionState = intersectionCount ? "error" : "ok";
+  const intersectionState = summary.modelMeshQa?.failed
+    ? "caution"
+    : intersectionCount
+      ? "error"
+      : "ok";
   const stabilityState = summary.stabilityQa?.severity === "error"
     ? "error"
     : summary.stabilityQa?.severity === "caution"
@@ -7356,14 +11123,18 @@ function updateGeneratedQaDashboard(summary) {
     },
     {
       label: "Mesh",
-      value: summary.meshQa?.unsupported_cells ? "Gap" : "Solid",
-      detail: `${formatStatusNumber(summary.meshQa?.max_gap_mm ?? 0)} mm max gap`,
+      value: summary.meshQa?.failed ? "QA failed" : summary.meshQa?.unsupported_cells ? "Gap" : "Solid",
+      detail: summary.meshQa?.failed
+        ? summary.meshQa.reason || "mesh QA could not complete"
+        : `${formatStatusNumber(summary.meshQa?.max_gap_mm ?? 0)} mm max gap`,
       state: meshState,
     },
     {
       label: "Intersections",
-      value: intersectionCount ? intersectionCount.toLocaleString() : "None",
-      detail: `${formatStatusNumber(maxPenetration)} mm penetration`,
+      value: summary.modelMeshQa?.failed ? "QA failed" : intersectionCount ? intersectionCount.toLocaleString() : "None",
+      detail: summary.modelMeshQa?.failed
+        ? summary.modelMeshQa.reason || "intersection QA could not complete"
+        : `${formatStatusNumber(maxPenetration)} mm penetration`,
       state: intersectionState,
     },
     {
@@ -7394,10 +11165,12 @@ function updateGeneratedQaDashboard(summary) {
 }
 
 function resolutionAdjustmentRecommendation({
+  accuracyMode,
   requestedCellSize,
   effectiveCellSize,
   gridCols,
   gridRows,
+  gridBudgetCells,
   totalTriangleCount,
   contactCellCount,
   envelopeCellCount,
@@ -7410,21 +11183,36 @@ function resolutionAdjustmentRecommendation({
   const effective = Number(effectiveCellSize);
   if (!Number.isFinite(requested) || requested <= 0 || !Number.isFinite(effective) || effective <= 0) return null;
 
-  const minResolution = Number(controlsEl.supportBasePatternSpacing?.min) || 0.25;
-  const suggestedFine = Math.max(minResolution, Math.min(requested * 0.5, requested - 0.05));
-  const roundedFine = roundedResolution(suggestedFine);
+  const nextProfileKey = nextFinerCradleResolutionProfileKey();
+  const nextProfile = nextProfileKey ? CRADLE_RESOLUTION_PROFILES[nextProfileKey] : null;
   if (effective > requested + 0.01) {
+    const renderedCells = Number(gridCols ?? 0) * Number(gridRows ?? 0);
+    const requestedCells =
+      renderedCells > 0 && Number.isFinite(renderedCells)
+        ? Math.round(renderedCells * Math.pow(effective / requested, 2))
+        : 0;
+    const requestedCellText =
+      requestedCells > 0
+        ? ` The requested resolution would be about ${requestedCells.toLocaleString()} cells for this model.`
+        : "";
+    const budget = Number(gridBudgetCells);
+    const budgetText = Number.isFinite(budget) && budget > 0
+      ? `${Math.round(budget).toLocaleString()}-cell grid budget`
+      : "current grid limit";
+    const modeText = accuracyMode === "medium"
+      ? "Medium accuracy"
+      : accuracyMode === "high"
+        ? "High accuracy"
+        : "Fast";
     return {
       type: "auto-coarsened",
       severity: "caution",
-      suggested: roundedResolution(effective),
+      suggestedProfile: nextProfileKey,
       cardDetail: `${formatStatusNumber(effective)} mm effective`,
-      message: `The requested ${formatStatusNumber(requested)} mm cradle resolution exceeded the current grid limit, so CradleMaker used ${formatStatusNumber(effective)} mm over ${Number(gridCols ?? 0).toLocaleString()} x ${Number(gridRows ?? 0).toLocaleString()} cells.`,
-      applyLabel: `Use ${formatStatusNumber(effective)} mm`,
+      message: `${modeText}: the requested ${formatStatusNumber(requested)} mm cradle resolution exceeded the ${budgetText}, so CradleMaker used ${formatStatusNumber(effective)} mm over ${Number(gridCols ?? 0).toLocaleString()} x ${Number(gridRows ?? 0).toLocaleString()} cells.${requestedCellText}${nextProfile ? ` Switch to ${nextProfile.label} for a finer target and a larger grid budget.` : " High is already selected; the grid remains memory-bounded."}`,
+      applyLabel: nextProfile ? `Use ${nextProfile.label}` : null,
     };
   }
-
-  if (requested <= minResolution + 0.001) return null;
 
   const contactCount = Number(contactCellCount ?? 0);
   const envelopeCount = Number(envelopeCellCount ?? 0);
@@ -7435,14 +11223,14 @@ function resolutionAdjustmentRecommendation({
     (triangleCount === 0 && (envelopeCount > 0 || overhangCount > 0)) ||
     (envelopeCount >= 25 && contactCount <= Math.max(4, envelopeCount * 0.08));
 
-  if (thinFeatureMiss && roundedFine < requested - 0.001) {
+  if (thinFeatureMiss) {
     return {
       type: "thin-feature-miss",
       severity: triangleCount === 0 ? "error" : "caution",
-      suggested: roundedFine,
-      cardDetail: `Thin features? Try ${formatStatusNumber(roundedFine)} mm`,
-      message: `Very little cradle was produced from the sampled underside (${contactCount.toLocaleString()} contact cells from ${envelopeCount.toLocaleString()} candidate cells). The model may have thin parts that the ${formatStatusNumber(requested)} mm cradle grid is missing. Try ${formatStatusNumber(roundedFine)} mm and regenerate supports.`,
-      applyLabel: `Use ${formatStatusNumber(roundedFine)} mm`,
+      suggestedProfile: nextProfileKey,
+      cardDetail: nextProfile ? `Thin features? Try ${nextProfile.label}` : "Thin-feature warning",
+      message: `Very little cradle was produced from the sampled underside (${contactCount.toLocaleString()} contact cells from ${envelopeCount.toLocaleString()} candidate cells). The model may have thin parts that the ${formatStatusNumber(requested)} mm cradle grid is missing.${nextProfile ? ` Switch to ${nextProfile.label} and regenerate supports.` : " High resolution is already selected."}`,
+      applyLabel: nextProfile ? `Use ${nextProfile.label}` : null,
     };
   }
 
@@ -7457,22 +11245,16 @@ function resolutionAdjustmentRecommendation({
     supportedPercent < 99.5 ||
     meshGap > Math.max(0.4, requested * 0.8);
 
-  if (!likelyCoarse || roundedFine >= requested - 0.001) return null;
+  if (!likelyCoarse) return null;
 
   return {
     type: "too-coarse",
     severity: unsupportedMeshCells || supportedPercent < 95 ? "error" : "caution",
-    suggested: roundedFine,
-    cardDetail: `Try ${formatStatusNumber(roundedFine)} mm`,
-    message: `This cradle may be undersampling thin features at ${formatStatusNumber(requested)} mm resolution. Try ${formatStatusNumber(roundedFine)} mm and regenerate supports.`,
-    applyLabel: `Use ${formatStatusNumber(roundedFine)} mm`,
+    suggestedProfile: nextProfileKey,
+    cardDetail: nextProfile ? `Try ${nextProfile.label}` : "High-resolution warning",
+    message: `This cradle may be undersampling thin features at ${formatStatusNumber(requested)} mm resolution.${nextProfile ? ` Switch to ${nextProfile.label} and regenerate supports.` : " High resolution is already selected."}`,
+    applyLabel: nextProfile ? `Use ${nextProfile.label}` : null,
   };
-}
-
-function roundedResolution(value) {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return 0.25;
-  return Math.max(0.25, Math.round(number * 100) / 100);
 }
 
 function showResolutionPrompt(recommendation) {
@@ -7485,6 +11267,7 @@ function showResolutionPrompt(recommendation) {
   controlsEl.resolutionPrompt.hidden = false;
   controlsEl.resolutionPromptText.textContent = recommendation.message;
   if (controlsEl.applyResolutionSuggestion) {
+    controlsEl.applyResolutionSuggestion.hidden = !recommendation.suggestedProfile;
     controlsEl.applyResolutionSuggestion.textContent = recommendation.applyLabel || "Apply suggested resolution";
   }
 }
@@ -7493,17 +11276,13 @@ function clearResolutionPrompt() {
   state.resolutionSuggestion = null;
   if (controlsEl.resolutionPrompt) controlsEl.resolutionPrompt.hidden = true;
   if (controlsEl.resolutionPromptText) controlsEl.resolutionPromptText.textContent = "";
+  if (controlsEl.applyResolutionSuggestion) controlsEl.applyResolutionSuggestion.hidden = true;
 }
 
 function applyResolutionSuggestion() {
   const suggestion = state.resolutionSuggestion;
-  if (!suggestion || !Number.isFinite(Number(suggestion.suggested))) return;
-  controlsEl.supportBasePatternSpacing.value = String(suggestion.suggested);
-  clearGeneratedSupport();
-  clearResolutionPrompt();
-  syncOptionPanels();
-  updateOutputs();
-  updateButtons();
+  if (!suggestion?.suggestedProfile) return;
+  applyCradleResolutionProfile(suggestion.suggestedProfile);
 }
 
 function stabilityDashboardValue(qa) {
@@ -7551,6 +11330,7 @@ function resetProgress(shell, progress) {
   if (!shell || !progress) return;
   progress.value = 0;
   progress.setAttribute("value", "0");
+  if (progress === controlsEl.jobProgress) setProgressDetail("");
   shell.hidden = true;
 }
 
@@ -7703,6 +11483,7 @@ function render() {
 
 function exportSupportStl() {
   if (!state.supportMesh) return;
+  if (!confirmPrintCradleExportIfNeeded()) return;
 
   const stl = supportMeshToAsciiStl(state.supportMesh, "cradlemaker_support");
   downloadTextFile(stl, supportExportName("cradle", "stl"), "model/stl");
@@ -7710,6 +11491,7 @@ function exportSupportStl() {
 
 function exportSupportPly() {
   if (!state.supportMesh) return;
+  if (!confirmPrintCradleExportIfNeeded()) return;
 
   const ply = supportMeshToAsciiPly(state.supportMesh);
   downloadTextFile(ply, supportExportName("cradle", "ply"), "model/ply");
@@ -7717,6 +11499,7 @@ function exportSupportPly() {
 
 function exportInterfaceStl() {
   if (!state.interfaceMesh) return;
+  if (!confirmPrintCradleExportIfNeeded()) return;
 
   const stl = supportMeshToAsciiStl(state.interfaceMesh, "cradlemaker_interface");
   downloadTextFile(stl, supportExportName("interface", "stl"), "model/stl");
@@ -7724,9 +11507,52 @@ function exportInterfaceStl() {
 
 function exportInterfacePly() {
   if (!state.interfaceMesh) return;
+  if (!confirmPrintCradleExportIfNeeded()) return;
 
   const ply = supportMeshToAsciiPly(state.interfaceMesh);
   downloadTextFile(ply, supportExportName("interface", "ply"), "model/ply");
+}
+
+function confirmPrintCradleExportIfNeeded() {
+  if (state.printCradleSafety?.exportable) return true;
+  const reason = state.printCradleSafety?.reason || "High accuracy has not been run for this cradle.";
+  const confirmed = window.confirm(
+    `Warning: ${reason}\n\nHigh accuracy checks are recommended before final printing to reduce the risk of model intersections or missed clearance.\n\nExport anyway?`
+  );
+  setJobStatus(
+    confirmed
+      ? `Print export continued after warning: ${reason}`
+      : `Print export canceled: ${reason}`,
+    confirmed ? "pending" : "error"
+  );
+  return confirmed;
+}
+
+function confirmSplitExportIfNeeded() {
+  const plan = state.splitPlan;
+  if (!plan) return true;
+  const warnings = [];
+  if (plan.qa?.intersects_model) {
+    warnings.push(formatSplitQaStatus(plan.qa));
+  }
+  if (Number(plan.gapQa?.count ?? 0) > 0) {
+    warnings.push(formatDovetailGapSpanQaStatus(plan.gapQa));
+  }
+  const oversizedCount = (plan.chunks ?? []).filter((chunk) => !chunk.fits).length;
+  if (oversizedCount) {
+    warnings.push(`${oversizedCount.toLocaleString()} split chunk${oversizedCount === 1 ? "" : "s"} exceed the selected build volume.`);
+  }
+  if (!warnings.length) return true;
+  const confirmed = window.confirm(
+    `Warning: split QA found possible issues:\n\n${warnings.join("\n\n")}\n\nExport split chunks anyway?`
+  );
+  setSplitStatus(
+    confirmed
+      ? `Split export continued after warning: ${warnings[0]}`
+      : `Split export canceled: ${warnings[0]}`,
+    confirmed ? "pending" : "error"
+  );
+  return confirmed;
 }
 
 function exportCncFoamStl() {
@@ -7814,6 +11640,8 @@ function cncSlabManifest() {
 
 function exportSplitStls() {
   if (!state.splitChunks.length) return;
+  if (!confirmPrintCradleExportIfNeeded()) return;
+  if (!confirmSplitExportIfNeeded()) return;
 
   const chunks = [...state.splitChunks];
   setSplitStatus(`Preparing ${chunks.length.toLocaleString()} chunk STL download${chunks.length === 1 ? "" : "s"}...`, "working");

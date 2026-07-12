@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <limits>
 #include <numeric>
+#include <queue>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -20,6 +21,13 @@ namespace {
 
 constexpr double kPi = 3.14159265358979323846;
 constexpr std::size_t kParallelTriangleThreshold = 8000;
+using GridScalar = double;
+constexpr GridScalar kGridEmpty = std::numeric_limits<GridScalar>::max();
+
+GridScalar grid_value(const double value)
+{
+    return std::isfinite(value) ? GridScalar(value) : kGridEmpty;
+}
 
 #if defined(__EMSCRIPTEN_PTHREADS__) || !defined(__EMSCRIPTEN__)
 #define CRADLEMAKER_CAN_USE_NATIVE_THREADS 1
@@ -29,7 +37,7 @@ constexpr bool kCanUseNativeThreads = true;
 constexpr bool kCanUseNativeThreads = false;
 #endif
 
-unsigned support_worker_count(const std::size_t triangle_count)
+unsigned support_worker_count(const std::size_t triangle_count, const std::size_t grid_cell_count = 0)
 {
 #if CRADLEMAKER_CAN_USE_NATIVE_THREADS
     if (!kCanUseNativeThreads)
@@ -39,9 +47,17 @@ unsigned support_worker_count(const std::size_t triangle_count)
 
     const unsigned hardware = std::max(1u, std::thread::hardware_concurrency());
     const unsigned by_work = std::max(1u, unsigned(triangle_count / kParallelTriangleThreshold));
-    return std::min({ hardware, by_work, 8u });
+    unsigned by_memory = 8u;
+    if (grid_cell_count >= 16000000)
+        by_memory = 2u;
+    else if (grid_cell_count >= 10000000)
+        by_memory = 3u;
+    else if (grid_cell_count >= 6000000)
+        by_memory = 4u;
+    return std::min({ hardware, by_work, by_memory, 8u });
 #else
     (void)triangle_count;
+    (void)grid_cell_count;
     return 1;
 #endif
 }
@@ -103,7 +119,7 @@ struct SupportSettings {
     bool foam_gap_enabled = false;
     bool join_uprights_bottom_enabled = true;
     bool support_blocker_cuts_base = false;
-    bool merge_nearby_columns_enabled = true;
+    bool column_taper_enabled = true;
     bool remove_small_overhangs = true;
     bool tree_mode = false;
     bool requested_orca_tree_mode = false;
@@ -123,6 +139,8 @@ struct SupportSettings {
     double foam_gap_xy_mm = 0.0;
     double base_margin_mm = 5.0;
     double base_thickness_mm = 2.0;
+    double column_taper_angle_deg = 3.0;
+    double max_contact_grid_cells = 1200000.0;
 
     double interface_thickness_mm() const { return double(std::max(0, interface_top_layers)) * interface_layer_height_mm; }
     double effective_top_z_distance_mm() const { return top_z_distance_mm + (foam_gap_enabled ? foam_gap_z_mm : 0.0); }
@@ -136,9 +154,9 @@ struct ContactGrid {
     double bottom_z = 0.0;
     int cols = 0;
     int rows = 0;
-    std::vector<double> top_z;
-    std::vector<double> model_ceiling_z;
-    std::vector<double> lower_envelope_z;
+    std::vector<GridScalar> top_z;
+    std::vector<GridScalar> model_ceiling_z;
+    std::vector<GridScalar> lower_envelope_z;
 
     int index(const int ix, const int iy) const { return iy * cols + ix; }
 
@@ -164,7 +182,7 @@ struct ContactGrid {
 
     double model_ceiling(const int ix, const int iy) const
     {
-        return has_model_ceiling(ix, iy) ? model_ceiling_z[index(ix, iy)] : std::numeric_limits<double>::max();
+        return has_model_ceiling(ix, iy) ? double(model_ceiling_z[index(ix, iy)]) : std::numeric_limits<double>::max();
     }
 };
 
@@ -177,7 +195,12 @@ struct SupportGenerationStats {
     std::size_t contact_cells = 0;
     std::size_t base_cells = 0;
     std::size_t bottom_join_cells = 0;
-    std::size_t column_merge_cells = 0;
+    std::size_t column_taper_cells = 0;
+    std::size_t column_taper_seed_cells = 0;
+    double column_taper_max_top_mm = 0.0;
+    double column_taper_added_volume_mm3 = 0.0;
+    double column_taper_max_seed_rise_mm = 0.0;
+    double column_taper_grid_reserve_mm = 0.0;
     std::size_t column_components_before = 0;
     std::size_t column_components_after = 0;
     std::size_t interface_cells = 0;
@@ -521,7 +544,8 @@ SupportSettings read_support_settings(const std::string& json)
     settings.base_enabled = read_bool_field(json, "base_enabled", settings.base_enabled);
     settings.join_uprights_bottom_enabled = read_bool_field(json, "join_uprights_bottom_enabled", settings.join_uprights_bottom_enabled);
     settings.support_blocker_cuts_base = read_bool_field(json, "support_blocker_cuts_base", settings.support_blocker_cuts_base);
-    settings.merge_nearby_columns_enabled = read_bool_field(json, "merge_nearby_columns_enabled", settings.merge_nearby_columns_enabled);
+    settings.column_taper_enabled = read_bool_field(json, "merge_nearby_columns_enabled", settings.column_taper_enabled);
+    settings.column_taper_enabled = read_bool_field(json, "column_taper_enabled", settings.column_taper_enabled);
     settings.interface_enabled = read_bool_field(json, "support_interface_enabled", settings.interface_enabled);
     settings.foam_gap_enabled = read_bool_field(json, "foam_gap_enabled", settings.foam_gap_enabled);
     settings.remove_small_overhangs = read_bool_field(json, "support_remove_small_overhang", settings.remove_small_overhangs);
@@ -549,6 +573,8 @@ SupportSettings read_support_settings(const std::string& json)
     settings.foam_gap_xy_mm = read_number_field(json, "foam_gap_xy_mm", settings.foam_gap_xy_mm);
     settings.base_margin_mm = read_number_field(json, "base_margin_mm", settings.base_margin_mm);
     settings.base_thickness_mm = read_number_field(json, "base_thickness_mm", settings.base_thickness_mm);
+    settings.column_taper_angle_deg = read_number_field(json, "column_taper_angle_deg", settings.column_taper_angle_deg);
+    settings.max_contact_grid_cells = read_number_field(json, "max_contact_grid_cells", settings.max_contact_grid_cells);
     settings.threshold_angle_deg = std::clamp(settings.threshold_angle_deg, 0.0, 89.0);
     settings.top_z_distance_mm = std::max(0.0, settings.top_z_distance_mm);
     settings.xy_distance_mm = std::max(0.0, settings.xy_distance_mm);
@@ -566,6 +592,8 @@ SupportSettings read_support_settings(const std::string& json)
     settings.foam_gap_xy_mm = settings.foam_gap_enabled ? std::clamp(settings.foam_gap_xy_mm, 0.0, 25.0) : 0.0;
     settings.base_margin_mm = std::max(0.0, settings.base_margin_mm);
     settings.base_thickness_mm = std::max(0.0, settings.base_thickness_mm);
+    settings.column_taper_angle_deg = std::clamp(settings.column_taper_angle_deg, 0.0, 12.0);
+    settings.max_contact_grid_cells = std::clamp(settings.max_contact_grid_cells, 250000.0, 24000000.0);
     return settings;
 }
 
@@ -1132,9 +1160,30 @@ bool sample_cell_triangle_z(const ContactGrid& grid, const int ix, const int iy,
 
 double slope_adaptive_clearance_mm(const ContactGrid& grid, const SupportSettings& settings, const Vec3& normal);
 
+double maximum_column_taper_reach_mm(const MeshStats& mesh_stats, const SupportSettings& settings)
+{
+    if (!settings.column_taper_enabled || settings.tree_mode || settings.column_taper_angle_deg <= 0.001)
+        return 0.0;
+
+    const double base_top = settings.base_enabled ? settings.base_thickness_mm : 0.0;
+    const double max_rise = std::max(0.0, mesh_stats.max_z - base_top);
+    const double taper_slope = std::tan(settings.column_taper_angle_deg * kPi / 180.0);
+    return taper_slope > 1e-8 ? max_rise * taper_slope : 0.0;
+}
+
+double column_taper_grid_reserve_mm(const MeshStats& mesh_stats, const SupportSettings& settings)
+{
+    const double taper_reach = maximum_column_taper_reach_mm(mesh_stats, settings);
+    return settings.contact_cell_size_mm > 1e-8
+        ? std::ceil(taper_reach / settings.contact_cell_size_mm) * settings.contact_cell_size_mm
+        : taper_reach;
+}
+
 ContactGrid make_contact_grid(const MeshStats& mesh_stats, const SupportSettings& settings)
 {
-    const double bounds_margin = settings.xy_distance_mm + settings.base_margin_mm + settings.contact_cell_size_mm;
+    const double taper_grid_reserve = column_taper_grid_reserve_mm(mesh_stats, settings);
+    const double bounds_margin =
+        settings.xy_distance_mm + settings.base_margin_mm + taper_grid_reserve + settings.contact_cell_size_mm;
     const double min_x = mesh_stats.min_x - bounds_margin;
     const double min_y = mesh_stats.min_y - bounds_margin;
     const double max_x = mesh_stats.max_x + bounds_margin;
@@ -1143,8 +1192,8 @@ ContactGrid make_contact_grid(const MeshStats& mesh_stats, const SupportSettings
     int cols = std::max(1, int(std::ceil((max_x - min_x) / cell_size)));
     int rows = std::max(1, int(std::ceil((max_y - min_y) / cell_size)));
 
-    constexpr int max_cells = 1200000;
-    if (cols * rows > max_cells) {
+    const double max_cells = settings.max_contact_grid_cells;
+    if (double(cols) * double(rows) > max_cells) {
         const double area = std::max(1.0, (max_x - min_x) * (max_y - min_y));
         cell_size = std::sqrt(area / max_cells);
         cols = std::max(1, int(std::ceil((max_x - min_x) / cell_size)));
@@ -1158,9 +1207,9 @@ ContactGrid make_contact_grid(const MeshStats& mesh_stats, const SupportSettings
     grid.bottom_z = 0.0;
     grid.cols = cols;
     grid.rows = rows;
-    grid.top_z.assign(std::size_t(cols * rows), grid.bottom_z);
-    grid.model_ceiling_z.assign(std::size_t(cols * rows), std::numeric_limits<double>::max());
-    grid.lower_envelope_z.assign(std::size_t(cols * rows), std::numeric_limits<double>::max());
+    grid.top_z.assign(std::size_t(cols * rows), grid_value(grid.bottom_z));
+    grid.model_ceiling_z.assign(std::size_t(cols * rows), kGridEmpty);
+    grid.lower_envelope_z.assign(std::size_t(cols * rows), kGridEmpty);
     return grid;
 }
 
@@ -1169,8 +1218,8 @@ void mark_model_ceiling_cell(ContactGrid& grid, const int ix, const int iy, cons
     if (!grid.inside(ix, iy) || ceiling_z <= grid.bottom_z + 0.05)
         return;
 
-    double& cell_ceiling = grid.model_ceiling_z[grid.index(ix, iy)];
-    cell_ceiling = std::min(cell_ceiling, ceiling_z);
+    GridScalar& cell_ceiling = grid.model_ceiling_z[grid.index(ix, iy)];
+    cell_ceiling = grid_value(std::min(double(cell_ceiling), ceiling_z));
 }
 
 void mark_model_side_wall_clearance(ContactGrid& grid, const SupportSettings& settings, const Vec3& a, const Vec3& b, const Vec3& c)
@@ -1222,7 +1271,7 @@ void mark_model_side_wall_clearance(ContactGrid& grid, const SupportSettings& se
 void populate_model_collision_ceiling(ContactGrid& grid, const MeshStats& mesh_stats, const SupportSettings& settings)
 {
     const std::size_t triangle_count = mesh_stats.vertices.size() / 3;
-    const unsigned worker_count = support_worker_count(triangle_count);
+    const unsigned worker_count = support_worker_count(triangle_count, grid.top_z.size());
     if (worker_count <= 1) {
         for (std::size_t vertex_index = 0; vertex_index + 2 < mesh_stats.vertices.size(); vertex_index += 3) {
             const Vec3 a = mesh_stats.vertices[vertex_index];
@@ -1266,7 +1315,7 @@ void populate_model_collision_ceiling(ContactGrid& grid, const MeshStats& mesh_s
         local.bottom_z = grid.bottom_z;
         local.cols = grid.cols;
         local.rows = grid.rows;
-        local.model_ceiling_z.assign(grid.model_ceiling_z.size(), std::numeric_limits<double>::max());
+        local.model_ceiling_z.assign(grid.model_ceiling_z.size(), kGridEmpty);
         local_grids.push_back(std::move(local));
     }
 
@@ -1357,8 +1406,8 @@ void mark_contact_cell(ContactGrid& grid, const int ix, const int iy, const doub
     if (clamped_top_z <= grid.bottom_z + 0.05)
         return;
 
-    double& cell_top = grid.top_z[grid.index(ix, iy)];
-    cell_top = std::max(cell_top, clamped_top_z);
+    GridScalar& cell_top = grid.top_z[grid.index(ix, iy)];
+    cell_top = grid_value(std::max(double(cell_top), clamped_top_z));
 }
 
 bool mark_lower_envelope_cell(ContactGrid& grid, const int ix, const int iy, const double top_z)
@@ -1370,14 +1419,14 @@ bool mark_lower_envelope_cell(ContactGrid& grid, const int ix, const int iy, con
     if (clamped_top_z <= grid.bottom_z + 0.05)
         return false;
 
-    double& cell_top = grid.top_z[grid.index(ix, iy)];
-    if (cell_top <= grid.bottom_z + 0.05) {
-        cell_top = clamped_top_z;
+    GridScalar& cell_top = grid.top_z[grid.index(ix, iy)];
+    if (double(cell_top) <= grid.bottom_z + 0.05) {
+        cell_top = grid_value(clamped_top_z);
         return true;
     }
 
-    if (clamped_top_z < cell_top) {
-        cell_top = clamped_top_z;
+    if (clamped_top_z < double(cell_top)) {
+        cell_top = grid_value(clamped_top_z);
         return true;
     }
 
@@ -1393,8 +1442,8 @@ void mark_lower_envelope_target_cell(ContactGrid& grid, const int ix, const int 
     if (clamped_top_z <= grid.bottom_z + 0.05)
         return;
 
-    double& target_top = grid.lower_envelope_z[grid.index(ix, iy)];
-    target_top = std::min(target_top, clamped_top_z);
+    GridScalar& target_top = grid.lower_envelope_z[grid.index(ix, iy)];
+    target_top = grid_value(std::min(double(target_top), clamped_top_z));
 }
 
 void mark_contact_xy(ContactGrid& grid, const double x, const double y, const double top_z)
@@ -1456,7 +1505,7 @@ std::size_t mark_lower_envelope_contacts(ContactGrid& grid, const MeshStats& mes
     std::size_t marked_cells = 0;
     const double min_surface_normal_z = minimum_lower_envelope_normal_z(settings);
     const std::size_t triangle_count = mesh_stats.vertices.size() / 3;
-    const unsigned worker_count = support_worker_count(triangle_count);
+    const unsigned worker_count = support_worker_count(triangle_count, grid.top_z.size());
 
 #if CRADLEMAKER_CAN_USE_NATIVE_THREADS
     if (worker_count > 1) {
@@ -1472,8 +1521,8 @@ std::size_t mark_lower_envelope_contacts(ContactGrid& grid, const MeshStats& mes
             local.cols = grid.cols;
             local.rows = grid.rows;
             local.model_ceiling_z = grid.model_ceiling_z;
-            local.top_z.assign(grid.top_z.size(), grid.bottom_z);
-            local.lower_envelope_z.assign(grid.lower_envelope_z.size(), std::numeric_limits<double>::max());
+            local.top_z.assign(grid.top_z.size(), grid_value(grid.bottom_z));
+            local.lower_envelope_z.assign(grid.lower_envelope_z.size(), kGridEmpty);
             local_grids.push_back(std::move(local));
         }
 
@@ -1610,8 +1659,8 @@ std::size_t mark_lower_envelope_contacts(ContactGrid& grid, const MeshStats& mes
 
 std::size_t prune_sparse_auto_contacts(ContactGrid& grid)
 {
-    const std::vector<double> source_top = grid.top_z;
-    const std::vector<double> source_target = grid.lower_envelope_z;
+    const std::vector<GridScalar> source_top = grid.top_z;
+    const std::vector<GridScalar> source_target = grid.lower_envelope_z;
     std::vector<unsigned char> remove(source_top.size(), 0);
     const double comparable_height_mm = std::max(1.5, grid.cell_size * 1.75);
 
@@ -1658,8 +1707,8 @@ std::size_t prune_sparse_auto_contacts(ContactGrid& grid)
         if (!remove[index])
             continue;
 
-        grid.top_z[index] = grid.bottom_z;
-        grid.lower_envelope_z[index] = std::numeric_limits<double>::max();
+        grid.top_z[index] = grid_value(grid.bottom_z);
+        grid.lower_envelope_z[index] = kGridEmpty;
         ++removed;
     }
 
@@ -1728,8 +1777,8 @@ std::size_t prune_small_contact_islands(ContactGrid& grid, const SupportSettings
                 continue;
 
             for (const int cell_index : component) {
-                grid.top_z[cell_index] = grid.bottom_z;
-                grid.lower_envelope_z[cell_index] = std::numeric_limits<double>::max();
+                grid.top_z[cell_index] = grid_value(grid.bottom_z);
+                grid.lower_envelope_z[cell_index] = kGridEmpty;
                 ++removed;
             }
         }
@@ -1788,8 +1837,8 @@ std::size_t remove_manual_support(ContactGrid& grid, const ManualSupportPoint& s
             const int cell_index = grid.index(ix, iy);
             if (grid.top_z[cell_index] > grid.bottom_z + 0.05)
                 ++removed_cells;
-            grid.top_z[cell_index] = grid.bottom_z;
-            grid.lower_envelope_z[cell_index] = std::numeric_limits<double>::max();
+            grid.top_z[cell_index] = grid_value(grid.bottom_z);
+            grid.lower_envelope_z[cell_index] = kGridEmpty;
         }
     }
 
@@ -1859,8 +1908,8 @@ std::size_t apply_manual_blocker_mask(ContactGrid& grid, const std::vector<unsig
 
         if (grid.top_z[index] > clamped_allowed_top + 0.05)
             ++removed_cells;
-        grid.top_z[index] = std::min(grid.top_z[index], clamped_allowed_top);
-        grid.lower_envelope_z[index] = std::numeric_limits<double>::max();
+        grid.top_z[index] = grid_value(std::min(double(grid.top_z[index]), clamped_allowed_top));
+        grid.lower_envelope_z[index] = kGridEmpty;
     }
 
     return removed_cells;
@@ -1878,7 +1927,7 @@ std::size_t count_contact_cells(const ContactGrid& grid)
 
 std::size_t close_contact_gaps(ContactGrid& grid)
 {
-    std::vector<double> closed = grid.top_z;
+    std::vector<GridScalar> closed = grid.top_z;
     std::size_t filled = 0;
 
     for (int iy = 1; iy + 1 < grid.rows; ++iy) {
@@ -1906,7 +1955,7 @@ std::size_t close_contact_gaps(ContactGrid& grid)
                 const double clamped_top = clamp_to_model_ceiling(grid, ix, iy, neighbor_top);
                 if (clamped_top <= grid.bottom_z + 0.05)
                     continue;
-                closed[grid.index(ix, iy)] = clamped_top;
+                closed[grid.index(ix, iy)] = grid_value(clamped_top);
                 ++filled;
             }
         }
@@ -1921,8 +1970,8 @@ std::size_t apply_xy_edge_clearance(ContactGrid& grid, const double gap_mm)
     if (gap_mm <= 0.01)
         return 0;
 
-    const std::vector<double> source = grid.top_z;
-    std::vector<double> eroded = grid.top_z;
+    const std::vector<GridScalar> source = grid.top_z;
+    std::vector<GridScalar> eroded = grid.top_z;
     const int radius_cells = std::max(1, int(std::ceil((gap_mm + grid.cell_size * 0.55) / grid.cell_size)));
     const double required_radius = gap_mm + grid.cell_size * 0.45;
     std::size_t removed = 0;
@@ -1951,7 +2000,7 @@ std::size_t apply_xy_edge_clearance(ContactGrid& grid, const double gap_mm)
             }
 
             if (!keep) {
-                eroded[cell_index] = grid.bottom_z;
+                eroded[cell_index] = grid_value(grid.bottom_z);
                 ++removed;
             }
         }
@@ -1987,10 +2036,10 @@ std::size_t grow_base_footprint(ContactGrid& grid, const double margin_mm, const
                 if (!grid.inside(ix, iy))
                     continue;
 
-                double& cell_top = grid.top_z[grid.index(ix, iy)];
+                GridScalar& cell_top = grid.top_z[grid.index(ix, iy)];
                 const double clamped_base_top = clamp_to_model_ceiling(grid, ix, iy, base_thickness_mm);
-                if (clamped_base_top > grid.bottom_z + 0.05 && cell_top < clamped_base_top - 0.05) {
-                    cell_top = clamped_base_top;
+                if (clamped_base_top > grid.bottom_z + 0.05 && double(cell_top) < clamped_base_top - 0.05) {
+                    cell_top = grid_value(clamped_base_top);
                     ++base_cells;
                 }
             }
@@ -2005,7 +2054,7 @@ std::size_t join_bottom_uprights(ContactGrid& grid, const double base_thickness_
     if (base_thickness_mm <= grid.bottom_z + 0.05)
         return 0;
 
-    const std::vector<double> source = grid.top_z;
+    const std::vector<GridScalar> source = grid.top_z;
     auto source_occupied = [&](const int ix, const int iy) {
         return grid.inside(ix, iy) && source[grid.index(ix, iy)] > grid.bottom_z + 0.05;
     };
@@ -2053,11 +2102,11 @@ std::size_t join_bottom_uprights(ContactGrid& grid, const double base_thickness_
             if (clamped_base_top <= grid.bottom_z + 0.05)
                 continue;
 
-            double& cell_top = grid.top_z[cell_index];
-            if (cell_top < clamped_base_top - 0.05) {
-                if (cell_top <= grid.bottom_z + 0.05)
+            GridScalar& cell_top = grid.top_z[cell_index];
+            if (double(cell_top) < clamped_base_top - 0.05) {
+                if (double(cell_top) <= grid.bottom_z + 0.05)
                     ++joined_cells;
-                cell_top = clamped_base_top;
+                cell_top = grid_value(clamped_base_top);
             }
         }
     }
@@ -2124,97 +2173,144 @@ std::size_t count_column_components(const ContactGrid& grid, const SupportSettin
     return components;
 }
 
-std::size_t merge_nearby_columns(ContactGrid& grid, const SupportSettings& settings)
+struct ColumnTaperResult {
+    std::size_t added_cells = 0;
+    std::size_t seed_cells = 0;
+    double max_added_top_mm = 0.0;
+    double added_volume_mm3 = 0.0;
+    double max_seed_rise_mm = 0.0;
+};
+
+double column_taper_ceiling_clearance_mm(const ContactGrid& grid)
 {
-    if (!settings.merge_nearby_columns_enabled || settings.tree_mode)
-        return 0;
+    return std::max(0.2, grid.cell_size * 0.25);
+}
+
+ColumnTaperResult taper_support_columns(
+    ContactGrid& grid,
+    const SupportSettings& settings,
+    const std::vector<unsigned char>& contact_mask,
+    const std::vector<GridScalar>& contact_top,
+    const std::vector<unsigned char>& blocker_mask,
+    std::vector<unsigned char>& taper_mask)
+{
+    ColumnTaperResult result;
+    taper_mask.assign(grid.top_z.size(), 0);
+    if (!settings.column_taper_enabled || settings.tree_mode || settings.column_taper_angle_deg <= 0.001)
+        return result;
+    if (contact_mask.size() != grid.top_z.size() || contact_top.size() != grid.top_z.size())
+        return result;
 
     const double base_top = settings.base_enabled ? settings.base_thickness_mm : grid.bottom_z;
-    const double min_column_top = column_component_threshold(grid, settings);
-    const double merge_ceiling_clearance = std::max(0.2, grid.cell_size * 0.25);
-    const double merge_radius_mm = std::clamp(settings.contact_cell_size_mm * 18.0, 8.0, 22.0);
-    const int merge_radius_cells = std::max(1, int(std::ceil(merge_radius_mm / grid.cell_size)));
-    const std::vector<double> source = grid.top_z;
-    std::vector<double> candidate = grid.top_z;
-    std::size_t merged_cells = 0;
+    const double taper_slope = std::tan(settings.column_taper_angle_deg * kPi / 180.0);
+    if (taper_slope <= 1e-8)
+        return result;
 
-    auto source_column = [&](const int ix, const int iy) {
-        return grid.inside(ix, iy) && source[grid.index(ix, iy)] > min_column_top;
+    const double vertical_drop_per_mm = 1.0 / taper_slope;
+    const double ceiling_clearance = column_taper_ceiling_clearance_mm(grid);
+    std::vector<GridScalar> tapered_top(grid.top_z.size(), grid_value(grid.bottom_z));
+
+    struct TaperFront {
+        double top_z = 0.0;
+        int cell_index = 0;
     };
-
-    auto safe_merge_top = [&](const int ix, const int iy, const double desired_top) {
-        if (!grid.inside(ix, iy))
-            return grid.bottom_z;
-        if (!grid.has_model_ceiling(ix, iy))
-            return desired_top;
-        return std::min(desired_top, grid.model_ceiling(ix, iy) - merge_ceiling_clearance);
-    };
-
-    auto ray_hit_top = [&](const int ix, const int iy, const int dx, const int dy) {
-        double hit_top = grid.bottom_z;
-        for (int step = 1; step <= merge_radius_cells; ++step) {
-            const int nx = ix + dx * step;
-            const int ny = iy + dy * step;
-            if (!grid.inside(nx, ny))
-                break;
-            if (!source_column(nx, ny))
-                continue;
-            hit_top = source[grid.index(nx, ny)];
-            break;
+    struct HighestTopFirst {
+        bool operator()(const TaperFront& lhs, const TaperFront& rhs) const
+        {
+            return lhs.top_z < rhs.top_z;
         }
-        return hit_top;
     };
+    std::priority_queue<TaperFront, std::vector<TaperFront>, HighestTopFirst> frontier;
 
-    auto paired_bridge_top = [&](const int ix, const int iy, const int dx, const int dy) {
-        const double forward = ray_hit_top(ix, iy, dx, dy);
-        if (forward <= min_column_top)
-            return grid.bottom_z;
-        const double backward = ray_hit_top(ix, iy, -dx, -dy);
-        if (backward <= min_column_top)
-            return grid.bottom_z;
-        return std::min(forward, backward);
-    };
-
-    constexpr std::array<std::array<int, 2>, 4> bridge_axes {{
-        {{ 1, 0 }},
-        {{ 0, 1 }},
-        {{ 1, 1 }},
-        {{ 1, -1 }}
+    constexpr std::array<std::array<int, 2>, 8> neighbors {{
+        {{ -1, 0 }}, {{ 1, 0 }}, {{ 0, -1 }}, {{ 0, 1 }},
+        {{ -1, -1 }}, {{ 1, -1 }}, {{ -1, 1 }}, {{ 1, 1 }}
     }};
 
-    for (int iy = 0; iy < grid.rows; ++iy) {
-        for (int ix = 0; ix < grid.cols; ++ix) {
-            const int cell_index = grid.index(ix, iy);
-            if (source[cell_index] > min_column_top)
-                continue;
+    for (std::size_t index = 0; index < contact_mask.size(); ++index) {
+        if (!contact_mask[index])
+            continue;
+        const double seed_top = contact_top[index];
+        if (seed_top <= base_top + 0.05)
+            continue;
 
-            double best_top = grid.bottom_z;
-            for (const auto& axis : bridge_axes) {
-                const double bridge_top = paired_bridge_top(ix, iy, axis[0], axis[1]);
-                if (bridge_top > best_top)
-                    best_top = bridge_top;
+        const int seed_x = int(index % std::size_t(grid.cols));
+        const int seed_y = int(index / std::size_t(grid.cols));
+        bool boundary_seed = false;
+        for (const auto& offset : neighbors) {
+            const int nx = seed_x + offset[0];
+            const int ny = seed_y + offset[1];
+            if (!grid.inside(nx, ny) || !contact_mask[std::size_t(grid.index(nx, ny))]) {
+                boundary_seed = true;
+                break;
             }
+        }
+        if (!boundary_seed)
+            continue;
 
-            const double clamped_top = safe_merge_top(ix, iy, best_top);
-            if (clamped_top <= min_column_top)
+        tapered_top[index] = grid_value(seed_top);
+        frontier.push({ seed_top, int(index) });
+        ++result.seed_cells;
+        result.max_seed_rise_mm = std::max(result.max_seed_rise_mm, seed_top - base_top);
+    }
+
+    constexpr double diagonal_scale = 1.4142135623730951;
+
+    while (!frontier.empty()) {
+        const TaperFront current = frontier.top();
+        frontier.pop();
+        if (current.top_z + 1e-6 < double(tapered_top[std::size_t(current.cell_index)]))
+            continue;
+
+        const int current_x = current.cell_index % grid.cols;
+        const int current_y = current.cell_index / grid.cols;
+        for (const auto& offset : neighbors) {
+            const int nx = current_x + offset[0];
+            const int ny = current_y + offset[1];
+            if (!grid.inside(nx, ny))
                 continue;
-            candidate[cell_index] = std::max(candidate[cell_index], clamped_top);
+
+            const int neighbor_index = grid.index(nx, ny);
+            if (blocker_mask.size() == grid.top_z.size() && blocker_mask[std::size_t(neighbor_index)])
+                continue;
+
+            const bool diagonal = offset[0] != 0 && offset[1] != 0;
+            const double step_mm = grid.cell_size * (diagonal ? diagonal_scale : 1.0);
+            double candidate_top = current.top_z - step_mm * vertical_drop_per_mm;
+            if (grid.has_model_ceiling(nx, ny))
+                candidate_top = std::min(candidate_top, grid.model_ceiling(nx, ny) - ceiling_clearance);
+            if (candidate_top <= base_top + 0.05)
+                continue;
+            if (candidate_top <= double(tapered_top[std::size_t(neighbor_index)]) + 0.01)
+                continue;
+
+            tapered_top[std::size_t(neighbor_index)] = grid_value(candidate_top);
+            frontier.push({ candidate_top, neighbor_index });
         }
     }
 
+    const double cell_area_mm2 = grid.cell_size * grid.cell_size;
     for (std::size_t index = 0; index < grid.top_z.size(); ++index) {
-        if (candidate[index] <= grid.top_z[index] + 0.05)
+        if (contact_mask[index])
             continue;
-        grid.top_z[index] = candidate[index];
-        ++merged_cells;
+        const double candidate_top = tapered_top[index];
+        const double previous_top = grid.top_z[index];
+        if (candidate_top <= previous_top + 0.05)
+            continue;
+
+        grid.top_z[index] = grid_value(candidate_top);
+        taper_mask[index] = 1;
+        result.max_added_top_mm = std::max(result.max_added_top_mm, candidate_top);
+        result.added_volume_mm3 += (candidate_top - previous_top) * cell_area_mm2;
+        ++result.added_cells;
     }
 
-    return merged_cells;
+    return result;
 }
 
 void smooth_contact_heights(ContactGrid& grid, const double base_thickness_mm)
 {
-    std::vector<double> smoothed = grid.top_z;
+    std::vector<GridScalar> smoothed = grid.top_z;
 
     for (int iy = 1; iy + 1 < grid.rows; ++iy) {
         for (int ix = 1; ix + 1 < grid.cols; ++ix) {
@@ -2243,7 +2339,7 @@ void smooth_contact_heights(ContactGrid& grid, const double base_thickness_mm)
             }
 
             if (weight >= 5.0)
-                smoothed[grid.index(ix, iy)] = std::max(base_thickness_mm, sum / weight);
+                smoothed[grid.index(ix, iy)] = grid_value(std::max(base_thickness_mm, sum / weight));
         }
     }
 
@@ -2270,7 +2366,7 @@ std::size_t restore_lower_envelope_contact_heights(ContactGrid& grid, const std:
                 continue;
 
             if (grid.top_z[cell_index] < clamped_target_top - tolerance_mm) {
-                grid.top_z[cell_index] = clamped_target_top;
+                grid.top_z[cell_index] = grid_value(clamped_target_top);
                 ++restored;
             }
         }
@@ -2287,9 +2383,9 @@ void clamp_grid_to_model_ceiling(ContactGrid& grid)
             if (!grid.has_model_ceiling(ix, iy))
                 continue;
 
-            grid.top_z[cell_index] = std::min(grid.top_z[cell_index], grid.model_ceiling(ix, iy));
+            grid.top_z[cell_index] = grid_value(std::min(double(grid.top_z[cell_index]), grid.model_ceiling(ix, iy)));
             if (grid.top_z[cell_index] <= grid.bottom_z + 0.05)
-                grid.top_z[cell_index] = grid.bottom_z;
+                grid.top_z[cell_index] = grid_value(grid.bottom_z);
         }
     }
 }
@@ -2377,7 +2473,7 @@ void update_coverage_from_final_grid(CoverageSamples& coverage, const ContactGri
     coverage.unsupported_cells = qa.unsupported_downward_cells;
 }
 
-bool layer_cell_occupied(const ContactGrid& grid, const std::vector<double>& bottom_z, const std::vector<double>& top_z, const int ix, const int iy)
+bool layer_cell_occupied(const ContactGrid& grid, const std::vector<GridScalar>& bottom_z, const std::vector<GridScalar>& top_z, const int ix, const int iy)
 {
     if (!grid.inside(ix, iy))
         return false;
@@ -2386,7 +2482,7 @@ bool layer_cell_occupied(const ContactGrid& grid, const std::vector<double>& bot
     return top_z[cell_index] > bottom_z[cell_index] + 0.05;
 }
 
-double layer_cell_top(const ContactGrid& grid, const std::vector<double>& bottom_z, const std::vector<double>& top_z, const int ix, const int iy)
+double layer_cell_top(const ContactGrid& grid, const std::vector<GridScalar>& bottom_z, const std::vector<GridScalar>& top_z, const int ix, const int iy)
 {
     if (!layer_cell_occupied(grid, bottom_z, top_z, ix, iy))
         return grid.bottom_z;
@@ -2394,7 +2490,7 @@ double layer_cell_top(const ContactGrid& grid, const std::vector<double>& bottom
     return top_z[grid.index(ix, iy)];
 }
 
-double layer_cell_bottom(const ContactGrid& grid, const std::vector<double>& bottom_z, const std::vector<double>& top_z, const int ix, const int iy)
+double layer_cell_bottom(const ContactGrid& grid, const std::vector<GridScalar>& bottom_z, const std::vector<GridScalar>& top_z, const int ix, const int iy)
 {
     if (!layer_cell_occupied(grid, bottom_z, top_z, ix, iy))
         return grid.bottom_z;
@@ -2419,9 +2515,9 @@ void add_cell_side_quad(SupportMesh& out, const int dx, const int dy, const doub
 
 double layer_corner_value(
     const ContactGrid& grid,
-    const std::vector<double>& bottom_z,
-    const std::vector<double>& top_z,
-    const std::vector<double>& value_z,
+    const std::vector<GridScalar>& bottom_z,
+    const std::vector<GridScalar>& top_z,
+    const std::vector<GridScalar>& value_z,
     const int corner_ix,
     const int corner_iy,
     const double shoulder_z,
@@ -2451,7 +2547,72 @@ double layer_corner_value(
     return found ? value : fallback;
 }
 
-double corner_model_ceiling(const ContactGrid& grid, const int corner_ix, const int corner_iy, const double fallback)
+bool corner_touches_mask(
+    const ContactGrid& grid,
+    const std::vector<unsigned char>& mask,
+    const int corner_ix,
+    const int corner_iy)
+{
+    if (mask.size() != grid.top_z.size())
+        return false;
+
+    for (int dy = -1; dy <= 0; ++dy) {
+        for (int dx = -1; dx <= 0; ++dx) {
+            const int ix = corner_ix + dx;
+            const int iy = corner_iy + dy;
+            if (grid.inside(ix, iy) && mask[std::size_t(grid.index(ix, iy))])
+                return true;
+        }
+    }
+
+    return false;
+}
+
+double corner_base_shoulder_top(
+    const ContactGrid& grid,
+    const std::vector<GridScalar>& bottom_z,
+    const std::vector<GridScalar>& top_z,
+    const std::vector<unsigned char>& taper_mask,
+    const int corner_ix,
+    const int corner_iy,
+    const double shoulder_z,
+    const double fallback)
+{
+    if (shoulder_z <= grid.bottom_z + 0.05)
+        return fallback;
+
+    double shoulder_top = fallback;
+    bool found = false;
+    for (int dy = -1; dy <= 0; ++dy) {
+        for (int dx = -1; dx <= 0; ++dx) {
+            const int ix = corner_ix + dx;
+            const int iy = corner_iy + dy;
+            if (!layer_cell_occupied(grid, bottom_z, top_z, ix, iy))
+                continue;
+
+            const int cell_index = grid.index(ix, iy);
+            if (taper_mask.size() == grid.top_z.size() && taper_mask[std::size_t(cell_index)])
+                continue;
+
+            const double candidate = top_z[std::size_t(cell_index)];
+            if (candidate > shoulder_z + 0.05)
+                continue;
+
+            shoulder_top = found ? std::min(shoulder_top, candidate) : candidate;
+            found = true;
+        }
+    }
+
+    return found ? shoulder_top : fallback;
+}
+
+double corner_model_ceiling(
+    const ContactGrid& grid,
+    const int corner_ix,
+    const int corner_iy,
+    const double fallback,
+    const bool conservative,
+    const double extra_clearance)
 {
     double ceiling = fallback;
     bool found = false;
@@ -2463,21 +2624,32 @@ double corner_model_ceiling(const ContactGrid& grid, const int corner_ix, const 
             if (!grid.has_model_ceiling(ix, iy))
                 continue;
 
-            const double candidate = grid.model_ceiling(ix, iy);
-            // Corners are shared by neighboring cells. Use the highest nearby
-            // ceiling so a valid tall contact cell is not crushed by a lower
-            // side-wall/base neighbor that merely touches the same corner.
-            ceiling = found ? std::max(ceiling, candidate) : candidate;
+            const double candidate = grid.model_ceiling(ix, iy) - (conservative ? extra_clearance : 0.0);
+            // Contact-only corners keep the highest nearby ceiling so valid
+            // contacts are not crushed. Corners touched by structural taper
+            // use the lowest ceiling: the continuous sloped face must remain
+            // below every adjacent model sample, not merely its own cell.
+            ceiling = found
+                ? (conservative ? std::min(ceiling, candidate) : std::max(ceiling, candidate))
+                : candidate;
             found = true;
         }
     }
 
-    return found ? ceiling : fallback;
+    return found ? std::max(grid.bottom_z, ceiling) : fallback;
 }
 
-double clamp_corner_to_model_ceiling(const ContactGrid& grid, const int corner_ix, const int corner_iy, const double top_z)
+double clamp_corner_to_model_ceiling(
+    const ContactGrid& grid,
+    const int corner_ix,
+    const int corner_iy,
+    const double top_z,
+    const bool conservative,
+    const double extra_clearance)
 {
-    return std::min(top_z, corner_model_ceiling(grid, corner_ix, corner_iy, top_z));
+    return std::min(
+        top_z,
+        corner_model_ceiling(grid, corner_ix, corner_iy, top_z, conservative, extra_clearance));
 }
 
 void add_cell_top_terrain(
@@ -2490,10 +2662,23 @@ void add_cell_top_terrain(
     const double z00,
     const double z10,
     const double z11,
-    const double z01)
+    const double z01,
+    const bool use_center_fan)
 {
-    (void)center_z;
-    add_quad(out, { x0, y0, z00 }, { x1, y0, z10 }, { x1, y1, z11 }, { x0, y1, z01 });
+    const Vec3 p00 { x0, y0, z00 };
+    const Vec3 p10 { x1, y0, z10 };
+    const Vec3 p11 { x1, y1, z11 };
+    const Vec3 p01 { x0, y1, z01 };
+    if (!use_center_fan) {
+        add_quad(out, p00, p10, p11, p01);
+        return;
+    }
+
+    const Vec3 center { (x0 + x1) * 0.5, (y0 + y1) * 0.5, center_z };
+    add_triangle(out, p00, p10, center);
+    add_triangle(out, p10, p11, center);
+    add_triangle(out, p11, p01, center);
+    add_triangle(out, p01, p00, center);
 }
 
 void add_cell_bottom_terrain(
@@ -2542,7 +2727,15 @@ void add_cell_boundary_side_terrain(
         add_quad(out, { x1, y1, b11 }, { x0, y1, b01 }, { x0, y1, t01 }, { x1, y1, t11 });
 }
 
-void mesh_height_field(const ContactGrid& grid, const std::vector<double>& bottom_z, const std::vector<double>& top_z, const double shoulder_z, SupportMesh& out)
+void mesh_height_field(
+    const ContactGrid& grid,
+    const std::vector<GridScalar>& bottom_z,
+    const std::vector<GridScalar>& top_z,
+    const double shoulder_z,
+    const std::vector<unsigned char>& contact_mask,
+    const std::vector<unsigned char>& taper_mask,
+    const double taper_clearance,
+    SupportMesh& out)
 {
     for (int iy = 0; iy < grid.rows; ++iy) {
         for (int ix = 0; ix < grid.cols; ++ix) {
@@ -2556,16 +2749,45 @@ void mesh_height_field(const ContactGrid& grid, const std::vector<double>& botto
             const double z0 = bottom_z[grid.index(ix, iy)];
             const double z1 = top_z[grid.index(ix, iy)];
 
-            const double top00 = clamp_corner_to_model_ceiling(grid, ix, iy, layer_corner_value(grid, bottom_z, top_z, top_z, ix, iy, shoulder_z, true, z1));
-            const double top10 = clamp_corner_to_model_ceiling(grid, ix + 1, iy, layer_corner_value(grid, bottom_z, top_z, top_z, ix + 1, iy, shoulder_z, true, z1));
-            const double top11 = clamp_corner_to_model_ceiling(grid, ix + 1, iy + 1, layer_corner_value(grid, bottom_z, top_z, top_z, ix + 1, iy + 1, shoulder_z, true, z1));
-            const double top01 = clamp_corner_to_model_ceiling(grid, ix, iy + 1, layer_corner_value(grid, bottom_z, top_z, top_z, ix, iy + 1, shoulder_z, true, z1));
+            const bool taper00 = corner_touches_mask(grid, taper_mask, ix, iy);
+            const bool taper10 = corner_touches_mask(grid, taper_mask, ix + 1, iy);
+            const bool taper11 = corner_touches_mask(grid, taper_mask, ix + 1, iy + 1);
+            const bool taper01 = corner_touches_mask(grid, taper_mask, ix, iy + 1);
+            double top00 = clamp_corner_to_model_ceiling(
+                grid, ix, iy,
+                layer_corner_value(grid, bottom_z, top_z, top_z, ix, iy, shoulder_z, true, z1),
+                taper00, taper_clearance);
+            double top10 = clamp_corner_to_model_ceiling(
+                grid, ix + 1, iy,
+                layer_corner_value(grid, bottom_z, top_z, top_z, ix + 1, iy, shoulder_z, true, z1),
+                taper10, taper_clearance);
+            double top11 = clamp_corner_to_model_ceiling(
+                grid, ix + 1, iy + 1,
+                layer_corner_value(grid, bottom_z, top_z, top_z, ix + 1, iy + 1, shoulder_z, true, z1),
+                taper11, taper_clearance);
+            double top01 = clamp_corner_to_model_ceiling(
+                grid, ix, iy + 1,
+                layer_corner_value(grid, bottom_z, top_z, top_z, ix, iy + 1, shoulder_z, true, z1),
+                taper01, taper_clearance);
+            if (taper00)
+                top00 = std::min(top00, corner_base_shoulder_top(grid, bottom_z, top_z, taper_mask, ix, iy, shoulder_z, top00));
+            if (taper10)
+                top10 = std::min(top10, corner_base_shoulder_top(grid, bottom_z, top_z, taper_mask, ix + 1, iy, shoulder_z, top10));
+            if (taper11)
+                top11 = std::min(top11, corner_base_shoulder_top(grid, bottom_z, top_z, taper_mask, ix + 1, iy + 1, shoulder_z, top11));
+            if (taper01)
+                top01 = std::min(top01, corner_base_shoulder_top(grid, bottom_z, top_z, taper_mask, ix, iy + 1, shoulder_z, top01));
             const double bottom00 = layer_corner_value(grid, bottom_z, top_z, bottom_z, ix, iy, 0.0, false, z0);
             const double bottom10 = layer_corner_value(grid, bottom_z, top_z, bottom_z, ix + 1, iy, 0.0, false, z0);
             const double bottom11 = layer_corner_value(grid, bottom_z, top_z, bottom_z, ix + 1, iy + 1, 0.0, false, z0);
             const double bottom01 = layer_corner_value(grid, bottom_z, top_z, bottom_z, ix, iy + 1, 0.0, false, z0);
+            const int cell_index = grid.index(ix, iy);
+            const bool contact_cell = contact_mask.size() == grid.top_z.size() && contact_mask[std::size_t(cell_index)];
+            const bool taper_cell = taper_mask.size() == grid.top_z.size() && taper_mask[std::size_t(cell_index)];
+            const bool use_center_fan = (contact_cell || taper_cell) && (taper00 || taper10 || taper11 || taper01) &&
+                (top00 < z1 - 0.05 || top10 < z1 - 0.05 || top11 < z1 - 0.05 || top01 < z1 - 0.05);
 
-            add_cell_top_terrain(out, x0, x1, y0, y1, z1, top00, top10, top11, top01);
+            add_cell_top_terrain(out, x0, x1, y0, y1, z1, top00, top10, top11, top01, use_center_fan);
             add_cell_bottom_terrain(out, x0, x1, y0, y1, bottom00, bottom10, bottom11, bottom01);
 
             const std::array<std::array<int, 2>, 4> neighbors { {
@@ -2658,7 +2880,7 @@ double distance_xy(const Vec3& lhs, const Vec3& rhs)
 
 std::vector<TreeTip> collect_tree_tips(
     const ContactGrid& grid,
-    const std::vector<double>& support_top,
+    const std::vector<GridScalar>& support_top,
     const std::vector<unsigned char>& contact_mask,
     const double root_z,
     const double sample_spacing)
@@ -3071,9 +3293,9 @@ TreeMeshResult mesh_organic_tree_grid(
     const ContactGrid& grid,
     const SupportSettings& settings,
     const std::vector<unsigned char>& contact_mask,
-    const std::vector<double>& support_top,
-    const std::vector<double>& interface_bottom,
-    const std::vector<double>& interface_top,
+    const std::vector<GridScalar>& support_top,
+    const std::vector<GridScalar>& interface_bottom,
+    const std::vector<GridScalar>& interface_top,
     SupportMesh& support_out,
     SupportMesh& interface_out,
     CoverageSamples* tree_coverage,
@@ -3421,16 +3643,17 @@ std::size_t mesh_contact_grid(
     const ContactGrid& grid,
     const SupportSettings& settings,
     const std::vector<unsigned char>& interface_eligible,
+    const std::vector<unsigned char>& taper_mask,
     SupportMesh& support_out,
     SupportMesh& interface_out,
     SupportGenerationStats* stats,
     CoverageSamples* coverage,
     OrganicTreeLayerData* tree_layer_data)
 {
-    std::vector<double> support_bottom(grid.top_z.size(), grid.bottom_z);
-    std::vector<double> support_top = grid.top_z;
-    std::vector<double> interface_bottom(grid.top_z.size(), grid.bottom_z);
-    std::vector<double> interface_top(grid.top_z.size(), grid.bottom_z);
+    std::vector<GridScalar> support_bottom(grid.top_z.size(), grid_value(grid.bottom_z));
+    std::vector<GridScalar> support_top = grid.top_z;
+    std::vector<GridScalar> interface_bottom(grid.top_z.size(), grid_value(grid.bottom_z));
+    std::vector<GridScalar> interface_top(grid.top_z.size(), grid_value(grid.bottom_z));
 
     const double interface_thickness = settings.interface_thickness_mm();
     if (interface_thickness > 0.05) {
@@ -3445,9 +3668,9 @@ std::size_t mesh_contact_grid(
 
                 const double top_z = grid.top_z[cell_index];
                 const double split_z = std::max(grid.bottom_z, top_z - interface_thickness);
-                support_top[cell_index] = split_z;
-                interface_bottom[cell_index] = split_z;
-                interface_top[cell_index] = top_z;
+                support_top[cell_index] = grid_value(split_z);
+                interface_bottom[cell_index] = grid_value(split_z);
+                interface_top[cell_index] = grid_value(top_z);
             }
         }
     }
@@ -3475,9 +3698,25 @@ std::size_t mesh_contact_grid(
         return tree_result.branches;
     }
 
-    mesh_height_field(grid, support_bottom, support_top, settings.base_enabled ? settings.base_thickness_mm : 0.0, support_out);
+    mesh_height_field(
+        grid,
+        support_bottom,
+        support_top,
+        settings.base_enabled ? settings.base_thickness_mm : 0.0,
+        interface_eligible,
+        taper_mask,
+        column_taper_ceiling_clearance_mm(grid),
+        support_out);
     if (interface_thickness > 0.05)
-        mesh_height_field(grid, interface_bottom, interface_top, 0.0, interface_out);
+        mesh_height_field(
+            grid,
+            interface_bottom,
+            interface_top,
+            0.0,
+            interface_eligible,
+            {},
+            0.0,
+            interface_out);
     return 0;
 }
 
@@ -3494,6 +3733,8 @@ SupportGenerationStats generate_orca_contact_proxy(
     SupportGenerationStats stats;
     if (!settings.enable_support || mesh_stats.vertices.size() < 3)
         return stats;
+
+    stats.column_taper_grid_reserve_mm = column_taper_grid_reserve_mm(mesh_stats, settings);
 
     using Clock = std::chrono::steady_clock;
     auto phase_start = Clock::now();
@@ -3562,6 +3803,22 @@ SupportGenerationStats generate_orca_contact_proxy(
         return stats;
 
     const std::vector<unsigned char> interface_eligible = snapshot_occupied_cells(grid);
+    const std::vector<GridScalar> contact_top = grid.top_z;
+
+    stats.column_components_before = count_column_components(grid, settings);
+    std::vector<unsigned char> taper_mask;
+    const ColumnTaperResult taper_result = taper_support_columns(
+        grid,
+        settings,
+        interface_eligible,
+        contact_top,
+        blocker_mask,
+        taper_mask);
+    stats.column_taper_cells = taper_result.added_cells;
+    stats.column_taper_seed_cells = taper_result.seed_cells;
+    stats.column_taper_max_top_mm = taper_result.max_added_top_mm;
+    stats.column_taper_added_volume_mm3 = taper_result.added_volume_mm3;
+    stats.column_taper_max_seed_rise_mm = taper_result.max_seed_rise_mm;
 
     if (settings.base_enabled) {
         const double blocker_foundation_top = !settings.support_blocker_cuts_base && (settings.base_enabled || settings.join_uprights_bottom_enabled)
@@ -3573,8 +3830,6 @@ SupportGenerationStats generate_orca_contact_proxy(
             stats.bottom_join_cells = join_bottom_uprights(grid, settings.base_thickness_mm);
         stats.manual_blocker_removed_cells += apply_manual_blocker_mask(grid, blocker_mask, blocker_foundation_top);
     }
-    stats.column_components_before = count_column_components(grid, settings);
-    stats.column_merge_cells = merge_nearby_columns(grid, settings);
     stats.manual_blocker_removed_cells += apply_manual_blocker_mask(
         grid,
         blocker_mask,
@@ -3590,7 +3845,16 @@ SupportGenerationStats generate_orca_contact_proxy(
     stats.timing_qa_ms += mark_ms();
     if (settings.interface_top_layers > 0)
         stats.interface_cells = count_masked_cells(interface_eligible);
-    stats.tree_branches = mesh_contact_grid(grid, settings, interface_eligible, support_out, interface_out, &stats, &coverage, tree_layer_data);
+    stats.tree_branches = mesh_contact_grid(
+        grid,
+        settings,
+        interface_eligible,
+        taper_mask,
+        support_out,
+        interface_out,
+        &stats,
+        &coverage,
+        tree_layer_data);
     stats.timing_mesh_ms = mark_ms();
 
     return stats;
@@ -3906,6 +4170,8 @@ std::string prepare_support_job_json_impl(const std::string& job_json, const boo
     append_number(out, settings.foam_gap_xy_mm);
     out << R"json(,"contact_cell_size_mm":)json";
     append_number(out, settings.contact_cell_size_mm);
+    out << R"json(,"max_contact_grid_cells":)json";
+    append_number(out, settings.max_contact_grid_cells);
     out << R"json(,"effective_contact_cell_size_mm":)json";
     append_number(out, support_stats.effective_contact_cell_size_mm);
     out << R"json(,"grid_cols":)json"
@@ -3920,8 +4186,8 @@ std::string prepare_support_job_json_impl(const std::string& job_json, const boo
         << (settings.base_enabled ? "true" : "false")
         << R"json(,"join_uprights_bottom_enabled":)json"
         << (settings.join_uprights_bottom_enabled ? "true" : "false")
-        << R"json(,"merge_nearby_columns_enabled":)json"
-        << (settings.merge_nearby_columns_enabled ? "true" : "false")
+        << R"json(,"column_taper_enabled":)json"
+        << (settings.column_taper_enabled ? "true" : "false")
         << R"json(,"contact_cells":)json"
         << support_stats.contact_cells
         << R"json(,"envelope_cells":)json"
@@ -3936,8 +4202,32 @@ std::string prepare_support_job_json_impl(const std::string& job_json, const boo
         << support_stats.base_cells
         << R"json(,"bottom_join_cells":)json"
         << support_stats.bottom_join_cells
-        << R"json(,"column_merge_cells":)json"
-        << support_stats.column_merge_cells
+        << R"json(,"column_taper_cells":)json"
+        << support_stats.column_taper_cells
+        << R"json(,"column_taper_seed_cells":)json"
+        << support_stats.column_taper_seed_cells;
+    out << R"json(,"column_taper_angle_deg":)json";
+    append_number(out, settings.column_taper_angle_deg);
+    out << R"json(,"column_taper_max_top_mm":)json";
+    append_number(out, support_stats.column_taper_max_top_mm);
+    out << R"json(,"column_taper_added_volume_mm3":)json";
+    append_number(out, support_stats.column_taper_added_volume_mm3);
+    const double column_taper_slope = std::tan(settings.column_taper_angle_deg * kPi / 180.0);
+    out << R"json(,"column_taper_step_drop_mm":)json";
+    append_number(out, column_taper_slope > 1e-8 ? support_stats.effective_contact_cell_size_mm / column_taper_slope : 0.0);
+    out << R"json(,"column_taper_max_seed_rise_mm":)json";
+    append_number(out, support_stats.column_taper_max_seed_rise_mm);
+    out << R"json(,"column_taper_max_theoretical_reach_mm":)json";
+    append_number(out, support_stats.column_taper_max_seed_rise_mm * column_taper_slope);
+    out << R"json(,"column_taper_side_guard_mm":)json";
+    append_number(
+        out,
+        settings.column_taper_enabled
+            ? std::max(0.2, support_stats.effective_contact_cell_size_mm * 0.25)
+            : 0.0);
+    out << R"json(,"column_taper_grid_reserve_mm":)json";
+    append_number(out, support_stats.column_taper_grid_reserve_mm);
+    out
         << R"json(,"column_components_before":)json"
         << support_stats.column_components_before
         << R"json(,"column_components_after":)json"
