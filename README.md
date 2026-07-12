@@ -1,5 +1,11 @@
 # CradleMaker
 
+<p align="center">
+  <a href="https://adamrountrey.github.io/CradleMaker/">
+    <img src="cradlemaker-web/assets/cradlemaker-logo.png" alt="CradleMaker logo" width="420">
+  </a>
+</p>
+
 CradleMaker is a browser-based tool for designing object-specific supports from
 3D scans of museum and cultural heritage objects. It is intended for
 conservators, collections staff, preparators, mountmakers, and fabricators who
