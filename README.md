@@ -298,9 +298,8 @@ The repository also contains the pinned target-aware Manifold patch, matched
 build scripts, build-profile manifests, and diagnostic benchmark tools under
 `cradlemaker-web/tools/` and `cradlemaker-web/vendor/`.
 
-The experimental real-Orca organic-tree compile probe is documented in
-[`cradlemaker-web/WASM_PORT.md`](cradlemaker-web/WASM_PORT.md). Upstream
-OrcaSlicer source is fetched into an ignored local cache and is not shipped with
+The experimental real-Orca organic-tree compile probe fetches upstream
+OrcaSlicer source into an ignored local cache. That source is not shipped with
 the web app.
 
 ## Repository Layout
