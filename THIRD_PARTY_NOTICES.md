@@ -42,12 +42,19 @@ IN THE SOFTWARE.
 Files:
 
 - `cradlemaker-web/vendor/manifold/`
+- `cradlemaker-web/vendor/manifold-par/`
+- `cradlemaker-web/vendor/manifold-targeted/`
+- `cradlemaker-web/vendor/manifold-targeted-o3/`
+- `cradlemaker-web/vendor/manifold-targeted-simd/`
+- `cradlemaker-web/vendor/manifold-targeted-lto/`
 
 License: Apache License 2.0
 
-The vendored Manifold package includes its full license at:
+Each vendored Manifold build includes a copy of its Apache License 2.0 text.
+The target-aware variants are reproducible builds from the pinned Manifold
+source revision plus the tracked patch at:
 
-- `cradlemaker-web/vendor/manifold/LICENSE`
+- `cradlemaker-web/tools/patches/manifold-targeted-minkowski.patch`
 
 ## three-mesh-bvh
 

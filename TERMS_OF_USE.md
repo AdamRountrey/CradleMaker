@@ -6,7 +6,8 @@ permitted below.
 These terms apply to CradleMaker source code, application code, build outputs,
 documentation, sample files, and other project materials owned by Adam Rountrey
 and distributed in this repository. Third-party components remain governed by
-their own license terms, as listed in `THIRD_PARTY_NOTICES.md`.
+their own license terms, as listed in
+[Third-Party Notices](THIRD_PARTY_NOTICES.md).
 
 ## Permitted Use
 
